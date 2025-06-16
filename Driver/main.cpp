@@ -3,7 +3,7 @@
 
 ntstatus DriverExit(PDRIVER_OBJECT)
 {
-    // UnHook();
+    UnHook();
     return ntstatus::success;
 }
 
@@ -22,6 +22,6 @@ ntstatus DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING)
     auto t = AccessVirtualMemory<void *>(tmp, 0x1ad000);
     print(INFO("value: %p"), t);
 
-    // Hook();
+    Hook();
     return ntstatus::success;
 }

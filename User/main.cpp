@@ -15,8 +15,10 @@ struct Command
 {
     void* SrcAddress;
     void* DestAddress;
-    uint32_t SrcPID, DestPID;
-    uint32_t Size, OpCode;
+    uint64_t SrcPID;
+    uint64_t DestPID;
+    uint32_t Size;
+    uint32_t OpCode;
 };
 
 int main()
@@ -32,25 +34,27 @@ int main()
 
     // Call func
     static Command cmd;
+    uint32_t PID = GetCurrentProcessId();
+    std::cout << "PID: " << PID << std::endl;
 
     // Read
-    x = 0, y = 1;
+    x = 9999, y = 1111;
     cmd.SrcAddress = &x;
     cmd.DestAddress = &y;
-    cmd.SrcPID = GetCurrentProcessId();
-    cmd.DestPID = GetCurrentProcessId();
+    cmd.SrcPID = PID;
+    cmd.DestPID = PID;
     cmd.OpCode = read;
-    Func(secret,&cmd);
     cmd.Size = sizeof(int);
+    Func(secret,&cmd);
     std::cout << x << y << std::endl;
     std::cout << &x << &y << std::endl;
 
     // Write
-    x = 0, y = 1;
+    x = 9999, y = 1111;
     cmd.SrcAddress = &x;
     cmd.DestAddress = &y;
-    cmd.SrcPID = GetCurrentProcessId();
-    cmd.DestPID = GetCurrentProcessId();
+    cmd.SrcPID = PID;
+    cmd.DestPID = PID;
     cmd.OpCode = write;
     cmd.Size = sizeof(int);
     Func(secret,&cmd);

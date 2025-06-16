@@ -139,7 +139,7 @@ _EPROCESS *EnumerateEProcess(const wchar_t *ProcessName, const uint64_t PID = -1
 
         // Sub str cmp
         size_t processLen = pProcess->ImageFilePointer->FileName.Length / sizeof(wchar_t);
-        if (!wcscmp(pProcess->ImageFilePointer->FileName.Buffer + processLen - targetLen, ProcessName))
+        if (targetLen && !wcscmp(pProcess->ImageFilePointer->FileName.Buffer + processLen - targetLen, ProcessName))
             return pProcess;
     } while (pCurrent != pHead);
 

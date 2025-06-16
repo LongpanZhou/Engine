@@ -125,27 +125,29 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
 
 // Read Physical Memory
 template<typename T>
-T AccessPhysicalMemory(address PhysicalAddress, pagesize PageSize)
+T AccessPhysicalMemory(address PhysicalAddress, pagesize PageSize, bool write = false)
 {
     T tmp{};
     MapPhysicalToVirtual(PhysicalAddress,
-        [&tmp](address VirtualAddress)
+        [&tmp, write](address VirtualAddress)
         {
             invlpg(VirtualAddress);
-            memcpy(&tmp, VirtualAddress, sizeof(T));
+            write ? memcpy(VirtualAddress, &tmp, sizeof(T))
+                  : memcpy(&tmp, VirtualAddress, sizeof(T));
         },
         PageSize
         );
     return tmp;
 }
 
-bool AccessPhysicalMemory(address PhysicalAddress, void* pBuffer, size_t Size, pagesize PageSize)
+bool AccessPhysicalMemory(address PhysicalAddress, address pBuffer, size_t Size, pagesize PageSize, bool write = false)
 {
     return MapPhysicalToVirtual(PhysicalAddress,
-            [pBuffer, Size](address VirtualAddress)
+            [pBuffer, Size, write](address VirtualAddress)
             {
                 invlpg(VirtualAddress);
-                memcpy(pBuffer, VirtualAddress, Size);
+                write ? memcpy(VirtualAddress, pBuffer, Size)
+                      : memcpy(pBuffer, VirtualAddress, Size);
             },
             PageSize
     );
@@ -175,16 +177,16 @@ std::pair<address, pagesize> GetPhysicalAddress(address VirtualAddress, cr3 CR3)
 
 // Read Virtual Memory
 template<typename T>
-T AccessVirtualMemory(address VirtualAddress, cr3 CR3)
+T AccessVirtualMemory(address VirtualAddress, cr3 CR3, bool write = false)
 {
     std::pair<address,pagesize> tmp = GetPhysicalAddress(VirtualAddress, CR3);
     if (!tmp.first) return T{};
-    return AccessPhysicalMemory<T>(tmp.first, tmp.second);
+    return AccessPhysicalMemory<T>(tmp.first, tmp.second, write);
 }
 
-bool AccessVirtualMemory(address VirtualAddress, cr3 CR3, void *pBuffer, size_t Size)
+bool AccessVirtualMemory(address VirtualAddress, cr3 CR3, address pBuffer, size_t Size, bool write = false)
 {
     std::pair<address,pagesize> tmp = GetPhysicalAddress(VirtualAddress, CR3);
     if (!tmp.first) return false;
-    return AccessPhysicalMemory(tmp.first, pBuffer, Size, tmp.second);
+    return AccessPhysicalMemory(tmp.first, pBuffer, Size, tmp.second, write);
 }

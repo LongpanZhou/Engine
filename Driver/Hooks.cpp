@@ -1,5 +1,6 @@
-// #include "LazyImport.cpp"
-//
+#include "LazyImport.cpp"
+#include "Crypt.cpp"
+
 // typedef void (__fastcall *KeStackAttachProcess_t)(address process_address, std::uint64_t* apc_state);
 // typedef void (__fastcall *KeUnstackDetachProcess_t)(std::uint64_t* apc_state);
 //
@@ -17,10 +18,12 @@ enum
 
 struct Command
 {
-    address SrcAddress;
-    address DestAddress;
-    uint32_t SrcPID, DestPID;
-    uint32_t Size, OpCode;
+    void* SrcAddress;
+    void* DestAddress;
+    uint64_t SrcPID;
+    uint64_t DestPID;
+    uint32_t Size;
+    uint32_t OpCode;
 };
 
 // NtCompareSigningLevels
@@ -39,23 +42,29 @@ uint64_t __fastcall Func(uint64_t Secret, Command* pCommand)
     {
         cr3 usermodeCR3 = ((_KPROCESS*)EnumerateEProcess(L"User.exe"))->DirectoryTableBase;
         AccessVirtualMemory(pCommand,usermodeCR3,&cmd,sizeof(cmd));
-        address process = EnumerateEProcess(L"", cmd.DestPID);
-        cr3 tmp = ((_KPROCESS*)process)->DirectoryTableBase;
 
-        print(INFO("Usermode address: %p"), process);
-        print(INFO("Usermode cr3: %p"), tmp);
+        cr3 processCR3 = ((_KPROCESS*)EnumerateEProcess(L"", cmd.DestPID))->DirectoryTableBase;
+        void* buffer = win::ExAllocatePoolWithTag(pool_type::NonPagedPool, cmd.Size, 0);
+
+        print(INFO("Usermode cr3: %p"), usermodeCR3);
+        print(INFO("Process cr3: %p"), processCR3);
+        print(INFO("SrcAddress: %p, DestAddress: %p, SrcPID: %p, DestPID: %p, Size: %p, OpCode: %p")
+                        ,cmd.SrcAddress,cmd.DestAddress,cmd.SrcPID,cmd.DestPID,cmd.Size,cmd.OpCode);
 
         switch (cmd.OpCode)
         {
             case read:
-                AccessVirtualMemory(cmd.SrcAddress, tmp, cmd.DestAddress, cmd.Size);
+                AccessVirtualMemory(cmd.DestAddress,processCR3,buffer,cmd.Size, false);
+                AccessVirtualMemory(cmd.SrcAddress,usermodeCR3,buffer,cmd.Size, true);
                 break;
             case write:
-                AccessVirtualMemory(cmd.SrcAddress, tmp, cmd.DestAddress, cmd.Size);
+                AccessVirtualMemory(cmd.SrcAddress,usermodeCR3,buffer,cmd.Size, false);
+                AccessVirtualMemory(cmd.DestAddress,processCR3,buffer,cmd.Size, true);
                 break;
             default:
                 print(WARN("Invalid OpCode %d"), cmd.OpCode);
         }
+        win::ExFreePool(buffer);
     }
 
     // Return original
