@@ -1,4 +1,4 @@
-// Hashs are not used but left for future if want to hide string
+// Hash are not used but left for future if you want to hide string
 constexpr uint64_t TimeToSeed(const char* Time)
 {
     //convert time to seed

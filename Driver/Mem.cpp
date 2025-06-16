@@ -1,7 +1,3 @@
-#include <wdk/wdk.hpp>
-#include "Lib/structs.h"
-#include "Lib/utils.h"
-
 using namespace arch;
 using namespace intrin;
 
@@ -28,49 +24,6 @@ enum pagesize : uint32_t
 template<typename T>
 bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSize = Page_4KB)
 {
-    // Cache
-    switch (PageSize)
-    {
-        case Page_4KB:
-            if (PTE_4KB && VA_4KB)
-            {
-                PTE_4KB->page_frame_number = PhysicalAddress >> 12;
-                VA_4KB.offset = PhysicalAddress.offset;
-
-                return Callback(VA_4KB);
-            }
-            break;
-        case Page_2MB:
-            if (PDE_2MB && VA_2MB)
-            {
-                PDE_2MB->page_frame_number = PhysicalAddress >> 21;
-                VA_2MB.offset = PhysicalAddress.offset;
-                VA_2MB.p1_index = PhysicalAddress.p1_index;
-
-                return Callback(VA_2MB);
-            }
-            break;
-        case Page_1GB:
-            if (PDPTE_1GB && VA_1GB)
-            {
-                PDPTE_1GB->page_frame_number = PhysicalAddress >> 30;
-                VA_1GB.offset = PhysicalAddress.offset;
-                VA_1GB.p1_index = PhysicalAddress.p1_index;
-                VA_1GB.p2_index = PhysicalAddress.p2_index;
-
-                return Callback(VA_1GB);
-            }
-            break;
-        case Page_Unmap:
-            if (PDPTE_1GB) PDPTE_1GB->present = 0;
-            if (PDE_2MB) PDE_2MB->present = 0;
-            if (PTE_4KB) PTE_4KB->present = 0;
-            return true;
-        default:
-            print(ERROR("Invalid Type %d"), PageSize);
-            return false;
-    }
-
     // Local variables
     int PML4_IDX, PDPT_IDX, PD_IDX, PT_IDX;
     cr3 CR3 = read_cr3();
@@ -109,7 +62,8 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
             VA_1GB.p3_index = PDPT_IDX;
             VA_1GB.p4_index = PML4_IDX;
 
-            return Callback(VA_1GB);
+            Callback(VA_1GB);
+            PDPTE_1GB->present = 0;
         }
 
         if (PDPTE->present) break;
@@ -136,7 +90,9 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
             VA_2MB.p3_index = PDPT_IDX;
             VA_2MB.p4_index = PML4_IDX;
 
-            return Callback(VA_2MB);
+            Callback(VA_2MB);
+            PDE_2MB->present = 0;
+            return true;
         }
 
         if (PDE->present) break;
@@ -159,7 +115,9 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
         VA_4KB.p3_index = PDPT_IDX;
         VA_4KB.p4_index = PML4_IDX;
 
-        return Callback(VA_4KB);
+        Callback(VA_4KB);
+        PTE_4KB->present = 0;
+        return true;
     }
 
     return false;
@@ -167,29 +125,29 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
 
 // Read Physical Memory
 template<typename T>
-T ReadPhysical(address PhysicalAddress, pagesize PageSize = Page_4KB)
+T AccessPhysicalMemory(address PhysicalAddress, pagesize PageSize, bool write)
 {
     T tmp{};
     MapPhysicalToVirtual(PhysicalAddress,
-        [&tmp](address VirtualAddress)
+        [&tmp, write](address VirtualAddress)
         {
             invlpg(VirtualAddress);
-            memcpy(&tmp, VirtualAddress, sizeof(T));
-            return true;
+            write ? memcpy(VirtualAddress, &tmp, sizeof(T))
+                  : memcpy(&tmp, VirtualAddress, sizeof(T));
         },
         PageSize
         );
     return tmp;
 }
 
-bool ReadPhysical(address PhysicalAddress, void* pBuffer, size_t Size, pagesize PageSize = Page_4KB)
+bool AccessPhysicalMemory(address PhysicalAddress, void* pBuffer, size_t Size, pagesize PageSize, bool write)
 {
     return MapPhysicalToVirtual(PhysicalAddress,
-            [pBuffer, Size](address VirtualAddress)
+            [pBuffer, Size, write](address VirtualAddress)
             {
                 invlpg(VirtualAddress);
-                memcpy(pBuffer, VirtualAddress, Size);
-                return true;
+                write ? memcpy(VirtualAddress, pBuffer, Size)
+                      : memcpy(pBuffer, VirtualAddress, Size);
             },
             PageSize
     );
@@ -198,46 +156,37 @@ bool ReadPhysical(address PhysicalAddress, void* pBuffer, size_t Size, pagesize 
 // Translate Virtual Address to Physical Address
 std::pair<address, pagesize> GetPhysicalAddress(address VirtualAddress, cr3 CR3)
 {
-    // Variables
-    static pml4e PML4ETable[512];
-    pml4e PML4E = PML4ETable[VirtualAddress.p4_index];
-
-    // Check Cache
-    if (!PML4E.present)
-    {
-        ReadPhysical({(CR3.pml4_frame_number << 12)}, &PML4ETable, sizeof(PML4ETable));
-        PML4E = PML4ETable[VirtualAddress.p4_index];
-        if (!PML4E) return {};
-    }
-
     // Translation...       Type 0: 4KB, Type 1: 2MB, Type 2: 1GB
-    auto PDPTE = ReadPhysical<pdpe>({(PML4E.page_frame_number << 12) + VirtualAddress.p3_index * 8});
+    auto PML4E = AccessPhysicalMemory<pdpe>({(CR3.pml4_frame_number << 12) + VirtualAddress.p4_index * 8}, Page_4KB, false);
+    if (!PML4E) return {};
+
+    auto PDPTE = AccessPhysicalMemory<pdpe>({(PML4E.page_frame_number << 12) + VirtualAddress.p3_index * 8}, Page_4KB, false);
     if (!PDPTE) return {};
     if (((pdpe_1gb)PDPTE).page_size)
         return {((pdpe_1gb)PDPTE).page_frame_number << 30 | VirtualAddress.offset_1gb(), Page_1GB};
 
-    auto PDE = ReadPhysical<pde>({(PDPTE.page_frame_number << 12) + VirtualAddress.p2_index * 8});
+    auto PDE = AccessPhysicalMemory<pde>({(PDPTE.page_frame_number << 12) + VirtualAddress.p2_index * 8}, Page_4KB, false);
     if (!PDE) return {};
     if (((pde_2mb)PDE).page_size)
         return {((pde_2mb)PDE).page_frame_number << 21 | VirtualAddress.offset_2mb(), Page_2MB};
 
-    auto PT = ReadPhysical<pte>({(PDE.page_frame_number << 12) + VirtualAddress.p1_index * 8});
+    auto PT = AccessPhysicalMemory<pte>({(PDE.page_frame_number << 12) + VirtualAddress.p1_index * 8}, Page_4KB, false);
     if (!PT) return {};
     return {PT.page_frame_number << 12 | VirtualAddress.offset, Page_4KB};
 }
 
 // Read Virtual Memory
 template<typename T>
-T ReadVirtualMemory(address TargetAddress, cr3 CR3)
+T AccessVirtualMemory(address VirtualAddress, cr3 CR3, bool write)
 {
-    std::pair<address,pagesize> tmp = GetPhysicalAddress(TargetAddress, CR3);
+    std::pair<address,pagesize> tmp = GetPhysicalAddress(VirtualAddress, CR3);
     if (!tmp.first) return T{};
-    return ReadPhysical<T>(tmp.first, tmp.second);
+    return AccessPhysicalMemory<T>(tmp.first, tmp.second, write);
 }
 
-bool ReadVirtualMemory(address VirtualAddress, cr3 CR3, void *pBuffer, size_t Size)
+bool AccessVirtualMemory(address VirtualAddress, cr3 CR3, void *pBuffer, size_t Size, bool write)
 {
     std::pair<address,pagesize> tmp = GetPhysicalAddress(VirtualAddress, CR3);
     if (!tmp.first) return false;
-    return ReadPhysical(tmp.first, pBuffer, Size, tmp.second);
+    return AccessPhysicalMemory(tmp.first, pBuffer, Size, tmp.second, write);
 }

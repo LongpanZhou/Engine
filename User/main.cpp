@@ -1,18 +1,62 @@
 #include <iostream>
-#include <cstdint>
 #include <windows.h>
 
-typedef NTSTATUS(WINAPI* NtUserQueryDisplay_t)(uint64_t param);
+#define secret 0xFFFFFFFF
+
+typedef NTSTATUS(WINAPI* NtCompareSigningLevels)(uint64_t Secret, void* pCommand);
+
+enum
+{
+    read,
+    write,
+};
+
+struct Command
+{
+    void* SrcAddress;
+    void* DestAddress;
+    uint32_t SrcPID, DestPID;
+    uint32_t Size, OpCode;
+};
 
 int main()
 {
-    HMODULE Win32u = LoadLibraryA("win32u.dll");
-    if (!Win32u) return NULL;
+    int x,y;
+    // Load lib
+    HMODULE Dll = LoadLibraryA("ntdll.dll");
+    if (!Dll) return NULL;
 
-    auto NtUserQueryDisplay = (NtUserQueryDisplay_t)GetProcAddress(Win32u, "NtUserQueryDisplay");
-    if (!NtUserQueryDisplay) return NULL;
+    // Load func
+    auto Func = (NtCompareSigningLevels)GetProcAddress(Dll, "NtCompareSigningLevels");
+    if (!Func) return NULL;
 
-    NTSTATUS status = NtUserQueryDisplay(0);
-    std::cout << "NtUserQueryDisplay returned " << status << std::endl;
+    // Call func
+    static Command cmd;
+
+    // Read
+    x = 0, y = 1;
+    cmd.SrcAddress = &x;
+    cmd.DestAddress = &y;
+    cmd.SrcPID = GetCurrentProcessId();
+    cmd.DestPID = GetCurrentProcessId();
+    cmd.OpCode = read;
+    Func(secret,&cmd);
+    cmd.Size = sizeof(int);
+    std::cout << x << y << std::endl;
+    std::cout << &x << &y << std::endl;
+
+    // Write
+    x = 0, y = 1;
+    cmd.SrcAddress = &x;
+    cmd.DestAddress = &y;
+    cmd.SrcPID = GetCurrentProcessId();
+    cmd.DestPID = GetCurrentProcessId();
+    cmd.OpCode = write;
+    cmd.Size = sizeof(int);
+    Func(secret,&cmd);
+    std::cout << x << y << std::endl;
+    std::cout << &x << &y << std::endl;
+    system("pause");
+
     return NULL;
 }

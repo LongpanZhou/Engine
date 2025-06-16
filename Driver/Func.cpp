@@ -1,3 +1,5 @@
+#include "Lib/structs.h"
+#include "Lib/utils.h"
 #include "Mem.cpp"
 
 PVOID EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleName)
@@ -18,12 +20,12 @@ PVOID EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleName
     if (!pPeb) return nullptr;
 
     // Read LDR (Loader Dynamic Resources)
-    auto *pLdr = ReadVirtualMemory<_PEB_LDR_DATA *>(&pPeb->Ldr, CR3);
+    auto *pLdr = AccessVirtualMemory<_PEB_LDR_DATA *>(&pPeb->Ldr, CR3, false);
     if (!pLdr) return nullptr;
 
     // Init variables for loop
     wchar_t pBuffer[256];
-    auto moduleList = ReadVirtualMemory<_LIST_ENTRY>(&pLdr->InLoadOrderModuleList, CR3);
+    auto moduleList = AccessVirtualMemory<_LIST_ENTRY>(&pLdr->InLoadOrderModuleList, CR3, false);
 
     _LDR_DATA_TABLE_ENTRY entry;
     UNICODE_STRING moduleName;
@@ -35,7 +37,7 @@ PVOID EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleName
     do
     {
         // Get LDR Entry
-        if (!ReadVirtualMemory(pCurrent, CR3, &entry, sizeof(_LDR_DATA_TABLE_ENTRY)))
+        if (!AccessVirtualMemory(pCurrent, CR3, &entry, sizeof(_LDR_DATA_TABLE_ENTRY),false))
             break;
 
         // Get module name n increment pCurrent
@@ -47,7 +49,7 @@ PVOID EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleName
             continue;
 
         // Read memory into buffer
-        if (!ReadVirtualMemory(moduleName.Buffer, CR3, &pBuffer, sizeof(pBuffer)))
+        if (!AccessVirtualMemory(moduleName.Buffer, CR3, &pBuffer, sizeof(pBuffer),false))
             continue;
 
         // Print info
@@ -181,9 +183,13 @@ PVOID PatternToBytes(char *const Signature)
 
 PVOID SignatureScan(const void *StartAddress, const void *EndAddress, char *const Signature)
 {
+    print(INFO("Start Address: %p"), StartAddress);
+    print(INFO("End Address: %p"), EndAddress);
+
     // This algo is so slow
     PatternToBytes(Signature);
     size_t size = strlen(Signature);
+    print(INFO("Signature Address: %p"), Signature);
 
     for (const char *Current = (char *) StartAddress; Current <= (char *) ((size_t)EndAddress - size); ++Current)
         for (size_t i = 0; i <= size; ++i)
@@ -214,34 +220,37 @@ PVOID SectionScan(const wchar_t *ProcessName, const wchar_t *ModuleName, const c
     if (!win::MmIsAddressValid(BaseAddress)) return nullptr;
 
     // Get section
-    auto *dosHeader = (_IMAGE_DOS_HEADER *) BaseAddress;
+    auto dosHeader = (_IMAGE_DOS_HEADER *) BaseAddress;
     print(INFO("dosHeader: %p"), dosHeader);
     if (!win::MmIsAddressValid(dosHeader)) return nullptr;
 
-    auto *ntHeader = (_IMAGE_NT_HEADERS64 *) (BaseAddress + dosHeader->e_lfanew);
+    auto ntHeader = (_IMAGE_NT_HEADERS64 *) (BaseAddress + dosHeader->e_lfanew);
     print(INFO("ntHeader: %p"), ntHeader);
     if (!win::MmIsAddressValid(ntHeader)) return nullptr;
 
-    auto *fileHeader = &ntHeader->FileHeader;
+    auto fileHeader = &ntHeader->FileHeader;
     print(INFO("fileHeader: %p"), fileHeader);
     if (!win::MmIsAddressValid(fileHeader)) return nullptr;
 
-    auto *optionalHeader = &ntHeader->OptionalHeader;
+    auto optionalHeader = &ntHeader->OptionalHeader;
     print(INFO("optionalHeader: %p"), optionalHeader);
     if (!win::MmIsAddressValid(optionalHeader)) return nullptr;
 
-    auto *sectionHeader = (_IMAGE_SECTION_HEADER *)((uint64_t) optionalHeader + sizeof(_IMAGE_OPTIONAL_HEADER64));
+    auto sectionHeader = (_IMAGE_SECTION_HEADER *)((uint64_t) optionalHeader + sizeof(_IMAGE_OPTIONAL_HEADER64));
     print(INFO("sectionHeader: %p"), sectionHeader);
     if (!win::MmIsAddressValid(sectionHeader)) return nullptr;
 
     // loop
-    void *sectionStart{}, *sectionEnd{};
+    void *sectionStart{};
+    void *sectionEnd{};
+
     for (int i = 0; i < fileHeader->NumberOfSections; i++)
     {
+        print(INFO("Section Name: %s"), sectionHeader[i].Name);
         if (!memcmp(sectionHeader[i].Name, SectionName, std::min(8,(int)strlen(SectionName))))
         {
             sectionStart = BaseAddress + sectionHeader[i].VirtualAddress;
-            sectionEnd = BaseAddress + sectionHeader->VirtualAddress + sectionHeader[i].Misc.VirtualSize;
+            sectionEnd = BaseAddress + sectionHeader[i].VirtualAddress + sectionHeader[i].Misc.VirtualSize;
             break;
         }
     }
