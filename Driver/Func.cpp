@@ -20,12 +20,14 @@ PVOID EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleName
     if (!pPeb) return nullptr;
 
     // Read LDR (Loader Dynamic Resources)
-    auto *pLdr = AccessVirtualMemory<_PEB_LDR_DATA *>(&pPeb->Ldr, CR3, false);
+    _PEB_LDR_DATA *pLdr;
+    AccessVirtualMemory(&pPeb->Ldr, CR3, &pLdr, sizeof(_PEB_LDR_DATA));
     if (!pLdr) return nullptr;
 
     // Init variables for loop
     wchar_t pBuffer[256];
-    auto moduleList = AccessVirtualMemory<_LIST_ENTRY>(&pLdr->InLoadOrderModuleList, CR3, false);
+    _LIST_ENTRY moduleList;
+    AccessVirtualMemory(&pLdr->InLoadOrderModuleList, CR3, &moduleList, sizeof(_LIST_ENTRY));
 
     _LDR_DATA_TABLE_ENTRY entry;
     UNICODE_STRING moduleName;
@@ -37,7 +39,7 @@ PVOID EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleName
     do
     {
         // Get LDR Entry
-        if (!AccessVirtualMemory(pCurrent, CR3, &entry, sizeof(_LDR_DATA_TABLE_ENTRY),false))
+        if (!AccessVirtualMemory(pCurrent, CR3, &entry, sizeof(_LDR_DATA_TABLE_ENTRY)))
             break;
 
         // Get module name n increment pCurrent
@@ -49,7 +51,7 @@ PVOID EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleName
             continue;
 
         // Read memory into buffer
-        if (!AccessVirtualMemory(moduleName.Buffer, CR3, &pBuffer, sizeof(pBuffer),false))
+        if (!AccessVirtualMemory(moduleName.Buffer, CR3, &pBuffer, sizeof(pBuffer)))
             continue;
 
         // Print info

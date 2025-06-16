@@ -5,8 +5,10 @@
 //
 // KeStackAttachProcess_t KeStackAttachProcess;
 // KeUnstackDetachProcess_t KeUnstackDetachProcess;
+//
+// _KPROCESS *KProcess;
+// _KAPC_STATE KapcState;
 
-// Communication Struct
 enum
 {
     read,
@@ -25,8 +27,6 @@ struct Command
 using func_type = uint64_t (__fastcall*)();
 func_type OriginalFunc;
 
-_KPROCESS *KProcess;
-_KAPC_STATE KapcState;
 address *pData;
 char Signature[] = "4C 8B 05 ? ? ? ? 33 C0 4D 85 C0 74 ? 49 8B C0 E8 ? ? ? ? F7 D8";
 
@@ -38,7 +38,7 @@ uint64_t __fastcall Func(uint64_t Secret, Command* pCommand)
     if (Secret == 0xFFFFFFFF)
     {
         cr3 usermodeCR3 = ((_KPROCESS*)EnumerateEProcess(L"User.exe"))->DirectoryTableBase;
-        AccessVirtualMemory(pCommand,usermodeCR3,&cmd,sizeof(cmd),false);
+        AccessVirtualMemory(pCommand,usermodeCR3,&cmd,sizeof(cmd));
         address process = EnumerateEProcess(L"", cmd.DestPID);
         cr3 tmp = ((_KPROCESS*)process)->DirectoryTableBase;
 
@@ -48,10 +48,10 @@ uint64_t __fastcall Func(uint64_t Secret, Command* pCommand)
         switch (cmd.OpCode)
         {
             case read:
-                AccessVirtualMemory(cmd.SrcAddress, tmp, cmd.DestAddress, cmd.Size, false);
+                AccessVirtualMemory(cmd.SrcAddress, tmp, cmd.DestAddress, cmd.Size);
                 break;
             case write:
-                AccessVirtualMemory(cmd.SrcAddress, tmp, cmd.DestAddress, cmd.Size, true);
+                AccessVirtualMemory(cmd.SrcAddress, tmp, cmd.DestAddress, cmd.Size);
                 break;
             default:
                 print(WARN("Invalid OpCode %d"), cmd.OpCode);

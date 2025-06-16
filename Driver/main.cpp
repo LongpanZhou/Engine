@@ -3,6 +3,7 @@
 
 ntstatus DriverExit(PDRIVER_OBJECT)
 {
+    // UnHook();
     return ntstatus::success;
 }
 
@@ -18,8 +19,9 @@ ntstatus DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING)
     print(INFO("Module Address: %p"), pModule);
 
     void *tmp = EnumerateKProcess(L"ntoskrnl.exe");
-    auto t = AccessVirtualMemory<void *>(tmp, 0x1ad000, false);
+    auto t = AccessVirtualMemory<void *>(tmp, 0x1ad000);
     print(INFO("value: %p"), t);
 
+    // Hook();
     return ntstatus::success;
 }
