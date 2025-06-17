@@ -27,6 +27,10 @@ ntstatus DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING)
     // auto str = ENCRYPT_STR("Hello world!");
     // print(INFO("Encrypt: %s"),str.data);
     // print(INFO("Decrypt: %s"),str.decrypt());
+    //
+    // auto wstr = ENCRYPT_WSTR(L"Hello world!");
+    // print(INFO("Encrypt: %ws"),wstr.data);
+    // print(INFO("Decrypt: %ws"),wstr.decrypt());
 
     Hook();
     return ntstatus::success;
