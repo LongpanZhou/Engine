@@ -1,5 +1,6 @@
 #include "Func.cpp"
 #include "Hooks.cpp"
+#include "Crypt.cpp"
 
 ntstatus DriverExit(PDRIVER_OBJECT)
 {
@@ -11,16 +12,21 @@ extern "C"
 ntstatus DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING)
 {
     // Initialization
-    DriverObject->DriverUnload = DriverExit;
+    // DriverObject->DriverUnload = DriverExit;
 
     // Main
-    _EPROCESS* pEProcess = EnumerateEProcess(L"notepad.exe");
-    void* pModule = EnumerateModuleBaseAddress(pEProcess, L"ntdll.dll");
-    print(INFO("Module Address: %p"), pModule);
+    // _EPROCESS* pEProcess = EnumerateEProcess(L"notepad.exe");
+    // void* pModule = EnumerateModuleBaseAddress(pEProcess, L"ntdll.dll");
+    // print(INFO("Module Address: %p"), pModule);
+    //
+    // void *tmp = EnumerateKProcess(L"ntoskrnl.exe");
+    // auto t = AccessVirtualMemory<void *>(tmp, 0x1ad000);
 
-    void *tmp = EnumerateKProcess(L"ntoskrnl.exe");
-    auto t = AccessVirtualMemory<void *>(tmp, 0x1ad000);
-    print(INFO("value: %p"), t);
+    // Encryption
+    // print(INFO("Seed: %p"), SEED);
+    // auto str = ENCRYPT_STR("Hello world!");
+    // print(INFO("Encrypt: %s"),str.data);
+    // print(INFO("Decrypt: %s"),str.decrypt());
 
     Hook();
     return ntstatus::success;

@@ -60,7 +60,12 @@ int main()
     Func(secret,&cmd);
     std::cout << x << y << std::endl;
     std::cout << &x << &y << std::endl;
-    system("pause");
+
+    cmd.OpCode = -1;
+    while (true)
+    {
+        Func(secret,&cmd);
+    }
 
     return NULL;
 }

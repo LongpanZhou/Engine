@@ -8,6 +8,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/vendor/")
 find_package(CrossWDK REQUIRED)
 
+# Get current UNIX time at CMake configure time
+string(TIMESTAMP CURRENT_UNIX_TIME "%s" UTC)
+
+# Generate seed.h with SEED macro
+file(WRITE "${CMAKE_CURRENT_SOURCE_DIR}/seed.h" "#pragma once\n#define SEED ${CURRENT_UNIX_TIME}\n")
+
 # Driver entry point
 wdk_add_driver(Driver
         main.cpp

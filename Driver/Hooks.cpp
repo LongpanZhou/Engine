@@ -1,5 +1,4 @@
 #include "LazyImport.cpp"
-#include "Crypt.cpp"
 
 // typedef void (__fastcall *KeStackAttachProcess_t)(address process_address, std::uint64_t* apc_state);
 // typedef void (__fastcall *KeUnstackDetachProcess_t)(std::uint64_t* apc_state);
