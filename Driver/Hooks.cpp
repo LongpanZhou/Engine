@@ -1,13 +1,5 @@
+#include "Crypt.cpp"
 #include "LazyImport.cpp"
-
-// typedef void (__fastcall *KeStackAttachProcess_t)(address process_address, std::uint64_t* apc_state);
-// typedef void (__fastcall *KeUnstackDetachProcess_t)(std::uint64_t* apc_state);
-//
-// KeStackAttachProcess_t KeStackAttachProcess;
-// KeUnstackDetachProcess_t KeUnstackDetachProcess;
-//
-// _KPROCESS *KProcess;
-// _KAPC_STATE KapcState;
 
 enum
 {
@@ -26,11 +18,10 @@ struct Command
 };
 
 // NtCompareSigningLevels
+constexpr auto SignatureEncode = Encode("4C 8B 05 ? ? ? ? 33 C0 4D 85 C0 74 ? 49 8B C0 E8 ? ? ? ? F7 D8");
 using func_type = uint64_t (__fastcall*)();
 func_type OriginalFunc;
-
 address *pData;
-char Signature[] = "4C 8B 05 ? ? ? ? 33 C0 4D 85 C0 74 ? 49 8B C0 E8 ? ? ? ? F7 D8";
 
 uint64_t __fastcall Func(uint64_t Secret, Command* pCommand)
 {
@@ -43,7 +34,7 @@ uint64_t __fastcall Func(uint64_t Secret, Command* pCommand)
         AccessVirtualMemory(pCommand,usermodeCR3,&cmd,sizeof(cmd));
 
         cr3 processCR3 = ((_KPROCESS*)EnumerateEProcess(L"", cmd.DestPID))->DirectoryTableBase;
-        void* buffer = win::ExAllocatePoolWithTag(pool_type::NonPagedPool, cmd.Size, 0);
+        char buffer[cmd.Size/4];
 
         print(INFO("Usermode cr3: %p"), usermodeCR3);
         print(INFO("Process cr3: %p"), processCR3);
@@ -53,17 +44,16 @@ uint64_t __fastcall Func(uint64_t Secret, Command* pCommand)
         switch (cmd.OpCode)
         {
             case read:
-                AccessVirtualMemory(cmd.DestAddress,processCR3,buffer,cmd.Size, false);
-                AccessVirtualMemory(cmd.SrcAddress,usermodeCR3,buffer,cmd.Size, true);
+                AccessVirtualMemory(cmd.DestAddress,processCR3,(void*)buffer,cmd.Size, false);
+                AccessVirtualMemory(cmd.SrcAddress,usermodeCR3,(void*)buffer,cmd.Size, true);
                 break;
             case write:
-                AccessVirtualMemory(cmd.SrcAddress,usermodeCR3,buffer,cmd.Size, false);
-                AccessVirtualMemory(cmd.DestAddress,processCR3,buffer,cmd.Size, true);
+                AccessVirtualMemory(cmd.SrcAddress,usermodeCR3,(void*)buffer,cmd.Size, false);
+                AccessVirtualMemory(cmd.DestAddress,processCR3,(void*)buffer,cmd.Size, true);
                 break;
             default:
                 print(WARN("Invalid OpCode %d"), cmd.OpCode);
         }
-        win::ExFreePool(buffer);
     }
 
     // Return original
@@ -72,13 +62,11 @@ uint64_t __fastcall Func(uint64_t Secret, Command* pCommand)
 
 void Hook()
 {
-    // Import functions
-    // address ntoskrnl = EnumerateKProcess(L"ntoskrnl.exe");
-    // KeStackAttachProcess = (KeStackAttachProcess_t)FindFuncExports(ntoskrnl, "KeStackAttachProcess");
-    // KeUnstackDetachProcess = (KeUnstackDetachProcess_t)FindFuncExports(ntoskrnl, "KeUnstackDetachProcess");
+    // Check if data
+    if (pData) return;
 
     // Data ptr swap
-    address instruction = (uint64_t)SectionScan(L"", L"ntoskrnl.exe", "PAGE", Signature) + 0x3;
+    address instruction = (uint64_t)SectionScan(L"", L"ntoskrnl.exe","PAGE", Decode(SignatureEncode).data()) + 0x3;
     pData = (address *) (instruction + 0x4 + *(uint32_t *) instruction);
 
     // Exchange
@@ -97,13 +85,6 @@ void UnHook()
 }
 
 /*
-    extern "C"
-    {
-        void KeStackAttachProcess(arch::address process_address, std::uint64_t* apc_state);
-
-        void KeUnstackDetachProcess(std::uint64_t* apc_state);
-    }
-
     ALWAYS_INLINE arch::address xchg_ptr(arch::address target, arch::address value) {
         arch::address old = value;
         asm volatile ("xchg %0, (%1)"

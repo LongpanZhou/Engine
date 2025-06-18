@@ -1,6 +1,5 @@
 #include "Func.cpp"
 #include "Hooks.cpp"
-#include "Crypt.cpp"
 
 ntstatus DriverExit(PDRIVER_OBJECT)
 {
@@ -23,7 +22,13 @@ ntstatus DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING)
     // auto t = AccessVirtualMemory<void *>(tmp, 0x1ad000);
 
     // Encryption
-
+    // constexpr auto Cstr = Encode("Hello World");
+    // print(INFO("Encoded: %s"), Cstr);
+    // print(INFO("Decoded: %s"), Decode(Cstr));
+    //
+    // constexpr auto Wstr = Encode(L"Hello World");
+    // print(INFO("Encoded: %ws"), Wstr);
+    // print(INFO("Decoded: %ws"), Decode(Wstr));
 
     // Hook
     Hook();

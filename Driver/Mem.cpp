@@ -7,9 +7,7 @@ namespace
     pde_2mb* PDE_2MB;
     pte* PTE_4KB;
 
-    address VA_1GB{};
-    address VA_2MB{};
-    address VA_4KB{};
+    address VA{};
 }
 
 enum pagesize : uint32_t
@@ -56,13 +54,13 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
             PDPTE_1GB->page_size = 1;
             PDPTE_1GB->page_frame_number = PhysicalAddress >> 30;
 
-            VA_1GB.offset = PhysicalAddress.offset;
-            VA_1GB.p1_index = PhysicalAddress.p1_index;
-            VA_1GB.p2_index = PhysicalAddress.p2_index;
-            VA_1GB.p3_index = PDPT_IDX;
-            VA_1GB.p4_index = PML4_IDX;
+            VA.offset = PhysicalAddress.offset;
+            VA.p1_index = PhysicalAddress.p1_index;
+            VA.p2_index = PhysicalAddress.p2_index;
+            VA.p3_index = PDPT_IDX;
+            VA.p4_index = PML4_IDX;
 
-            Callback(VA_1GB);
+            Callback(VA);
             PDPTE_1GB->present = 0;
         }
 
@@ -84,13 +82,13 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
             PDE_2MB->page_size = 1;
             PDE_2MB->page_frame_number = PhysicalAddress >> 21;
 
-            VA_2MB.offset = PhysicalAddress.offset;
-            VA_2MB.p1_index = PhysicalAddress.p1_index;
-            VA_2MB.p2_index = PD_IDX;
-            VA_2MB.p3_index = PDPT_IDX;
-            VA_2MB.p4_index = PML4_IDX;
+            VA.offset = PhysicalAddress.offset;
+            VA.p1_index = PhysicalAddress.p1_index;
+            VA.p2_index = PD_IDX;
+            VA.p3_index = PDPT_IDX;
+            VA.p4_index = PML4_IDX;
 
-            Callback(VA_2MB);
+            Callback(VA);
             PDE_2MB->present = 0;
             return true;
         }
@@ -109,13 +107,13 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
         PTE_4KB->write = 1;
         PTE_4KB->page_frame_number = PhysicalAddress >> 12;
 
-        VA_4KB.offset = PhysicalAddress.offset;
-        VA_4KB.p1_index = PT_IDX;
-        VA_4KB.p2_index = PD_IDX;
-        VA_4KB.p3_index = PDPT_IDX;
-        VA_4KB.p4_index = PML4_IDX;
+        VA.offset = PhysicalAddress.offset;
+        VA.p1_index = PT_IDX;
+        VA.p2_index = PD_IDX;
+        VA.p3_index = PDPT_IDX;
+        VA.p4_index = PML4_IDX;
 
-        Callback(VA_4KB);
+        Callback(VA);
         PTE_4KB->present = 0;
         return true;
     }

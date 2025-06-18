@@ -5,7 +5,7 @@
 PVOID EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleName)
 {
     // Check if EProcess is empty
-    if (!win::MmIsAddressValid(pEProcess)) return nullptr;
+    if (!pEProcess) return nullptr;
     print(INFO("EProcess Address: %p"), pEProcess);
     print(INFO("Target Module Name: %ws"), ModuleName);
 
@@ -219,28 +219,28 @@ PVOID SectionScan(const wchar_t *ProcessName, const wchar_t *ModuleName, const c
     address BaseAddress = ProcessName[0] == L'\0'
                               ? EnumerateKProcess(ModuleName)
                               : EnumerateModuleBaseAddress(EnumerateEProcess(ProcessName), ModuleName);
-    if (!win::MmIsAddressValid(BaseAddress)) return nullptr;
+    if (!BaseAddress) return nullptr;
 
     // Get section
     auto dosHeader = (_IMAGE_DOS_HEADER *) BaseAddress;
     print(INFO("dosHeader: %p"), dosHeader);
-    if (!win::MmIsAddressValid(dosHeader)) return nullptr;
+    if (!dosHeader) return nullptr;
 
     auto ntHeader = (_IMAGE_NT_HEADERS64 *) (BaseAddress + dosHeader->e_lfanew);
     print(INFO("ntHeader: %p"), ntHeader);
-    if (!win::MmIsAddressValid(ntHeader)) return nullptr;
+    if (!ntHeader) return nullptr;
 
     auto fileHeader = &ntHeader->FileHeader;
     print(INFO("fileHeader: %p"), fileHeader);
-    if (!win::MmIsAddressValid(fileHeader)) return nullptr;
+    if (!fileHeader) return nullptr;
 
     auto optionalHeader = &ntHeader->OptionalHeader;
     print(INFO("optionalHeader: %p"), optionalHeader);
-    if (!win::MmIsAddressValid(optionalHeader)) return nullptr;
+    if (!optionalHeader) return nullptr;
 
     auto sectionHeader = (_IMAGE_SECTION_HEADER *)((uint64_t) optionalHeader + sizeof(_IMAGE_OPTIONAL_HEADER64));
     print(INFO("sectionHeader: %p"), sectionHeader);
-    if (!win::MmIsAddressValid(sectionHeader)) return nullptr;
+    if (!(sectionHeader)) return nullptr;
 
     // loop
     void *sectionStart{};
