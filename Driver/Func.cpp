@@ -2,7 +2,7 @@
 #include "Lib/utils.h"
 #include "Mem.cpp"
 
-PVOID EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleName)
+address EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleName)
 {
     // Check if EProcess is empty
     if (!pEProcess) return nullptr;
@@ -10,7 +10,7 @@ PVOID EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleName
     print(INFO("Target Module Name: %ws"), ModuleName);
 
     // Get KProcess n CR3
-    _KPROCESS *pKProcess = (_KPROCESS *)pEProcess;
+    _KPROCESS *pKProcess = (_KPROCESS *) pEProcess;
     cr3 CR3 = {pKProcess->DirectoryTableBase};
     print(INFO("KProcess Address: %p"), pKProcess);
     print(INFO("KProcess CR3: %p"), CR3);
@@ -67,7 +67,7 @@ PVOID EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleName
     return nullptr;
 }
 
-PVOID EnumerateKProcess(const wchar_t *ProcessName, const uint64_t PID = -1)
+address EnumerateKProcess(const wchar_t *ProcessName, const uint64_t PID = -1)
 {
     // Parameters
     print(INFO("Target KProcess Name: %ws"), ProcessName);
@@ -148,20 +148,21 @@ _EPROCESS *EnumerateEProcess(const wchar_t *ProcessName, const uint64_t PID = -1
     return nullptr;
 }
 
-__forceinline CHAR HexToByte(char c)
-{
-    if (c >= '0' && c <= '9') return (c - '0');
-    if (c >= 'A' && c <= 'F') return (c - 'A' + 0xA);
-    if (c >= 'a' && c <= 'f') return (c - 'a' + 0xA);
-    return 0xFF; //Invalid
+constexpr uint8_t HexToByte(char c) {
+    return (c >= '0' && c <= '9') ? c - '0' :
+           (c >= 'A' && c <= 'F') ? c - 'A' + 0xA :
+           (c >= 'a' && c <= 'f') ? c - 'a' + 0xA :
+           0xFF; // Invalid
 }
 
-PVOID PatternToBytes(char *const Signature)
+template<size_t N>
+constexpr std::array<char, N> PatternToBytes(const char (&Signature)[N])
 {
+    std::array<char, N> Bytes{};
     size_t i = 0;
     size_t len = 0;
 
-    while (i < strlen(Signature))
+    while (i < N - 1)
     {
         switch (Signature[i])
         {
@@ -169,35 +170,35 @@ PVOID PatternToBytes(char *const Signature)
                 break;
             case '?':
                 ++i; // ? can only be followed by ' ' or '?'
-                Signature[len++] = '?';
+                Bytes[len++] = '?';
                 break;
             default:
                 char high = HexToByte(Signature[i]);
                 char low = HexToByte(Signature[++i]);
-                Signature[len++] = (high<<4 | low);
+                Bytes[len++] = (high << 4 | low);
         }
         ++i;
     }
 
-    Signature[len] = '\0';
-    return Signature;
+    Bytes[len] = '\0';
+    return Bytes;
 }
 
-PVOID SignatureScan(const void *StartAddress, const void *EndAddress, char *const Signature)
+address SignatureScan(const void *StartAddress, const void *EndAddress, const char *Signature)
 {
     print(INFO("Start Address: %p"), StartAddress);
     print(INFO("End Address: %p"), EndAddress);
-
-    // This algo is so slow
-    PatternToBytes(Signature);
-    size_t size = strlen(Signature);
     print(INFO("Signature Address: %p"), Signature);
+    size_t size = strlen(Signature);
 
-    for (const char *Current = (char *) StartAddress; Current <= (char *) ((size_t)EndAddress - size); ++Current)
+    for (const char *Current = (char *) StartAddress; Current <= (char *) ((size_t) EndAddress - size); ++Current)
         for (size_t i = 0; i <= size; ++i)
         {
             if (i == size)
-                return (void *) Current;
+            {
+                print(INFO("Signature: %p"), Current);
+                return Current;
+            }
 
             if (Signature[i] != '?' && Signature[i] != Current[i])
                 break;
@@ -207,7 +208,8 @@ PVOID SignatureScan(const void *StartAddress, const void *EndAddress, char *cons
     return nullptr;
 }
 
-PVOID SectionScan(const wchar_t *ProcessName, const wchar_t *ModuleName, const char *SectionName, char *const Signature)
+address SectionScan(const wchar_t *ProcessName, const wchar_t *ModuleName, const char *SectionName,
+                    const char *Signature)
 {
     // Print info
     print(INFO("ProcessName: %ws"), ProcessName);
@@ -238,7 +240,7 @@ PVOID SectionScan(const wchar_t *ProcessName, const wchar_t *ModuleName, const c
     print(INFO("optionalHeader: %p"), optionalHeader);
     if (!optionalHeader) return nullptr;
 
-    auto sectionHeader = (_IMAGE_SECTION_HEADER *)((uint64_t) optionalHeader + sizeof(_IMAGE_OPTIONAL_HEADER64));
+    auto sectionHeader = (_IMAGE_SECTION_HEADER *) ((uint64_t) optionalHeader + sizeof(_IMAGE_OPTIONAL_HEADER64));
     print(INFO("sectionHeader: %p"), sectionHeader);
     if (!(sectionHeader)) return nullptr;
 
@@ -246,10 +248,11 @@ PVOID SectionScan(const wchar_t *ProcessName, const wchar_t *ModuleName, const c
     void *sectionStart{};
     void *sectionEnd{};
 
+    // Find Section
     for (int i = 0; i < fileHeader->NumberOfSections; i++)
     {
         print(INFO("Section Name: %s"), sectionHeader[i].Name);
-        if (!memcmp(sectionHeader[i].Name, SectionName, std::min(8,(int)strlen(SectionName))))
+        if (!memcmp(sectionHeader[i].Name, SectionName, std::min(8, (int) strlen(SectionName))))
         {
             sectionStart = BaseAddress + sectionHeader[i].VirtualAddress;
             sectionEnd = BaseAddress + sectionHeader[i].VirtualAddress + sectionHeader[i].Misc.VirtualSize;
@@ -258,7 +261,5 @@ PVOID SectionScan(const wchar_t *ProcessName, const wchar_t *ModuleName, const c
     }
 
     // Signature Scan
-    void* tmp = SignatureScan(sectionStart, sectionEnd, Signature);
-    print(INFO("Signature: %p"), tmp);
-    return tmp;
+    return SignatureScan(sectionStart, sectionEnd, Signature);
 }

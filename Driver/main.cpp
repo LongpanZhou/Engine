@@ -13,13 +13,14 @@ ntstatus DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING)
     // Initialization
     // DriverObject->DriverUnload = DriverExit;
 
-    // Func
+    // Functions
     // _EPROCESS* pEProcess = EnumerateEProcess(L"notepad.exe");
     // void* pModule = EnumerateModuleBaseAddress(pEProcess, L"ntdll.dll");
     // print(INFO("Module Address: %p"), pModule);
     //
     // void *tmp = EnumerateKProcess(L"ntoskrnl.exe");
-    // auto t = AccessVirtualMemory<void *>(tmp, 0x1ad000);
+    // AccessVirtualMemory(tmp, 0x1ad000, &tmp, sizeof(tmp));
+    // print(INFO("KProcess Address: %p"), tmp);
 
     // Encryption
     // constexpr auto Cstr = Encode("Hello World");
