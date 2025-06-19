@@ -23,13 +23,13 @@ ntstatus DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING)
     // print(INFO("KProcess Address: %p"), tmp);
 
     // Encryption
-    // constexpr auto Cstr = Encode("Hello World");
-    // print(INFO("Encoded: %s"), Cstr);
-    // print(INFO("Decoded: %s"), Decode(Cstr));
-    //
-    // constexpr auto Wstr = Encode(L"Hello World");
-    // print(INFO("Encoded: %ws"), Wstr);
-    // print(INFO("Decoded: %ws"), Decode(Wstr));
+    constexpr auto Cstr = Encode("Hello World");
+    print(INFO("Encoded: %s"), Cstr);
+    print(INFO("Decoded: %s"), Decode(Cstr));
+
+    constexpr auto Wstr = Encode(L"Hello World");
+    print(INFO("Encoded: %ws"), Wstr);
+    print(INFO("Decoded: %ws"), Decode(Wstr));
 
     // Hook
     Hook();

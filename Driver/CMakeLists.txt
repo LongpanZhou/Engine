@@ -10,6 +10,7 @@ find_package(CrossWDK REQUIRED)
 
 # Get current UNIX time at CMake configure time
 string(TIMESTAMP CURRENT_UNIX_TIME "%s" UTC)
+add_compile_definitions(SEED=${CURRENT_UNIX_TIME})
 
 # Generate seed.h with SEED macro
 file(WRITE "${CMAKE_CURRENT_SOURCE_DIR}/seed.h" "#pragma once\n#define SEED ${CURRENT_UNIX_TIME}\n")

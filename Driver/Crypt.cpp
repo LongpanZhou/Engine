@@ -1,5 +1,3 @@
-#include "seed.h"
-
 // Hash are not used but left for future if you want to hide string
 uint64_t Hash(const char *Str, uint64_t Seed)
 {
@@ -10,43 +8,22 @@ uint64_t Hash(const char *Str, uint64_t Seed)
     return Seed;
 }
 
-// XOR
-constexpr char key = SEED & 0xff;
-constexpr wchar_t wkey = SEED & 0xffff;
-
 // No more ChatGPT
-template<size_t N>
-constexpr std::array<char, N> Encode(const char (&Str)[N])
+template<typename T, size_t N>
+constexpr std::array<T, N> Encode(const T (&Str)[N])
 {
-    std::array<char, N> encrypted{};
+    std::array<T, N> encrypted{};
     for (size_t i = 0; i < N; ++i)
-        encrypted[i] = Str[i] ^ key;
+        encrypted[i] = Str[i] ^ SEED;
     return encrypted;
 }
 
-template<size_t N>
-constexpr std::array<wchar_t, N> Encode(const wchar_t (&Str)[N])
+// Don't criticize this pls, i want to keep naming constant with constexpr
+template<typename T, size_t N>
+constexpr std::array<T, N> Decode(const std::array<T, N> &Str)
 {
-    std::array<wchar_t, N> encrypted{};
+    std::array<T, N> tmp = Str;
     for (size_t i = 0; i < N; ++i)
-        encrypted[i] = Str[i] ^ wkey;
-    return encrypted;
-}
-
-template<size_t N>
-constexpr std::array<char, N> Decode(const std::array<char, N> &Str)
-{
-    std::array<char, N> tmp = Str;
-    for (size_t i = 0; i < N; ++i)
-        tmp[i] ^= key;
-    return tmp;
-}
-
-template<size_t N>
-constexpr std::array<wchar_t, N> Decode(const std::array<wchar_t, N> &Str)
-{
-    std::array<wchar_t, N> tmp = Str;
-    for (size_t i = 0; i < N; ++i)
-        tmp[i] ^= wkey;
+        tmp[i] ^= SEED;
     return tmp;
 }
