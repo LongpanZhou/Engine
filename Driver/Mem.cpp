@@ -121,7 +121,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
     return false;
 }
 
-// Read Physical Memory
+// PhysicalMemory
 template<typename T>
 T AccessPhysicalMemory(address PhysicalAddress, pagesize PageSize, bool write = false)
 {
@@ -155,25 +155,25 @@ bool AccessPhysicalMemory(address PhysicalAddress, address pBuffer, size_t Size,
 std::pair<address, pagesize> GetPhysicalAddress(address VirtualAddress, cr3 CR3)
 {
     // Translation...       Type 0: 4KB, Type 1: 2MB, Type 2: 1GB
-    pdpe PML4E = AccessPhysicalMemory<pdpe>({(CR3.pml4_frame_number << 12) + VirtualAddress.p4_index * 8}, Page_4KB);
-    if (!PML4E) return {};
+    auto PML4E = AccessPhysicalMemory<pml4e>({(CR3.pml4_frame_number << 12) + VirtualAddress.p4_index * 8}, Page_4KB);
+    if (!PML4E.present) return {};
 
     auto PDPTE = AccessPhysicalMemory<pdpe>({(PML4E.page_frame_number << 12) + VirtualAddress.p3_index * 8}, Page_4KB);
-    if (!PDPTE) return {};
+    if (!PDPTE.present) return {};
     if (((pdpe_1gb)PDPTE).page_size)
         return {((pdpe_1gb)PDPTE).page_frame_number << 30 | VirtualAddress.offset_1gb(), Page_1GB};
 
     auto PDE = AccessPhysicalMemory<pde>({(PDPTE.page_frame_number << 12) + VirtualAddress.p2_index * 8}, Page_4KB);
-    if (!PDE) return {};
+    if (!PDE.present) return {};
     if (((pde_2mb)PDE).page_size)
         return {((pde_2mb)PDE).page_frame_number << 21 | VirtualAddress.offset_2mb(), Page_2MB};
 
     auto PT = AccessPhysicalMemory<pte>({(PDE.page_frame_number << 12) + VirtualAddress.p1_index * 8}, Page_4KB);
-    if (!PT) return {};
+    if (!PT.present) return {};
     return {PT.page_frame_number << 12 | VirtualAddress.offset, Page_4KB};
 }
 
-// Read Virtual Memory
+// VirtualMemory
 template<typename T>
 T AccessVirtualMemory(address VirtualAddress, cr3 CR3, bool write = false)
 {
@@ -187,4 +187,10 @@ bool AccessVirtualMemory(address VirtualAddress, cr3 CR3, address pBuffer, size_
     std::pair<address,pagesize> tmp = GetPhysicalAddress(VirtualAddress, CR3);
     if (!tmp.first) return false;
     return AccessPhysicalMemory(tmp.first, pBuffer, Size, tmp.second, write);
+}
+
+// MmIsAddressValid
+inline bool IsAddressValid(address VirtualAddress, cr3 CR3)
+{
+    return GetPhysicalAddress(VirtualAddress, CR3).first;
 }

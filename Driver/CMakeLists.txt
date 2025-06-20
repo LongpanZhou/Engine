@@ -12,7 +12,7 @@ find_package(CrossWDK REQUIRED)
 string(TIMESTAMP CURRENT_UNIX_TIME "%s" UTC)
 add_compile_definitions(SEED=${CURRENT_UNIX_TIME})
 
-# Generate seed.h with SEED macro
+# Generate seed.h with SEED macro (NOT ADDING THIS DOES NOT WORK)
 file(WRITE "${CMAKE_CURRENT_SOURCE_DIR}/seed.h" "#pragma once\n#define SEED ${CURRENT_UNIX_TIME}\n")
 
 # Driver entry point

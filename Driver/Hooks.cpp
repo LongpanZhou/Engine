@@ -1,5 +1,4 @@
 #include "Crypt.cpp"
-#include "LazyImport.cpp"
 
 enum
 {
@@ -11,18 +10,19 @@ struct Command
 {
     void *SrcAddress;
     void *DestAddress;
-    uint64_t SrcPID;
-    uint64_t DestPID;
+    uint32_t SrcPID;
+    uint32_t DestPID;
     uint32_t Size;
     uint32_t OpCode;
-};
+} __attribute__((packed));
 
 // NtCompareSigningLevels
-constexpr auto Signature = PatternToBytes("4C 8B 05 ? ? ? ? 33 C0 4D 85 C0 74 ? 49 8B C0 E8 ? ? ? ? F7 D8");
+constexpr auto Signature = Decode(PatternToBytes("4C 8B 05 ? ? ? ? 33 C0 4D 85 C0 74 ? 49 8B C0 E8 ? ? ? ? F7 D8"));
 using func_type = uint64_t (__fastcall*)();
 func_type OriginalFunc;
 address *pData;
 
+// Hook Func
 uint64_t __fastcall Func(uint64_t Secret, Command *pCommand)
 {
     static Command cmd;
@@ -60,13 +60,14 @@ uint64_t __fastcall Func(uint64_t Secret, Command *pCommand)
     return OriginalFunc();
 }
 
+// Hook
 void Hook()
 {
-    // Check if data
+    // Check if dataptr empty
     if (pData) return;
 
     // Data ptr swap
-    address instruction = SectionScan(L"", L"ntoskrnl.exe", "PAGE", Signature.data()) + 0x3;
+    address instruction = SectionScan(GetNtoskrnl(), "PAGE", Decode(Signature).data()) + 0x3;
     pData = (address *) (instruction + 0x4 + *(uint32_t *) instruction);
 
     // Exchange
@@ -74,6 +75,7 @@ void Hook()
     print(INFO("HOOKED"));
 }
 
+// UnHook
 void UnHook()
 {
     // Check if dataptr exist

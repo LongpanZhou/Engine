@@ -1,3 +1,5 @@
+#include "seed.h"
+
 // Hash are not used but left for future if you want to hide string
 uint64_t Hash(const char *Str, uint64_t Seed)
 {

@@ -6,13 +6,12 @@ address EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleNa
 {
     // Check if EProcess is empty
     if (!pEProcess) return nullptr;
-    print(INFO("EProcess Address: %p"), pEProcess);
-    print(INFO("Target Module Name: %ws"), ModuleName);
 
     // Get KProcess n CR3
     _KPROCESS *pKProcess = (_KPROCESS *) pEProcess;
     cr3 CR3 = {pKProcess->DirectoryTableBase};
-    print(INFO("KProcess Address: %p"), pKProcess);
+    print(INFO("EProcess Address: %p"), pEProcess);
+    print(INFO("Target Module Name: %ws"), ModuleName);
     print(INFO("KProcess CR3: %p"), CR3);
 
     // Get PEB (Process Environment Block)
@@ -148,6 +147,7 @@ _EPROCESS *EnumerateEProcess(const wchar_t *ProcessName, const uint64_t PID = -1
     return nullptr;
 }
 
+// Hex to bytes
 constexpr uint8_t HexToByte(char c) {
     return (c >= '0' && c <= '9') ? c - '0' :
            (c >= 'A' && c <= 'F') ? c - 'A' + 0xA :
@@ -155,6 +155,7 @@ constexpr uint8_t HexToByte(char c) {
            0xFF; // Invalid
 }
 
+// Pattern to Bytes
 template<size_t N>
 constexpr std::array<char, N> PatternToBytes(const char (&Signature)[N])
 {
@@ -184,6 +185,7 @@ constexpr std::array<char, N> PatternToBytes(const char (&Signature)[N])
     return Bytes;
 }
 
+// Signature Scan
 address SignatureScan(const void *StartAddress, const void *EndAddress, const char *Signature)
 {
     print(INFO("Start Address: %p"), StartAddress);
@@ -208,21 +210,9 @@ address SignatureScan(const void *StartAddress, const void *EndAddress, const ch
     return nullptr;
 }
 
-address SectionScan(const wchar_t *ProcessName, const wchar_t *ModuleName, const char *SectionName,
-                    const char *Signature)
+// Section Signature Scan
+address SectionScan(address BaseAddress, const char *SectionName, const char *Signature)
 {
-    // Print info
-    print(INFO("ProcessName: %ws"), ProcessName);
-    print(INFO("ModuleName: %ws"), ModuleName);
-    print(INFO("SectionName: %s"), SectionName);
-    print(INFO("Signature: %s"), Signature);
-
-    // Initialize variables (empty = Kernel, else = User)
-    address BaseAddress = ProcessName[0] == L'\0'
-                              ? EnumerateKProcess(ModuleName)
-                              : EnumerateModuleBaseAddress(EnumerateEProcess(ProcessName), ModuleName);
-    if (!BaseAddress) return nullptr;
-
     // Get section
     auto dosHeader = (_IMAGE_DOS_HEADER *) BaseAddress;
     print(INFO("dosHeader: %p"), dosHeader);
@@ -262,4 +252,99 @@ address SectionScan(const wchar_t *ProcessName, const wchar_t *ModuleName, const
 
     // Signature Scan
     return SignatureScan(sectionStart, sectionEnd, Signature);
+}
+
+// Get ntoskrnl.exe address
+address GetNtoskrnl()
+{
+    // IDT
+    interrupt_descriptor_table idt = sidt();
+    address base = idt.base;
+
+    // Brute Force
+    do {
+        // Get Data Directory
+        auto dosHeader = (_IMAGE_DOS_HEADER *)base;
+        if (!IsAddressValid(dosHeader, 0x1ad000) || dosHeader->e_magic != 0x5A4D)
+            continue;
+
+        auto ntHeader = (_IMAGE_NT_HEADERS64 *)(base + dosHeader->e_lfanew);
+        if (!IsAddressValid(ntHeader, 0x1ad000) || ntHeader->Signature != 0x4550)
+            continue;
+
+        auto dataDir = ntHeader->OptionalHeader.DataDirectory;
+        if (dataDir->VirtualAddress == 0)
+            continue;
+
+        auto exportDir = (_IMAGE_EXPORT_DIRECTORY *)(base + dataDir->VirtualAddress);
+        if (!IsAddressValid(exportDir, 0x1ad000))
+            continue;
+
+        // Get module name from export directory
+        const char* name = (const char*)(base + exportDir->Name);
+        if (!IsAddressValid(name, 0x1ad000))
+            continue;
+
+        // Check ntoskrnl.exe
+        if (strcmp(name, "ntoskrnl.exe"))
+            continue;
+
+        // Ntoskrnl.exe
+        print(INFO("ntoskrnl.exe: %p"), base);
+        return base;
+    } while (base -= 0x1000);
+
+    print(ERROR("ntoskrnl.exe NOT FOUND!"));
+    return nullptr;
+}
+
+// Lazy Import
+address FindFuncExports(address BaseAddress, const char *FuncName)
+{
+    // Get Export Directory
+    auto dosHeader = (_IMAGE_DOS_HEADER *) BaseAddress;
+    print(INFO("dosHeader: %p"), dosHeader);
+    if (!dosHeader) return nullptr;
+
+    auto ntHeader = (_IMAGE_NT_HEADERS64 *) (BaseAddress + dosHeader->e_lfanew);
+    print(INFO("ntHeader: %p"), ntHeader);
+    if (!ntHeader) return nullptr;
+
+    auto dataDir = ntHeader->OptionalHeader.DataDirectory;
+    print(INFO("dataDir: %p"), dataDir);
+    if (!dataDir) return nullptr;
+
+    auto exportDir = (_IMAGE_EXPORT_DIRECTORY *) (BaseAddress + dataDir->VirtualAddress);
+    print(INFO("exportDir: %p"), exportDir);
+    if (!exportDir) return nullptr;
+
+    // Get FuncAddress
+    uint32_t *functions = (uint32_t *) (BaseAddress + exportDir->AddressOfFunctions);
+    print(INFO("functions: %p"), functions);
+    if (!functions) return nullptr;
+
+    // Get NameOrdinalAddress
+    uint16_t *ordinals = (uint16_t *) (BaseAddress + exportDir->AddressOfNameOrdinals);
+    print(INFO("ordinals: %p"), ordinals);
+    if (!ordinals) return nullptr;
+
+    // Get NameAddress
+    uint32_t *names = (uint32_t *) (BaseAddress + exportDir->AddressOfNames);
+    print(INFO("names: %p"), names);
+    if (!names) return nullptr;
+
+    // Loop through export table
+    for (uint32_t i = 0; i < exportDir->NumberOfNames; ++i)
+    {
+        const char *funcName = (const char *) (BaseAddress + names[i]);
+        print(INFO("Function Name: %s"), funcName);
+
+        if (!strcmp(funcName, FuncName))
+        {
+            return BaseAddress + functions[ordinals[i]];;
+        }
+    }
+
+    print(ERROR("EXPORT FUNCTION NOT FOUND!"));
+    return nullptr;
 }

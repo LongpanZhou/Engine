@@ -1,9 +1,10 @@
 #include "Func.cpp"
 #include "Hooks.cpp"
+#include "NMI.cpp"
 
 ntstatus DriverExit(PDRIVER_OBJECT)
 {
-    UnHook();
+    // UnHook();
     return ntstatus::success;
 }
 
@@ -28,10 +29,10 @@ ntstatus DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING)
     print(INFO("Decoded: %s"), Decode(Cstr));
 
     constexpr auto Wstr = Encode(L"Hello World");
-    print(INFO("Encoded: %ws"), Wstr);
+    print(INFO("Encoded: %ws"), Wstr);//
     print(INFO("Decoded: %ws"), Decode(Wstr));
 
     // Hook
-    Hook();
+    Hook();//
     return ntstatus::success;
 }
