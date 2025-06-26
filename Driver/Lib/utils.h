@@ -12,7 +12,7 @@
 
 
 //PRINT FUNC
-#define DEBUG
+// #define DEBUG
 
 #ifdef DEBUG
 // PRINT FUNC for debug mode

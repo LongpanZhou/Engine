@@ -22,17 +22,22 @@ ntstatus DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING)
     // void *tmp = EnumerateKProcess(L"ntoskrnl.exe");
     // AccessVirtualMemory(tmp, 0x1ad000, &tmp, sizeof(tmp));
     // print(INFO("KProcess Address: %p"), tmp);
+    //
+    // GetNtoskrnl();
 
     // Encryption
-    constexpr auto Cstr = Encode("Hello World");
-    print(INFO("Encoded: %s"), Cstr);
-    print(INFO("Decoded: %s"), Decode(Cstr));
-
-    constexpr auto Wstr = Encode(L"Hello World");
-    print(INFO("Encoded: %ws"), Wstr);//
-    print(INFO("Decoded: %ws"), Decode(Wstr));
+    // constexpr auto Cstr = Encode("Hello World");
+    // print(INFO("Encoded: %s"), Cstr.data());
+    // print(INFO("Decoded: %s"), Decode(Cstr).data());
+    //
+    // constexpr auto Wstr = Encode(L"Hello World");
+    // print(INFO("Encoded: %ws"), Wstr.data());
+    // print(INFO("Decoded: %ws"), Decode(Wstr).data());
 
     // Hook
-    Hook();//
+    Hook();
+
+    // NMI
+    IDTHook();
     return ntstatus::success;
 }

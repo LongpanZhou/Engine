@@ -6,22 +6,21 @@
 
 #include <wdk/wdk.hpp>
 
-#define BOOL bool
-#define VOID void
-#define PVOID void*
+typedef bool BOOL;
+typedef void VOID;
+typedef void* PVOID;
 
-#define UCHAR uint8_t
-#define USHORT uint16_t
-#define ULONG uint32_t
-#define ULONGLONG uint64_t
+typedef uint8_t     UCHAR;
+typedef uint16_t    USHORT;
+typedef uint32_t    ULONG;
+typedef uint64_t    ULONGLONG;
 
-#define CHAR int8_t
-#define SHORT int16_t
-#define LONG int32_t
-#define LONGLONG int64_t
+typedef int8_t      CHAR;
+typedef int16_t     SHORT;
+typedef int32_t     LONG;
+typedef int64_t     LONGLONG;
 
 #define _UNICODE_STRING UNICODE_STRING
-
 #define CONTAINING_RECORD(address, type, field) ((type *)((uint64_t)(address) - (uint64_t)(&((type *)0)->field)))
 
 // PE HEADER BS

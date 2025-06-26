@@ -15,7 +15,7 @@ template<typename T, size_t N>
 constexpr std::array<T, N> Encode(const T (&Str)[N])
 {
     std::array<T, N> encrypted{};
-    for (size_t i = 0; i < N; ++i)
+    for (size_t i = 0; i < N-1; ++i)
         encrypted[i] = Str[i] ^ SEED;
     return encrypted;
 }
@@ -25,7 +25,7 @@ template<typename T, size_t N>
 constexpr std::array<T, N> Decode(const std::array<T, N> &Str)
 {
     std::array<T, N> tmp = Str;
-    for (size_t i = 0; i < N; ++i)
+    for (size_t i = 0; i < N-1; ++i)
         tmp[i] ^= SEED;
     return tmp;
 }

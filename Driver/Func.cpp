@@ -242,7 +242,7 @@ address SectionScan(address BaseAddress, const char *SectionName, const char *Si
     for (int i = 0; i < fileHeader->NumberOfSections; i++)
     {
         print(INFO("Section Name: %s"), sectionHeader[i].Name);
-        if (!memcmp(sectionHeader[i].Name, SectionName, std::min(8, (int) strlen(SectionName))))
+        if (!memcmp(sectionHeader[i].Name, SectionName, strlen(SectionName)))
         {
             sectionStart = BaseAddress + sectionHeader[i].VirtualAddress;
             sectionEnd = BaseAddress + sectionHeader[i].VirtualAddress + sectionHeader[i].Misc.VirtualSize;
