@@ -1,5 +1,6 @@
 #include "Lib/structs.h"
 #include "Lib/utils.h"
+#include "Crypt.cpp"
 #include "Mem.cpp"
 
 address EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleName)
@@ -18,9 +19,9 @@ address EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleNa
     _PEB *pPeb = pEProcess->Peb;
     if (!pPeb) return nullptr;
 
-    // Read LDR (Loader Dynamic Resources)
+    // Read LDR (Loader Dynamic Resources): the pointer stored at &pPeb->Ldr, not the struct it points to
     _PEB_LDR_DATA *pLdr;
-    AccessVirtualMemory(&pPeb->Ldr, CR3, &pLdr, sizeof(_PEB_LDR_DATA));
+    AccessVirtualMemory(&pPeb->Ldr, CR3, &pLdr, sizeof(pLdr));
     if (!pLdr) return nullptr;
 
     // Init variables for loop
@@ -31,11 +32,12 @@ address EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleNa
     _LDR_DATA_TABLE_ENTRY entry;
     UNICODE_STRING moduleName;
 
-    _LIST_ENTRY *pHead = moduleList.Flink;
+    // The head is the sentinel inside PEB_LDR_DATA; it is not a module, so the walk stops when it comes back
+    _LIST_ENTRY *pHead = (_LIST_ENTRY *) &pLdr->InLoadOrderModuleList;
     _LIST_ENTRY *pCurrent = moduleList.Flink;
 
     // Loop through all modules
-    do
+    while (pCurrent != pHead)
     {
         // Get LDR Entry
         if (!AccessVirtualMemory(pCurrent, CR3, &entry, sizeof(_LDR_DATA_TABLE_ENTRY)))
@@ -49,9 +51,11 @@ address EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleNa
         if (!(entry.DllBase && moduleName.Length && moduleName.Buffer))
             continue;
 
-        // Read memory into buffer
-        if (!AccessVirtualMemory(moduleName.Buffer, CR3, &pBuffer, sizeof(pBuffer)))
+        // Read only the name and its terminator, so a short name at the end of a page does not read past it
+        size_t NameBytes = moduleName.Length < sizeof(pBuffer) - sizeof(wchar_t) ? moduleName.Length : sizeof(pBuffer) - sizeof(wchar_t);
+        if (!AccessVirtualMemory(moduleName.Buffer, CR3, &pBuffer, NameBytes))
             continue;
+        pBuffer[NameBytes / sizeof(wchar_t)] = L'\0';
 
         // Print info
         print(INFO("Module Name: %ws"), pBuffer);
@@ -59,7 +63,7 @@ address EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleNa
         // Str cmp
         if (!wcscmp(pBuffer, ModuleName))
             return entry.DllBase;
-    } while (pCurrent != pHead);
+    }
 
     // Not Found
     print(ERROR("%ws NOT FOUND!"), ModuleName);
@@ -74,13 +78,13 @@ address EnumerateKProcess(const wchar_t *ProcessName, const uint64_t PID = -1)
 
     // Init variables for loop
     _LIST_ENTRY *pHead = (_LIST_ENTRY *) win::PsLoadedModuleList;
-    _LIST_ENTRY *pCurrent = pHead;
+    _LIST_ENTRY *pCurrent = pHead->Flink;   // the list head is not a module
 
     _KLDR_DATA_TABLE_ENTRY *entry;
     _UNICODE_STRING moduleName;
 
     // Loop through all kernel modules
-    do
+    while (pCurrent != pHead)
     {
         // Get KLDR entry n get module name n increment pCurrent
         entry = CONTAINING_RECORD(pCurrent, _KLDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
@@ -97,7 +101,7 @@ address EnumerateKProcess(const wchar_t *ProcessName, const uint64_t PID = -1)
         // Str cmp
         if (!wcscmp(moduleName.Buffer, ProcessName))
             return entry->DllBase;
-    } while (pCurrent != pHead);
+    }
 
     // Not Found
     print(ERROR("%ws NOT FOUND!"), ProcessName);
@@ -124,7 +128,7 @@ _EPROCESS *EnumerateEProcess(const wchar_t *ProcessName, const uint64_t PID = -1
         pCurrent = pCurrent->Flink;
 
         // PID cmp
-        print(INFO("Process Name: %s, PID: %d"), pProcess->ImageFileName, pProcess->UniqueProcessId);
+        print(INFO("Process Name: %s, PID: %p"), pProcess->ImageFileName, pProcess->UniqueProcessId);
         if (pProcess->UniqueProcessId == (void *) PID)
             return pProcess;
 
@@ -136,10 +140,15 @@ _EPROCESS *EnumerateEProcess(const wchar_t *ProcessName, const uint64_t PID = -1
         print(INFO("File Path: %ws"),
               pProcess->ImageFilePointer->FileName.Buffer);
 
-        // Sub str cmp
+        // Match the file name only: the path must be longer than the name, and the name must follow a '\'
         size_t processLen = pProcess->ImageFilePointer->FileName.Length / sizeof(wchar_t);
-        if (targetLen && !wcscmp(pProcess->ImageFilePointer->FileName.Buffer + processLen - targetLen, ProcessName))
-            return pProcess;
+        if (targetLen && processLen > targetLen)
+        {
+            const wchar_t *FileName = pProcess->ImageFilePointer->FileName.Buffer;
+            size_t NameStart = processLen - targetLen;
+            if (FileName[NameStart - 1] == L'\\' && !memcmp(FileName + NameStart, ProcessName, targetLen * sizeof(wchar_t)))
+                return pProcess;
+        }
     } while (pCurrent != pHead);
 
     // Not Found
@@ -192,6 +201,13 @@ address SignatureScan(const void *StartAddress, const void *EndAddress, const ch
     print(INFO("End Address: %p"), EndAddress);
     print(INFO("Signature Address: %p"), Signature);
     size_t size = strlen(Signature);
+
+    // Nothing to search: a missing range, or one shorter than the signature (the bound below would wrap)
+    if (!StartAddress || !EndAddress || (size_t) EndAddress - (size_t) StartAddress < size)
+    {
+        print(ERROR("SIGNATURE NOT FOUND!"));
+        return nullptr;
+    }
 
     for (const char *Current = (char *) StartAddress; Current <= (char *) ((size_t) EndAddress - size); ++Current)
         for (size_t i = 0; i <= size; ++i)
@@ -250,9 +266,19 @@ address SectionScan(address BaseAddress, const char *SectionName, const char *Si
         }
     }
 
+    // Section not found: there is nothing to scan
+    if (!sectionStart)
+    {
+        print(ERROR("SECTION NOT FOUND!"));
+        return nullptr;
+    }
+
     // Signature Scan
     return SignatureScan(sectionStart, sectionEnd, Signature);
 }
+
+// Encoded runtime strings and the hook signature
+#include "Strings.h"
 
 // Get ntoskrnl.exe address
 address GetNtoskrnl()
@@ -261,15 +287,19 @@ address GetNtoskrnl()
     interrupt_descriptor_table idt = sidt();
     address base = idt.base;
 
+    // Validity checks walk the page tables of the System process, which map all of kernel memory.
+    // (Calling them with a constant in place of a CR3 checks against the wrong tables.)
+    cr3 SystemCR3 = {((_KPROCESS *) win::PsInitialSystemProcess)->DirectoryTableBase};
+
     // Brute Force
     do {
         // Get Data Directory
         auto dosHeader = (_IMAGE_DOS_HEADER *)base;
-        if (!IsAddressValid(dosHeader, 0x1ad000) || dosHeader->e_magic != 0x5A4D)
+        if (!IsAddressValid(dosHeader, SystemCR3) || dosHeader->e_magic != 0x5A4D)
             continue;
 
         auto ntHeader = (_IMAGE_NT_HEADERS64 *)(base + dosHeader->e_lfanew);
-        if (!IsAddressValid(ntHeader, 0x1ad000) || ntHeader->Signature != 0x4550)
+        if (!IsAddressValid(ntHeader, SystemCR3) || ntHeader->Signature != 0x4550)
             continue;
 
         auto dataDir = ntHeader->OptionalHeader.DataDirectory;
@@ -277,16 +307,16 @@ address GetNtoskrnl()
             continue;
 
         auto exportDir = (_IMAGE_EXPORT_DIRECTORY *)(base + dataDir->VirtualAddress);
-        if (!IsAddressValid(exportDir, 0x1ad000))
+        if (!IsAddressValid(exportDir, SystemCR3))
             continue;
 
         // Get module name from export directory
         const char* name = (const char*)(base + exportDir->Name);
-        if (!IsAddressValid(name, 0x1ad000))
+        if (!IsAddressValid(name, SystemCR3))
             continue;
 
         // Check ntoskrnl.exe
-        if (strcmp(name, "ntoskrnl.exe"))
+        if (strcmp(name, Decode(NtoskrnlName).data()))
             continue;
 
         // Ntoskrnl.exe
@@ -347,4 +377,31 @@ address FindFuncExports(address BaseAddress, const char *FuncName)
 
     print(ERROR("EXPORT FUNCTION NOT FOUND!"));
     return nullptr;
+}
+
+// SystemCodeIntegrityInformation (class 0x67) returns a length and a bit mask of code integrity options
+struct SYSTEM_CODEINTEGRITY_INFORMATION
+{
+    uint32_t Length;
+    uint32_t CodeIntegrityOptions;
+};
+
+constexpr uint32_t SystemCodeIntegrityInformationClass = 0x67;
+constexpr uint32_t CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED = 0x400;
+
+// Declared here because the vendor headers are not in this checkout; the signature is the kernel's
+extern "C" int32_t ZwQuerySystemInformation(uint32_t SystemInformationClass, void *SystemInformation,
+                                            uint32_t SystemInformationLength, uint32_t *ReturnLength);
+
+// Returns true if HVCI (hypervisor-enforced code integrity, "Memory integrity") is on for kernel code.
+// If the query fails, this returns false, which means "not known to be on".
+bool IsHVCIEnabled()
+{
+    SYSTEM_CODEINTEGRITY_INFORMATION info{};
+    info.Length = sizeof(info);
+
+    int32_t status = ZwQuerySystemInformation(SystemCodeIntegrityInformationClass, &info, sizeof(info), nullptr);
+    if (status < 0) return false;   // NTSTATUS values below zero are errors
+
+    return (info.CodeIntegrityOptions & CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED) != 0;
 }

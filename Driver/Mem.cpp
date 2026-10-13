@@ -1,15 +1,6 @@
 using namespace arch;
 using namespace intrin;
 
-namespace
-{
-    pdpe_1gb* PDPTE_1GB;
-    pde_2mb* PDE_2MB;
-    pte* PTE_4KB;
-
-    address VA{};
-}
-
 enum pagesize : uint32_t
 {
     Page_4KB,
@@ -18,26 +9,46 @@ enum pagesize : uint32_t
     Page_Unmap
 };
 
+// Claims an empty entry for a mapping. An entry is empty only when all of its bits are zero, so a claim never
+// takes an entry that a live mapping still uses, or overwrites a non-present entry that holds other state
+template<typename T>
+bool ClaimEntry(T *Entry, T Value)
+{
+    uint64_t Expected = 0;
+    uint64_t Desired;
+    memcpy(&Desired, &Value, sizeof(Desired));
+    return __atomic_compare_exchange_n((uint64_t *) Entry, &Expected, Desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+
+// Empties an entry again, so the next mapping can claim it
+template<typename T>
+void ReleaseEntry(T *Entry)
+{
+    __atomic_store_n((uint64_t *) Entry, 0, __ATOMIC_SEQ_CST);
+}
+
 // MapPhysicalToVirtual
 template<typename T>
 bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSize = Page_4KB)
 {
-    // Local variables
+    // Local variables. They are per call, so concurrent callers never share mapping state
     int PML4_IDX, PDPT_IDX, PD_IDX, PT_IDX;
     cr3 CR3 = read_cr3();
     address tmp;
+    address VA{};
 
     pml4e* PML4E;
     pdpe* PDPTE;
     pde* PDE;
 
-    // PML4
+    // PML4: the first present entry leads to the PDPT
     tmp = win::MmGetVirtualForPhysical({CR3.pml4_frame_number << 12});
     for (PML4_IDX = 0; PML4_IDX < 512; ++PML4_IDX)
     {
         PML4E = &((pml4e *)tmp)[PML4_IDX];
         if (PML4E->present) break;
     }
+    if (PML4_IDX == 512) return false;
 
     // PDPT
     tmp = win::MmGetVirtualForPhysical({PML4E->page_frame_number << 12});
@@ -48,11 +59,12 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
         {
             if (PDPTE->present) continue;
 
-            PDPTE_1GB = (pdpe_1gb*)PDPTE;
-            PDPTE_1GB->present = 1;
-            PDPTE_1GB->write = 1;
-            PDPTE_1GB->page_size = 1;
-            PDPTE_1GB->page_frame_number = PhysicalAddress >> 30;
+            pdpe_1gb Value{};
+            Value.present = 1;
+            Value.write = 1;
+            Value.page_size = 1;
+            Value.page_frame_number = PhysicalAddress >> 30;
+            if (!ClaimEntry((pdpe_1gb *) PDPTE, Value)) continue;
 
             VA.offset = PhysicalAddress.offset;
             VA.p1_index = PhysicalAddress.p1_index;
@@ -61,11 +73,14 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
             VA.p4_index = PML4_IDX;
 
             Callback(VA);
-            PDPTE_1GB->present = 0;
+            ReleaseEntry((pdpe_1gb *) PDPTE);
+            return true;
         }
 
-        if (PDPTE->present) break;
+        // A 1GB entry maps memory directly and is not a table, so only a present, non-large entry leads to a PD
+        if (PDPTE->present && !((pdpe_1gb *) PDPTE)->page_size) break;
     }
+    if (PageSize == Page_1GB || PDPT_IDX == 512) return false;
 
     // PD
     tmp = win::MmGetVirtualForPhysical({PDPTE->page_frame_number << 12});
@@ -76,11 +91,12 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
         {
             if (PDE->present) continue;
 
-            PDE_2MB = (pde_2mb *)PDE;
-            PDE_2MB->present = 1;
-            PDE_2MB->write = 1;
-            PDE_2MB->page_size = 1;
-            PDE_2MB->page_frame_number = PhysicalAddress >> 21;
+            pde_2mb Value{};
+            Value.present = 1;
+            Value.write = 1;
+            Value.page_size = 1;
+            Value.page_frame_number = PhysicalAddress >> 21;
+            if (!ClaimEntry((pde_2mb *) PDE, Value)) continue;
 
             VA.offset = PhysicalAddress.offset;
             VA.p1_index = PhysicalAddress.p1_index;
@@ -89,23 +105,27 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
             VA.p4_index = PML4_IDX;
 
             Callback(VA);
-            PDE_2MB->present = 0;
+            ReleaseEntry((pde_2mb *) PDE);
             return true;
         }
 
-        if (PDE->present) break;
+        // Same rule as the PDPT: a 2MB entry is a mapping, not a page table
+        if (PDE->present && !((pde_2mb *) PDE)->page_size) break;
     }
+    if (PageSize == Page_2MB || PD_IDX == 512) return false;
 
     // PT
     tmp = win::MmGetVirtualForPhysical({PDE->page_frame_number << 12});
     for (PT_IDX = 0; PT_IDX < 512; ++PT_IDX)
     {
-        PTE_4KB = &((pte *) tmp)[PT_IDX];
+        pte *PTE_4KB = &((pte *) tmp)[PT_IDX];
         if (PTE_4KB->present) continue;
 
-        PTE_4KB->present = 1;
-        PTE_4KB->write = 1;
-        PTE_4KB->page_frame_number = PhysicalAddress >> 12;
+        pte Value{};
+        Value.present = 1;
+        Value.write = 1;
+        Value.page_frame_number = PhysicalAddress >> 12;
+        if (!ClaimEntry(PTE_4KB, Value)) continue;
 
         VA.offset = PhysicalAddress.offset;
         VA.p1_index = PT_IDX;
@@ -114,7 +134,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
         VA.p4_index = PML4_IDX;
 
         Callback(VA);
-        PTE_4KB->present = 0;
+        ReleaseEntry(PTE_4KB);
         return true;
     }
 
@@ -123,21 +143,21 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
 
 // PhysicalMemory
 template<typename T>
-T AccessPhysicalMemory(address PhysicalAddress, pagesize PageSize, bool write = false)
+T AccessPhysicalMemory(address PhysicalAddress, pagesize PageSize)
 {
     T tmp{};
     MapPhysicalToVirtual(PhysicalAddress,
-        [&tmp, write](address VirtualAddress)
+        [&tmp](address VirtualAddress)
         {
             invlpg(VirtualAddress);
-            write ? memcpy(VirtualAddress, &tmp, sizeof(T))
-                  : memcpy(&tmp, VirtualAddress, sizeof(T));
+            memcpy(&tmp, VirtualAddress, sizeof(T));
         },
         PageSize
         );
     return tmp;
 }
 
+// Size must not cross the page the mapping covers; AccessVirtualMemory guarantees that
 bool AccessPhysicalMemory(address PhysicalAddress, address pBuffer, size_t Size, pagesize PageSize, bool write = false)
 {
     return MapPhysicalToVirtual(PhysicalAddress,
@@ -175,18 +195,30 @@ std::pair<address, pagesize> GetPhysicalAddress(address VirtualAddress, cr3 CR3)
 
 // VirtualMemory
 template<typename T>
-T AccessVirtualMemory(address VirtualAddress, cr3 CR3, bool write = false)
+T AccessVirtualMemory(address VirtualAddress, cr3 CR3)
 {
     std::pair<address,pagesize> tmp = GetPhysicalAddress(VirtualAddress, CR3);
     if (!tmp.first) return T{};
-    return AccessPhysicalMemory<T>(tmp.first, tmp.second, write);
+    return AccessPhysicalMemory<T>(tmp.first, tmp.second);
 }
 
 bool AccessVirtualMemory(address VirtualAddress, cr3 CR3, address pBuffer, size_t Size, bool write = false)
 {
-    std::pair<address,pagesize> tmp = GetPhysicalAddress(VirtualAddress, CR3);
-    if (!tmp.first) return false;
-    return AccessPhysicalMemory(tmp.first, pBuffer, Size, tmp.second, write);
+    // Copy one page at a time: the next virtual page can map to an unrelated physical frame
+    while (Size)
+    {
+        size_t Chunk = 0x1000 - VirtualAddress.offset;
+        if (Chunk > Size) Chunk = Size;
+
+        std::pair<address,pagesize> tmp = GetPhysicalAddress(VirtualAddress, CR3);
+        if (!tmp.first) return false;
+        if (!AccessPhysicalMemory(tmp.first, pBuffer, Chunk, tmp.second, write)) return false;
+
+        VirtualAddress = address((uint64_t) VirtualAddress + Chunk);
+        pBuffer = address((uint64_t) pBuffer + Chunk);
+        Size -= Chunk;
+    }
+    return true;
 }
 
 // MmIsAddressValid

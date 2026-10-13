@@ -40,13 +40,21 @@ target_link_options(Driver PRIVATE
         -flto                     # LTO for cross-module optimization
 )
 
-# Code signing (optional)
-add_custom_command(TARGET Driver POST_BUILD
-        COMMAND "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x86/signtool.exe"
-        sign /v
-        /f ${CMAKE_CURRENT_SOURCE_DIR}/TestSign.pfx
-        /p 1234
-        /t http://timestamp.digicert.com
-        /fd sha256
-        "${CMAKE_BINARY_DIR}/Driver.sys"
-)
+# Code signing (optional): finds signtool in any installed Windows Kit, and takes the PFX password from the
+# environment instead of storing it in this file. Signing is skipped (with a warning) when either is missing.
+find_program(SIGNTOOL signtool
+        PATHS "C:/Program Files (x86)/Windows Kits/10/bin/x86"
+              "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x86"
+        NO_DEFAULT_PATH)
+if(SIGNTOOL AND DEFINED ENV{TESTSIGN_PFX_PASSWORD})
+        add_custom_command(TARGET Driver POST_BUILD
+                COMMAND "${SIGNTOOL}" sign /v
+                /f "${CMAKE_CURRENT_SOURCE_DIR}/TestSign.pfx"
+                /p "$ENV{TESTSIGN_PFX_PASSWORD}"
+                /t http://timestamp.digicert.com
+                /fd sha256
+                "${CMAKE_BINARY_DIR}/Driver.sys"
+        )
+else()
+        message(WARNING "Driver.sys will not be signed: needs signtool and the TESTSIGN_PFX_PASSWORD environment variable")
+endif()

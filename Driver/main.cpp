@@ -2,17 +2,16 @@
 #include "Hooks.cpp"
 #include "NMI.cpp"
 
-ntstatus DriverExit(PDRIVER_OBJECT)
+void DriverExit(PDRIVER_OBJECT)
 {
     // UnHook();
-    return ntstatus::success;
+    IDTUnHook();
 }
 
 extern "C"
 ntstatus DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING)
 {
     // Initialization
-    // DriverObject->DriverUnload = DriverExit;
 
     // Functions
     // _EPROCESS* pEProcess = EnumerateEProcess(L"notepad.exe");
@@ -34,10 +33,17 @@ ntstatus DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING)
     // print(INFO("Encoded: %ws"), Wstr.data());
     // print(INFO("Decoded: %ws"), Decode(Wstr).data());
 
-    // Hook
-    Hook();
+    // Hook (STATUS_UNSUCCESSFUL if ntoskrnl or the signature cannot be found)
+    if (!Hook()) return static_cast<ntstatus>(0xC0000001);
 
-    // NMI
-    IDTHook();
+    // NMI. If it fails, undo the hook: a driver that fails to load must not leave a hook pointing at its code
+    if (!IDTHook())
+    {
+        UnHook();
+        return static_cast<ntstatus>(0xC0000001);
+    }
+
+    // Set last, once everything is in place, so an unload only undoes what DriverEntry actually did
+    DriverObject->DriverUnload = DriverExit;
     return ntstatus::success;
 }
