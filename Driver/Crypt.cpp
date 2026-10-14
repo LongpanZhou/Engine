@@ -1,3 +1,4 @@
+#include <array>
 #include "seed.h"
 
 // Hash are not used but left for future if you want to hide string
