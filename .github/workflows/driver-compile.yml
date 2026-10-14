@@ -36,7 +36,7 @@ jobs:
       - name: Configure
         run: >
           cmake -S Driver -B build -G Ninja
-          -DWDK_LIB_PATH=$env:WDK_LIB_PATH
+          "-DWDK_LIB_PATH=$env:WDK_LIB_PATH"
           -DCMAKE_C_COMPILER=clang
           -DCMAKE_CXX_COMPILER=clang++
           -DCMAKE_CXX_COMPILER_TARGET=x86_64-pc-windows-msvc
