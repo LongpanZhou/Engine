@@ -1,0 +1,50 @@
+name: driver-compile
+
+# Compiles and links Driver.sys against the real WDK libraries on a Windows runner.
+# Runs only on this branch while the setup is being tested.
+on:
+  push:
+    branches: [ci/wdk-compile]
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install LLVM and Ninja
+        run: choco install llvm ninja -y --no-progress
+
+      - name: Install WDK
+        run: >
+          winget install --id Microsoft.WindowsWDK.10.0.26100 --version 10.1.26100.6584
+          --exact --silent --accept-package-agreements --accept-source-agreements
+
+      - name: Check toolchain and WDK libraries
+        shell: pwsh
+        run: |
+          where.exe clang++ lld-link ninja
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" -Directory | ForEach-Object { $_.Name }
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib\*\km\x64\ntoskrnl.lib" | ForEach-Object { $_.FullName }
+
+      - name: Configure
+        run: >
+          cmake -S Driver -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=clang
+          -DCMAKE_CXX_COMPILER=clang++
+          -DCMAKE_CXX_COMPILER_TARGET=x86_64-pc-windows-msvc
+          -DCMAKE_LINKER=lld-link
+
+      - name: Build Driver.sys
+        run: cmake --build build --target Driver --verbose
+
+      - name: Upload Driver.sys
+        uses: actions/upload-artifact@v4
+        with:
+          name: Driver
+          path: build/Driver.sys
+          if-no-files-found: error
