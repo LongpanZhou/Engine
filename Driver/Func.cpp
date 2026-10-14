@@ -292,6 +292,7 @@ address GetNtoskrnl()
     cr3 SystemCR3 = {((_KPROCESS *) win::PsInitialSystemProcess)->DirectoryTableBase};
 
     // Brute Force
+    auto NtoskrnlFile = Decode(NtoskrnlName);
     do {
         // Get Data Directory
         auto dosHeader = (_IMAGE_DOS_HEADER *)base;
@@ -316,7 +317,7 @@ address GetNtoskrnl()
             continue;
 
         // Check ntoskrnl.exe
-        if (strcmp(name, Decode(NtoskrnlName).data()))
+        if (strcmp(name, NtoskrnlFile.data()))
             continue;
 
         // Ntoskrnl.exe

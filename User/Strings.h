@@ -28,3 +28,4 @@ constexpr std::array<T, N> Decode(const std::array<T, N> &Encoded)
 constexpr auto NtdllName = Encode("ntdll.dll");
 constexpr auto NtCompareSigningLevelsName = Encode("NtCompareSigningLevels");
 constexpr auto PidLabel = Encode("PID: ");
+constexpr auto ScanLabel = Encode("NMI outside modules: ");

@@ -47,7 +47,7 @@ struct NMI_RECORD
     uint64_t Rip;
     uint64_t Rsp;
     uint64_t Cs;
-    uint32_t Count;
+    bool Recorded;           // set once this scan has recorded an NMI on this processor
     uint32_t StackBytes;
     uint8_t Stack[NMI_STACK_BYTES];
     uint32_t FrameCount;
@@ -120,8 +120,9 @@ extern "C"
 // Copies the interrupted thread's stack from the interrupted RSP up to the top of the stack, or NMI_STACK_BYTES,
 // whichever is smaller. The top is the thread's StackBase (KTHREAD offset 0x30, as the nmi project uses; not verified
 // here). Runs at NMI level, so it only reads memory: no locks, no paged memory.
-void CaptureNmiStack(NMI_RECORD *Record, uint64_t Rsp)
+void CaptureNmiStack(NMI_RECORD *Record)
 {
+    uint64_t Rsp = Record->Rsp;
     uint64_t StackBase = *(uint64_t *) ((uint8_t *) KeGetCurrentThread() + 0x030);
     uint64_t Available = StackBase > Rsp ? StackBase - Rsp : 0;
     uint32_t Bytes = Available < NMI_STACK_BYTES ? (uint32_t) Available : NMI_STACK_BYTES;
@@ -200,13 +201,13 @@ bool PrologStackAdjust(const UNWIND_INFO *Info, uint32_t PrologOffset, uint64_t 
 // Walks a captured stack from the interrupted RIP upward. Each frame's return address is read from the copy at the
 // address where the function's entry RSP points. The walk stops at a frame it cannot unwind, or when the copy ends.
 // Runs at PASSIVE_LEVEL, because it looks up unwind data.
-uint32_t WalkNmiStack(NMI_RECORD *Record, uint64_t *Frames, uint32_t MaxFrames)
+void WalkNmiStack(NMI_RECORD *Record)
 {
     uint64_t Rip = Record->Rip;
     uint64_t Rsp = Record->Rsp;
     uint32_t Count = 0;
 
-    while (Count < MaxFrames)
+    while (Count < NMI_MAX_FRAMES)
     {
         uint64_t ImageBase = 0;
         RUNTIME_FUNCTION *Function = RtlLookupFunctionEntry(Rip, &ImageBase, nullptr);
@@ -222,18 +223,19 @@ uint32_t WalkNmiStack(NMI_RECORD *Record, uint64_t *Frames, uint32_t MaxFrames)
         uint64_t ReturnAddress = 0;
         if (!ReadNmiStack(Record, EntryRsp, &ReturnAddress)) break;
 
-        Frames[Count++] = ReturnAddress;
+        Record->Frames[Count++] = ReturnAddress;
         Rip = ReturnAddress;
         Rsp = EntryRsp + 8;
     }
 
-    return Count;
+    Record->FrameCount = Count;
 }
 
 // Records an NMI on a processor that RunNmiScan armed, and only the first one. Called at NMI level, so it only reads
 // and writes memory and uses atomic operations
-void RecordArmedNmi(uint32_t Cpu, const NMI_FRAME *Frame)
+void RecordArmedNmi(const NMI_FRAME *Frame)
 {
+    uint32_t Cpu = KeGetCurrentProcessorNumberEx(nullptr);
     if (Cpu >= MaxNmiProcessors) return;
     if (__atomic_load_n(&NmiState[Cpu], __ATOMIC_SEQ_CST) != NmiArmed) return;   // the usual case: no scan running here
 
@@ -245,9 +247,9 @@ void RecordArmedNmi(uint32_t Cpu, const NMI_FRAME *Frame)
     Record->Rip = Frame->Rip;
     Record->Rsp = Frame->Rsp;
     Record->Cs = Frame->Cs;
-    Record->Count++;
-    CaptureNmiStack(Record, Frame->Rsp);
+    CaptureNmiStack(Record);
 
+    Record->Recorded = true;
     __atomic_store_n(&NmiState[Cpu], NmiRecorded, __ATOMIC_SEQ_CST);
 }
 
@@ -262,7 +264,7 @@ extern "C" bool NMIInterruptHandler(NMI_REGISTERS *Regs)
     if (!NmiHandlerEnabled) return false;
 
     NMI_FRAME *Frame = (NMI_FRAME *) (Regs + 1);   // the CPU's frame starts right after the saved registers
-    RecordArmedNmi(KeGetCurrentProcessorNumberEx(nullptr), Frame);
+    RecordArmedNmi(Frame);
     return false;
 }
 
@@ -349,9 +351,6 @@ void IDTHandle()
 // The IDTR that Windows uses, kept so IDTUnHook can put it back
 interrupt_descriptor_table WindowsIDTR;
 
-// The IDTR to load on every processor; its address is the context passed to the broadcast
-interrupt_descriptor_table LocalIDTR;
-
 // KeGenericCallDpc runs a routine once on every active processor. Declared here because the vendor headers
 // are not in this checkout; the signatures are the WDK's.
 struct _KDPC;
@@ -376,6 +375,9 @@ bool IDTHook()
     // Decide now, at normal level, whether the NMI handler may run
     NmiHandlerEnabled = !IsHVCIEnabled();
 
+    // With HVCI on the handler never runs, so the IDT is left alone (the call-stack method does not need it)
+    if (!NmiHandlerEnabled) return true;
+
     // Get windows IDT
     WindowsIDTR = sidt();
     IDT_GATE *windowsIDT = (IDT_GATE *) WindowsIDTR.base;
@@ -391,6 +393,7 @@ bool IDTHook()
     localIDT[14] = CreateInterruptHandler(windowsIDT[14], (uint64_t) &asm_pf_handler);
 
     // Load the table on every processor, not just this one (the limit is the last valid byte, so size - 1)
+    interrupt_descriptor_table LocalIDTR;
     LocalIDTR.base = &localIDT;
     LocalIDTR.limit = sizeof(localIDT) - 1;
     KeGenericCallDpc(LoadIDTROnProcessor, &LocalIDTR);
@@ -433,7 +436,7 @@ uint32_t CountNmiInterruptsOutsideModules()
     {
         NMI_RECORD *Record = &NmiRecords[Cpu];
 
-        if (Record->Count == 0) continue;
+        if (!Record->Recorded) continue;
         if ((Record->Cs & 3) == 3) continue;
 
         if (!IsRipInKernelModule(Record->Rip))
@@ -448,15 +451,6 @@ uint32_t CountNmiInterruptsOutsideModules()
 
 // ---- Call-stack method: used when HVCI is on, where the IDT handler does not run ----
 
-// Processor set, as HalSendNMI takes it
-struct KAFFINITY_EX
-{
-    uint16_t Count;
-    uint16_t Size;
-    uint32_t Reserved;
-    uint64_t Bitmap[20];
-};
-
 typedef uint8_t (*PNMI_CALLBACK_FUNCTION)(void *Context, uint8_t Handled);
 
 // Kernel functions for this method. Declared here because the vendor headers are not in this checkout
@@ -464,9 +458,9 @@ extern "C"
 {
     void *KeRegisterNmiCallback(PNMI_CALLBACK_FUNCTION Callback, void *Context);
     void KeDeregisterNmiCallback(void *Handle);
-    void KeInitializeAffinityEx(KAFFINITY_EX *Affinity);
-    void KeAddProcessorAffinityEx(KAFFINITY_EX *Affinity, uint32_t Processor);
-    void HalSendNMI(KAFFINITY_EX *Affinity);
+    void KeInitializeAffinityEx(_KAFFINITY_EX *Affinity);
+    void KeAddProcessorAffinityEx(_KAFFINITY_EX *Affinity, uint32_t Processor);
+    void HalSendNMI(_KAFFINITY_EX *Affinity);
     int32_t KeDelayExecutionThread(uint8_t WaitMode, uint8_t Alertable, int64_t *Interval);
     uint32_t KeQueryActiveProcessorCount(void *ActiveProcessors);
 }
@@ -513,22 +507,23 @@ uint8_t NmiCallback(void *Context, uint8_t Handled)
     uint64_t Kpcr = ReadKpcrAddress();
     TASK_STATE_SEGMENT_64 *Tss = *(TASK_STATE_SEGMENT_64 **) (Kpcr + 0x008);   // the KPCR's pointer to the TSS
     NMI_FRAME *Frame = (NMI_FRAME *) (Tss->Ist3 - sizeof(NMI_FRAME));
-    RecordArmedNmi(KeGetCurrentProcessorNumberEx(nullptr), Frame);
+    RecordArmedNmi(Frame);
 
     return 0;
 }
 
-// Ends the wait for one processor. If no NMI came, the processor is disarmed, so an NMI that arrives later is ignored.
-// If one was recorded, this waits until the handler has finished writing the record, then leaves the processor Idle
-void CollectNmiRecord(uint32_t Cpu)
+// Ends the wait for one processor. If no NMI came, the processor is disarmed, so an NMI that arrives later is ignored,
+// and this returns false. If one was recorded, this waits until the handler has finished writing it, then returns true
+bool CollectNmiRecord(uint32_t Cpu)
 {
     uint32_t State = NmiArmed;
-    if (__atomic_compare_exchange_n(&NmiState[Cpu], &State, NmiIdle, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return;
-    if (State == NmiIdle) return;
+    if (__atomic_compare_exchange_n(&NmiState[Cpu], &State, NmiIdle, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return false;
+    if (State == NmiIdle) return false;
 
     State = NmiRecorded;
     while (!__atomic_compare_exchange_n(&NmiState[Cpu], &State, NmiIdle, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
         State = NmiRecorded;
+    return true;
 }
 
 // Sends an NMI to every processor and records what each one interrupted.
@@ -537,7 +532,8 @@ void CollectNmiRecord(uint32_t Cpu)
 // loaded module.
 uint32_t RunNmiScan()
 {
-    bool hvci = IsHVCIEnabled();
+    // IDTHook already decided whether the handler runs. When it does not (HVCI on), the callback records the NMIs
+    bool hvci = !NmiHandlerEnabled;
     void *handle = nullptr;
 
     memset(NmiRecords, 0, sizeof(NmiRecords));
@@ -552,29 +548,29 @@ uint32_t RunNmiScan()
         }
     }
 
+    // Arm every processor, then send all the NMIs at once. Each processor records only its own NMI, so they do not
+    // interfere, and one wait covers them all
     uint32_t cores = KeQueryActiveProcessorCount(nullptr);
+    if (cores > MaxNmiProcessors) cores = MaxNmiProcessors;
     int64_t delay = -100 * 10000;   // 100 ms, relative, in 100-nanosecond units
 
-    for (uint32_t core = 0; core < cores && core < MaxNmiProcessors; core++)
+    _KAFFINITY_EX affinity{};
+    KeInitializeAffinityEx(&affinity);
+    for (uint32_t core = 0; core < cores; core++)
     {
-        KAFFINITY_EX affinity{};
-        KeInitializeAffinityEx(&affinity);
         KeAddProcessorAffinityEx(&affinity, core);
-
         __atomic_store_n(&NmiState[core], NmiArmed, __ATOMIC_SEQ_CST);   // from here, the first NMI on this core is recorded
-        HalSendNMI(&affinity);
-
-        KeDelayExecutionThread(0, 0, &delay);   // KernelMode, not alertable: let this NMI finish first
-        CollectNmiRecord(core);
     }
+    HalSendNMI(&affinity);
+
+    KeDelayExecutionThread(0, 0, &delay);   // KernelMode, not alertable: let the NMIs finish first
 
     if (hvci) KeDeregisterNmiCallback(handle);
 
-    // Unwind each captured stack (this is normal level, so the unwind data can be looked up)
-    for (uint32_t cpu = 0; cpu < MaxNmiProcessors; cpu++)
+    // Collect each record once it is complete, then unwind its stack (normal level, so the unwind data can be looked up)
+    for (uint32_t core = 0; core < cores; core++)
     {
-        if (NmiRecords[cpu].Count)
-            NmiRecords[cpu].FrameCount = WalkNmiStack(&NmiRecords[cpu], NmiRecords[cpu].Frames, NMI_MAX_FRAMES);
+        if (CollectNmiRecord(core)) WalkNmiStack(&NmiRecords[core]);
     }
 
     return CountNmiInterruptsOutsideModules();

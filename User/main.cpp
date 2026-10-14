@@ -1,27 +1,9 @@
 #include <iostream>
 #include <windows.h>
 #include "Strings.h"
-
-#define secret 0xFFFFFFFF
+#include "../Common/Command.h"
 
 typedef NTSTATUS(WINAPI* NtCompareSigningLevels)(uint64_t Secret, void* pCommand);
-
-enum
-{
-    read,
-    write,
-};
-
-// Must match Driver/Hooks.cpp's Command byte for byte (32 bytes, PIDs are 32-bit)
-struct Command
-{
-    void* SrcAddress;
-    void* DestAddress;
-    uint32_t SrcPID;
-    uint32_t DestPID;
-    uint32_t Size;
-    uint32_t OpCode;
-} __attribute__((packed));
 
 int main()
 {
@@ -47,7 +29,7 @@ int main()
     cmd.DestPID = PID;
     cmd.OpCode = read;
     cmd.Size = sizeof(int);
-    Func(secret,&cmd);
+    Func(CommandSecret,&cmd);
     std::cout << x << y << std::endl;
     std::cout << &x << &y << std::endl;
 
@@ -59,15 +41,22 @@ int main()
     cmd.DestPID = PID;
     cmd.OpCode = write;
     cmd.Size = sizeof(int);
-    Func(secret,&cmd);
+    Func(CommandSecret,&cmd);
     std::cout << x << y << std::endl;
     std::cout << &x << &y << std::endl;
+
+    // Scan for NMIs that interrupted code outside every kernel module. The driver writes the count to Suspicious
+    uint32_t Suspicious = 0;
+    cmd.DestAddress = &Suspicious;
+    cmd.OpCode = scan;
+    Func(CommandSecret,&cmd);
+    std::cout << Decode(ScanLabel).data() << Suspicious << std::endl;
 
     // Stay alive so the driver can find this process by name, but sleep between calls instead of spinning a core
     cmd.OpCode = -1;
     while (true)
     {
-        Func(secret,&cmd);
+        Func(CommandSecret,&cmd);
         Sleep(1000);
     }
 

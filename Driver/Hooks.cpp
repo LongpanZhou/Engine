@@ -1,18 +1,4 @@
-enum
-{
-    read,
-    write,
-};
-
-struct Command
-{
-    void *SrcAddress;
-    void *DestAddress;
-    uint32_t SrcPID;
-    uint32_t DestPID;
-    uint32_t Size;
-    uint32_t OpCode;
-} __attribute__((packed));
+#include "../Common/Command.h"
 
 // NtCompareSigningLevels: Signature, UserExeName and PageSectionName are in Strings.h
 using func_type = uint64_t (__fastcall*)(uint64_t, Command *);
@@ -23,7 +9,7 @@ address *pData;
 // never depends on the Size the caller sent
 bool CopyVirtualMemory(address SrcAddress, cr3 SrcCR3, address DestAddress, cr3 DestCR3, uint32_t Size)
 {
-    char buffer[0x100];
+    char buffer[0x400];
     while (Size)
     {
         uint32_t Chunk = Size < sizeof(buffer) ? Size : sizeof(buffer);
@@ -37,45 +23,59 @@ bool CopyVirtualMemory(address SrcAddress, cr3 SrcCR3, address DestAddress, cr3 
     return true;
 }
 
+// Defined in NMI.cpp, which is included after this file
+uint32_t RunNmiScan();
+
+// Runs one command from User.exe. A command that cannot be read or resolved is dropped, and the caller
+// still goes on to the original function
+void HandleCommand(Command *pCommand)
+{
+    // Local, not static: a shared command would be overwritten by concurrent callers
+    Command cmd;
+
+    _EPROCESS *pUser = EnumerateEProcess(Decode(UserExeName).data());
+    if (!pUser) return;
+    cr3 usermodeCR3 = ((_KPROCESS *) pUser)->DirectoryTableBase;
+
+    // A command that cannot be read is dropped, not replayed from an earlier call
+    if (!AccessVirtualMemory(pCommand, usermodeCR3, &cmd, sizeof(cmd))) return;
+
+    _EPROCESS *pProcess = EnumerateEProcess(L"", cmd.DestPID);
+    if (!pProcess) return;
+    cr3 processCR3 = ((_KPROCESS *) pProcess)->DirectoryTableBase;
+
+    print(INFO("Usermode cr3: %p"), usermodeCR3);
+    print(INFO("Process cr3: %p"), processCR3);
+    print(INFO("SrcAddress: %p, DestAddress: %p, SrcPID: %p, DestPID: %p, Size: %p, OpCode: %p")
+          , cmd.SrcAddress, cmd.DestAddress, cmd.SrcPID, cmd.DestPID, cmd.Size, cmd.OpCode);
+
+    switch (cmd.OpCode)
+    {
+        case read:
+            if (!CopyVirtualMemory(cmd.DestAddress, processCR3, cmd.SrcAddress, usermodeCR3, cmd.Size))
+                print(WARN("Read failed"));
+            break;
+        case write:
+            if (!CopyVirtualMemory(cmd.SrcAddress, usermodeCR3, cmd.DestAddress, processCR3, cmd.Size))
+                print(WARN("Write failed"));
+            break;
+        case scan:
+        {
+            uint32_t Suspicious = RunNmiScan();
+            if (!AccessVirtualMemory(cmd.DestAddress, usermodeCR3, &Suspicious, sizeof(Suspicious), true))
+                print(WARN("Scan result not written"));
+            break;
+        }
+        default:
+            print(WARN("Invalid OpCode %d"), cmd.OpCode);
+    }
+}
+
 // Hook Func
 uint64_t __fastcall Func(uint64_t Secret, Command *pCommand)
 {
     // I see dead people
-    if (Secret == 0xFFFFFFFF)
-    {
-        // Local, not static: a shared command would be overwritten by concurrent callers
-        Command cmd;
-
-        _EPROCESS *pUser = EnumerateEProcess(Decode(UserExeName).data());
-        if (!pUser) return OriginalFunc(Secret, pCommand);
-        cr3 usermodeCR3 = ((_KPROCESS *) pUser)->DirectoryTableBase;
-
-        // A command that cannot be read is dropped, not replayed from an earlier call
-        if (!AccessVirtualMemory(pCommand, usermodeCR3, &cmd, sizeof(cmd))) return OriginalFunc(Secret, pCommand);
-
-        _EPROCESS *pProcess = EnumerateEProcess(L"", cmd.DestPID);
-        if (!pProcess) return OriginalFunc(Secret, pCommand);
-        cr3 processCR3 = ((_KPROCESS *) pProcess)->DirectoryTableBase;
-
-        print(INFO("Usermode cr3: %p"), usermodeCR3);
-        print(INFO("Process cr3: %p"), processCR3);
-        print(INFO("SrcAddress: %p, DestAddress: %p, SrcPID: %p, DestPID: %p, Size: %p, OpCode: %p")
-              , cmd.SrcAddress, cmd.DestAddress, cmd.SrcPID, cmd.DestPID, cmd.Size, cmd.OpCode);
-
-        switch (cmd.OpCode)
-        {
-            case read:
-                if (!CopyVirtualMemory(cmd.DestAddress, processCR3, cmd.SrcAddress, usermodeCR3, cmd.Size))
-                    print(WARN("Read failed"));
-                break;
-            case write:
-                if (!CopyVirtualMemory(cmd.SrcAddress, usermodeCR3, cmd.DestAddress, processCR3, cmd.Size))
-                    print(WARN("Write failed"));
-                break;
-            default:
-                print(WARN("Invalid OpCode %d"), cmd.OpCode);
-        }
-    }
+    if (Secret == CommandSecret) HandleCommand(pCommand);
 
     // Return original, called with the same arguments it was called with
     return OriginalFunc(Secret, pCommand);

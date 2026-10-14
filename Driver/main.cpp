@@ -4,7 +4,7 @@
 
 void DriverExit(PDRIVER_OBJECT)
 {
-    // UnHook();
+    UnHook();
     IDTUnHook();
 }
 
