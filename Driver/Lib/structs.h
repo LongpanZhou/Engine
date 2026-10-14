@@ -20,7 +20,7 @@ typedef int16_t     SHORT;
 typedef int32_t     LONG;
 typedef int64_t     LONGLONG;
 
-#define _UNICODE_STRING UNICODE_STRING
+#define _UNICODE_STRING win::UNICODE_STRING
 #define CONTAINING_RECORD(address, type, field) ((type *)((uint64_t)(address) - (uint64_t)(&((type *)0)->field)))
 
 // PE HEADER BS

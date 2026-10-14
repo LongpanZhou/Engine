@@ -1,3 +1,3 @@
 [submodule "Driver/vendor"]
 	path = Driver/vendor
-	url = https://github.com/bibles-org/crosswdk.git
+	url = https://github.com/AllusiveWheat/crosswdk.git

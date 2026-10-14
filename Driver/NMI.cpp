@@ -462,7 +462,6 @@ extern "C"
     void KeAddProcessorAffinityEx(_KAFFINITY_EX *Affinity, uint32_t Processor);
     void HalSendNMI(_KAFFINITY_EX *Affinity);
     int32_t KeDelayExecutionThread(uint8_t WaitMode, uint8_t Alertable, int64_t *Interval);
-    uint32_t KeQueryActiveProcessorCount(void *ActiveProcessors);
 }
 
 // The part of the 64-bit task state segment this method reads. It is packed, as the CPU lays it out
@@ -550,7 +549,7 @@ uint32_t RunNmiScan()
 
     // Arm every processor, then send all the NMIs at once. Each processor records only its own NMI, so they do not
     // interfere, and one wait covers them all
-    uint32_t cores = KeQueryActiveProcessorCount(nullptr);
+    uint32_t cores = win::KeQueryActiveProcessorCount(nullptr);
     if (cores > MaxNmiProcessors) cores = MaxNmiProcessors;
     int64_t delay = -100 * 10000;   // 100 ms, relative, in 100-nanosecond units
 

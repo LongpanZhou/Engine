@@ -119,7 +119,7 @@ bool Hook()
     pData = (address *) (instruction + 0x4 + *(int32_t *) instruction);
 
     // Exchange
-    OriginalFunc = (func_type) xchg_ptr(pData, &Func);
+    OriginalFunc = (func_type) __atomic_exchange_n((uint64_t *) pData, (uint64_t) &Func, __ATOMIC_SEQ_CST);
     print(INFO("HOOKED"));
     return true;
 }
@@ -131,7 +131,7 @@ void UnHook()
     if (!pData) return;
 
     // Exchange
-    xchg_ptr(pData, OriginalFunc);
+    __atomic_exchange_n((uint64_t *) pData, (uint64_t) OriginalFunc, __ATOMIC_SEQ_CST);
     print(INFO("UNHOOKED"));
 }
 

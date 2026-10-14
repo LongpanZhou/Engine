@@ -2,15 +2,15 @@
 #include "Hooks.cpp"
 #include "NMI.cpp"
 
-void DriverExit(PDRIVER_OBJECT)
+win::ntstatus DriverExit(win::DRIVER_OBJECT*)
 {
     UnHook();
     IDTUnHook();
     UnlinkMapTable();
+    return win::ntstatus::success;
 }
 
-extern "C"
-ntstatus DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING)
+win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*)
 {
     // Initialization
 
@@ -35,13 +35,13 @@ ntstatus DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING)
     // print(INFO("Decoded: %ws"), Decode(Wstr).data());
 
     // Hook (STATUS_UNSUCCESSFUL if ntoskrnl or the signature cannot be found)
-    if (!Hook()) return static_cast<ntstatus>(0xC0000001);
+    if (!Hook()) return static_cast<win::ntstatus>(0xC0000001);
 
     // NMI. If it fails, undo the hook: a driver that fails to load must not leave a hook pointing at its code
     if (!IDTHook())
     {
         UnHook();
-        return static_cast<ntstatus>(0xC0000001);
+        return static_cast<win::ntstatus>(0xC0000001);
     }
 
     // The dedicated mapping table, if it is enabled (off by default)
@@ -49,5 +49,5 @@ ntstatus DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING)
 
     // Set last, once everything is in place, so an unload only undoes what DriverEntry actually did
     DriverObject->DriverUnload = DriverExit;
-    return ntstatus::success;
+    return win::ntstatus::success;
 }

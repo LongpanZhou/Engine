@@ -30,7 +30,7 @@ address EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleNa
     AccessVirtualMemory(&pLdr->InLoadOrderModuleList, CR3, &moduleList, sizeof(_LIST_ENTRY));
 
     _LDR_DATA_TABLE_ENTRY entry;
-    UNICODE_STRING moduleName;
+    win::UNICODE_STRING moduleName;
 
     // The head is the sentinel inside PEB_LDR_DATA; it is not a module, so the walk stops when it comes back
     _LIST_ENTRY *pHead = (_LIST_ENTRY *) &pLdr->InLoadOrderModuleList;
