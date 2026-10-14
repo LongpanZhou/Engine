@@ -2,6 +2,10 @@
 #include "Hooks.cpp"
 #include "NMI.cpp"
 
+// The vendor's entry point walks this table to run global constructors. The driver has none that need to run,
+// so the table is empty. Add an entry here if a global object with a runtime constructor is introduced
+extern "C" void (*__CTOR_LIST__[2])() = {nullptr, nullptr};
+
 win::ntstatus DriverExit(win::DRIVER_OBJECT*)
 {
     UnHook();

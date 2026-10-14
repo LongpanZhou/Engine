@@ -77,7 +77,7 @@ address EnumerateKProcess(const wchar_t *ProcessName, const uint64_t PID = -1)
     print(INFO("Target PID: %p"), PID);
 
     // Init variables for loop
-    _LIST_ENTRY *pHead = (_LIST_ENTRY *) win::PsLoadedModuleList;
+    _LIST_ENTRY *pHead = (_LIST_ENTRY *) *__imp_PsLoadedModuleList;
     _LIST_ENTRY *pCurrent = pHead->Flink;   // the list head is not a module
 
     _KLDR_DATA_TABLE_ENTRY *entry;
@@ -129,7 +129,7 @@ _EPROCESS *EnumerateEProcess(const wchar_t *ProcessName, const uint64_t PID = -1
     print(INFO("Target PID: %p"), PID);
 
     // Get system default EProcess n ListEntry
-    _EPROCESS *Process = (_EPROCESS *) win::PsInitialSystemProcess;
+    _EPROCESS *Process = (_EPROCESS *) *__imp_PsInitialSystemProcess;
     _LIST_ENTRY *pHead = &(Process->ActiveProcessLinks);
     _LIST_ENTRY *pCurrent = pHead;
 
@@ -294,7 +294,7 @@ address GetNtoskrnl()
 
     // Validity checks walk the page tables of the System process, which map all of kernel memory.
     // (Calling them with a constant in place of a CR3 checks against the wrong tables.)
-    cr3 SystemCR3 = {((_KPROCESS *) win::PsInitialSystemProcess)->DirectoryTableBase};
+    cr3 SystemCR3 = {((_KPROCESS *) *__imp_PsInitialSystemProcess)->DirectoryTableBase};
 
     // Brute Force
     auto NtoskrnlFile = Decode(NtoskrnlName);

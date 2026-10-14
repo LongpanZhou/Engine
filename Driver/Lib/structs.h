@@ -21,6 +21,10 @@ typedef int32_t     LONG;
 typedef int64_t     LONGLONG;
 
 #define _UNICODE_STRING win::UNICODE_STRING
+
+// The kernel exports these as data. The import library reaches each one through __imp_, which holds the variable's address
+extern "C" void **__imp_PsInitialSystemProcess;
+extern "C" void **__imp_PsLoadedModuleList;
 #define CONTAINING_RECORD(address, type, field) ((type *)((uint64_t)(address) - (uint64_t)(&((type *)0)->field)))
 
 // PE HEADER BS

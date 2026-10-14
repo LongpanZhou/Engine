@@ -310,7 +310,7 @@ bool LinkTable(cr3 CR3, address TablePA, uint64_t *TableEntries, uint64_t PML4Id
 // Links the dedicated table into the System process's tables at the configured entry
 bool LinkMapTable()
 {
-    cr3 SystemCR3 = {((_KPROCESS *) win::PsInitialSystemProcess)->DirectoryTableBase};
+    cr3 SystemCR3 = {((_KPROCESS *) *__imp_PsInitialSystemProcess)->DirectoryTableBase};
     address TablePA{};
     pagesize PageSize{};
     if (!GetPhysicalAddress(address((uint64_t) MapTableStorage), SystemCR3, TablePA, PageSize)) return false;

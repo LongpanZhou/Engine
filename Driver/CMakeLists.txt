@@ -20,6 +20,13 @@ wdk_add_driver(Driver
         main.cpp
 )
 
+# The HAL exports HalSendNMI, which ntoskrnl.lib does not provide
+target_link_libraries(Driver PRIVATE WDK::HAL)
+
+# NDEBUG compiles out the CRT's assert, which would otherwise need C runtime symbols that -nostdlib leaves out.
+# _ITERATOR_DEBUG_LEVEL=0 turns off the STL's debug checks for the same reason
+target_compile_definitions(Driver PRIVATE NDEBUG _ITERATOR_DEBUG_LEVEL=0)
+
 # Per-target compile and link options
 target_compile_options(Driver PRIVATE
         -Oz                       # Optimize for size aggressively

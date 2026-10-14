@@ -110,10 +110,17 @@ constexpr uint8_t UWOP_SAVE_XMM128 = 8;
 constexpr uint8_t UWOP_SAVE_XMM128_FAR = 9;
 constexpr uint8_t UNW_FLAG_CHAININFO = 0x4;
 
+// The kernel's KeGetCurrentThread is inline in the WDK and not exported, so read the current thread from the KPCR
+inline void *KeGetCurrentThread()
+{
+    uint64_t Thread;
+    __asm__ volatile ("movq %%gs:0x188, %0" : "=r"(Thread));
+    return (void *) Thread;
+}
+
 // Declared here because the vendor headers are not in this checkout; the signatures are the kernel's
 extern "C"
 {
-    void *KeGetCurrentThread();
     RUNTIME_FUNCTION *RtlLookupFunctionEntry(uint64_t ControlPc, uint64_t *ImageBase, void *HistoryTable);
 }
 
@@ -413,7 +420,7 @@ bool IDTUnHook()
 // Returns true if Rip lies inside a loaded kernel module. Walks PsLoadedModuleList, so call at PASSIVE_LEVEL
 bool IsRipInKernelModule(uint64_t Rip)
 {
-    _LIST_ENTRY *Head = (_LIST_ENTRY *) win::PsLoadedModuleList;
+    _LIST_ENTRY *Head = (_LIST_ENTRY *) *__imp_PsLoadedModuleList;
 
     for (_LIST_ENTRY *Current = Head->Flink; Current != Head; Current = Current->Flink)
     {
