@@ -27,6 +27,34 @@ void ReleaseEntry(T *Entry)
     __atomic_store_n((uint64_t *) Entry, 0, __ATOMIC_SEQ_CST);
 }
 
+// The dedicated table: one 4 KB page of 512 slots that only the driver uses for 4 KB mappings. Its storage is in the
+// driver image. While it is linked (MapTableEntries is set), a mapping claims a slot in it instead of searching the tables
+alignas(4096) uint64_t MapTableStorage[512];
+uint64_t *MapTableEntries = nullptr;     // the slots the mapper claims; null while the table is not linked
+uint64_t MapTableBase = 0;               // virtual address of slot 0 while linked
+address MapTablePdEntry{};               // physical address of the page directory entry that links the table
+
+// Maps one 4 KB page through a free slot in the dedicated table. The slot's address is known, so no tables are searched.
+// Returns false if the table has no free slot; the caller then searches as usual
+template<typename T>
+bool MapInDedicatedTable(address PhysicalAddress, T &&Callback)
+{
+    for (uint64_t Slot = 0; Slot < 512; ++Slot)
+    {
+        pte *Entry = (pte *) &MapTableEntries[Slot];
+        pte Value{};
+        Value.present = 1;
+        Value.write = 1;
+        Value.page_frame_number = PhysicalAddress >> 12;
+        if (!ClaimEntry(Entry, Value)) continue;
+
+        Callback(address(MapTableBase + Slot * 0x1000 + PhysicalAddress.offset));
+        ReleaseEntry(Entry);
+        return true;
+    }
+    return false;
+}
+
 // The most page tables one mapping may open while it searches for an empty entry. Each open reads a whole table, so
 // this bounds the work one mapping can do
 constexpr int MaxTablesPerMapping = 16;
@@ -36,6 +64,9 @@ constexpr int MaxTablesPerMapping = 16;
 template<typename T>
 bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSize = Page_4KB)
 {
+    // While the dedicated table is linked, a 4 KB mapping takes a slot in it. If it has no free slot, the search below runs
+    if (PageSize == Page_4KB && MapTableEntries && MapInDedicatedTable(PhysicalAddress, Callback)) return true;
+
     // Local variables. They are per call, so concurrent callers never share mapping state
     int Opened = 0;
     cr3 CR3 = read_cr3();
@@ -242,4 +273,56 @@ inline bool IsAddressValid(address VirtualAddress, cr3 CR3)
     address Physical{};
     pagesize PageSize{};
     return GetPhysicalAddress(VirtualAddress, CR3, Physical, PageSize);
+}
+
+// The link is off by default. It changes kernel page tables, so the placeholder entry below must be checked on the
+// Windows VM (it has to be empty, and shared by every process) before this is turned on
+constexpr bool MapTableEnabled = true;
+constexpr uint64_t MapTablePml4Index = 2;
+constexpr uint64_t MapTablePdptIndex = 0;
+constexpr uint64_t MapTablePdIndex = 2;
+
+// Writes the page directory entry at (PML4Idx, PDPTIdx, PDIdx) under CR3, so it points at the table at TablePA, and starts
+// using the table at TableEntries. Refused if the path is not present, the entry is not empty, or the path is a 1 GB page
+bool LinkTable(cr3 CR3, address TablePA, uint64_t *TableEntries, uint64_t PML4Idx, uint64_t PDPTIdx, uint64_t PDIdx)
+{
+    pml4e PML4E{};
+    if (!AccessPhysicalMemory({(CR3.pml4_frame_number << 12) + PML4Idx * 8}, Page_4KB, PML4E) || !PML4E.present) return false;
+
+    pdpe PDPTE{};
+    if (!AccessPhysicalMemory({(PML4E.page_frame_number << 12) + PDPTIdx * 8}, Page_4KB, PDPTE) || !PDPTE.present) return false;
+    if (((pdpe_1gb)PDPTE).page_size) return false;
+
+    uint64_t PdEntry = (PDPTE.page_frame_number << 12) + PDIdx * 8;   // physical address of the entry to write
+    uint64_t Current = 0;
+    if (!AccessPhysicalMemory(address(PdEntry), Page_4KB, Current) || Current != 0) return false;
+
+    uint64_t Value = ((uint64_t) TablePA & 0x000FFFFFFFFFF000ull) | 0x3;   // present and writable, supervisor only
+    if (!AccessPhysicalMemory(address(PdEntry), (void *) &Value, sizeof(Value), Page_4KB, true)) return false;
+
+    MapTablePdEntry = address(PdEntry);
+    MapTableBase = (PML4Idx << 39) | (PDPTIdx << 30) | (PDIdx << 21);
+    if (PML4Idx >= 256) MapTableBase |= 0xFFFF000000000000ull;   // kernel addresses are sign-extended from bit 47
+    MapTableEntries = TableEntries;
+    return true;
+}
+
+// Links the dedicated table into the System process's tables at the configured entry
+bool LinkMapTable()
+{
+    cr3 SystemCR3 = {((_KPROCESS *) win::PsInitialSystemProcess)->DirectoryTableBase};
+    address TablePA{};
+    pagesize PageSize{};
+    if (!GetPhysicalAddress(address((uint64_t) MapTableStorage), SystemCR3, TablePA, PageSize)) return false;
+    return LinkTable(SystemCR3, TablePA, MapTableStorage, MapTablePml4Index, MapTablePdptIndex, MapTablePdIndex);
+}
+
+// Clears the link and stops using the dedicated table, so later mappings search the tables as before. Other processors
+// may still cache translations of the table's addresses. Nothing uses them after this, but they are not flushed on each processor
+void UnlinkMapTable()
+{
+    if (!MapTableEntries) return;
+    uint64_t Empty = 0;
+    AccessPhysicalMemory(MapTablePdEntry, (void *) &Empty, sizeof(Empty), Page_4KB, true);
+    MapTableEntries = nullptr;
 }

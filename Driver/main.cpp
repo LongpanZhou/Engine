@@ -6,6 +6,7 @@ void DriverExit(PDRIVER_OBJECT)
 {
     UnHook();
     IDTUnHook();
+    UnlinkMapTable();
 }
 
 extern "C"
@@ -42,6 +43,9 @@ ntstatus DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING)
         UnHook();
         return static_cast<ntstatus>(0xC0000001);
     }
+
+    // The dedicated mapping table, if it is enabled (off by default)
+    if (MapTableEnabled) LinkMapTable();
 
     // Set last, once everything is in place, so an unload only undoes what DriverEntry actually did
     DriverObject->DriverUnload = DriverExit;

@@ -26,6 +26,27 @@ bool CopyVirtualMemory(address SrcAddress, cr3 SrcCR3, address DestAddress, cr3 
 // Defined in NMI.cpp, which is included after this file
 uint32_t RunNmiScan();
 
+// PID of User.exe as last found. It is only a hint: FindUserProcess checks the process it names before using it
+uint64_t UserExePid = -1;
+
+// Finds User.exe. The cached PID is tried first: the walk compares PIDs only, and the name is checked on the one process
+// found. If that process is not User.exe (the PID was reused, or User.exe was restarted), the full name search runs
+_EPROCESS *FindUserProcess()
+{
+    auto UserName = Decode(UserExeName);
+
+    uint64_t Pid = __atomic_load_n(&UserExePid, __ATOMIC_SEQ_CST);
+    if (Pid != (uint64_t) -1)
+    {
+        _EPROCESS *pCached = EnumerateEProcess(L"", Pid);
+        if (pCached && ProcessHasName(pCached, UserName.data())) return pCached;
+    }
+
+    _EPROCESS *pUser = EnumerateEProcess(UserName.data());
+    if (pUser) __atomic_store_n(&UserExePid, (uint64_t) pUser->UniqueProcessId, __ATOMIC_SEQ_CST);
+    return pUser;
+}
+
 // Runs one command from User.exe. A command that cannot be read or resolved is dropped, and the caller
 // still goes on to the original function
 void HandleCommand(Command *pCommand)
@@ -33,7 +54,7 @@ void HandleCommand(Command *pCommand)
     // Local, not static: a shared command would be overwritten by concurrent callers
     Command cmd;
 
-    _EPROCESS *pUser = EnumerateEProcess(Decode(UserExeName).data());
+    _EPROCESS *pUser = FindUserProcess();
     if (!pUser) return;
     cr3 usermodeCR3 = ((_KPROCESS *) pUser)->DirectoryTableBase;
 

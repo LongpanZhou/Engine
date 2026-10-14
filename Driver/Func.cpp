@@ -108,12 +108,25 @@ address EnumerateKProcess(const wchar_t *ProcessName, const uint64_t PID = -1)
     return nullptr;
 }
 
+// True if the process's image path ends in ProcessName, with a '\' before it. Only the file name counts, not the directory
+bool ProcessHasName(_EPROCESS *pProcess, const wchar_t *ProcessName)
+{
+    if (!pProcess->ImageFilePointer || !pProcess->ImageFilePointer->FileName.Length) return false;
+
+    size_t targetLen = wcslen(ProcessName);
+    size_t processLen = pProcess->ImageFilePointer->FileName.Length / sizeof(wchar_t);
+    if (!targetLen || processLen <= targetLen) return false;
+
+    const wchar_t *FileName = pProcess->ImageFilePointer->FileName.Buffer;
+    size_t NameStart = processLen - targetLen;
+    return FileName[NameStart - 1] == L'\\' && !memcmp(FileName + NameStart, ProcessName, targetLen * sizeof(wchar_t));
+}
+
 _EPROCESS *EnumerateEProcess(const wchar_t *ProcessName, const uint64_t PID = -1)
 {
     // Parameters
     print(INFO("Target EProcess Name: %ws"), ProcessName);
     print(INFO("Target PID: %p"), PID);
-    size_t targetLen = wcslen(ProcessName);
 
     // Get system default EProcess n ListEntry
     _EPROCESS *Process = (_EPROCESS *) win::PsInitialSystemProcess;
@@ -140,15 +153,7 @@ _EPROCESS *EnumerateEProcess(const wchar_t *ProcessName, const uint64_t PID = -1
         print(INFO("File Path: %ws"),
               pProcess->ImageFilePointer->FileName.Buffer);
 
-        // Match the file name only: the path must be longer than the name, and the name must follow a '\'
-        size_t processLen = pProcess->ImageFilePointer->FileName.Length / sizeof(wchar_t);
-        if (targetLen && processLen > targetLen)
-        {
-            const wchar_t *FileName = pProcess->ImageFilePointer->FileName.Buffer;
-            size_t NameStart = processLen - targetLen;
-            if (FileName[NameStart - 1] == L'\\' && !memcmp(FileName + NameStart, ProcessName, targetLen * sizeof(wchar_t)))
-                return pProcess;
-        }
+        if (ProcessHasName(pProcess, ProcessName)) return pProcess;
     } while (pCurrent != pHead);
 
     // Not Found
