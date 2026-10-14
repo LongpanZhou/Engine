@@ -18,22 +18,25 @@ jobs:
       - name: Install LLVM and Ninja
         run: choco install llvm ninja -y --no-progress
 
-      - name: Install WDK
-        run: >
-          winget install --id Microsoft.WindowsWDK.10.0.26100 --version 10.1.26100.6584
-          --exact --silent --accept-package-agreements --accept-source-agreements
-
-      - name: Check toolchain and WDK libraries
+      # The WDK kernel libraries come from the Microsoft.Windows.WDK.x64 NuGet package, so no installer runs.
+      # Only the .lib files are needed: the driver builds against the vendor's own headers.
+      - name: Get WDK kernel libraries
         shell: pwsh
         run: |
-          where.exe clang++ lld-link ninja
-          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" -Directory | ForEach-Object { $_.Name }
-          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib\*\km\x64\ntoskrnl.lib" | ForEach-Object { $_.FullName }
+          $url = "https://api.nuget.org/v3-flatcontainer/microsoft.windows.wdk.x64/10.0.26100.6584/microsoft.windows.wdk.x64.10.0.26100.6584.nupkg"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\wdk.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\wdk.zip" -DestinationPath "$env:RUNNER_TEMP\wdk"
+          $libs = "$env:RUNNER_TEMP\wdk\c\Lib\10.0.26100.0\km\x64"
+          if (-not (Test-Path "$libs\ntoskrnl.lib")) { throw "ntoskrnl.lib not found in $libs" }
+          "WDK_LIB_PATH=$libs" >> $env:GITHUB_ENV
+
+      - name: Check toolchain
+        run: where.exe clang++ lld-link ninja
 
       - name: Configure
         run: >
           cmake -S Driver -B build -G Ninja
-          -DCMAKE_BUILD_TYPE=Release
+          -DWDK_LIB_PATH=$env:WDK_LIB_PATH
           -DCMAKE_C_COMPILER=clang
           -DCMAKE_CXX_COMPILER=clang++
           -DCMAKE_CXX_COMPILER_TARGET=x86_64-pc-windows-msvc
@@ -41,10 +44,3 @@ jobs:
 
       - name: Build Driver.sys
         run: cmake --build build --target Driver --verbose
-
-      - name: Upload Driver.sys
-        uses: actions/upload-artifact@v4
-        with:
-          name: Driver
-          path: build/Driver.sys
-          if-no-files-found: error
