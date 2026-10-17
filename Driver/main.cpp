@@ -68,7 +68,8 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
     }
 
     // Set last, once everything is in place, so an unload only undoes what DriverEntry actually did
-    DriverObject->DriverUnload = DriverExit;
+    // A manually mapped driver (kdmapper) gets a NULL DriverObject and no unload callback, so only set it when there is one
+    if (DriverObject) DriverObject->DriverUnload = DriverExit;
     print(INFO("DriverEntry: success"));
     return win::ntstatus::success;
 }

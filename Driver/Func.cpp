@@ -285,14 +285,16 @@ address SectionScan(address BaseAddress, const char *SectionName, const char *Si
 // Encoded runtime strings and the hook signature
 #include "Strings.h"
 
+// Most pages the scan may visit before giving up: 0x4000 pages = 64 MB, far more than the ntoskrnl image spans
+constexpr uint64_t MaxScanSteps = 0x4000;
+
 // Get ntoskrnl.exe address
 address GetNtoskrnl()
 {
-    // IDT
-    interrupt_descriptor_table idt = sidt();
-
-    // Start on a page boundary. The scan steps 4 KB at a time, so an unaligned start never lands on a page header
-    address base = (address) ((uint64_t) idt.base & ~0xFFFull);
+    // Start inside ntoskrnl, not at the IDT base: the IDT is not always inside the image (it was below it on one boot).
+    // __imp_PsInitialSystemProcess is the loader's import slot for a variable in ntoskrnl's data, so its address is
+    // inside the image. Round it down to a page boundary so the 4 KB steps land on page headers
+    address base = (address) ((uint64_t) (void *) __imp_PsInitialSystemProcess & ~0xFFFull);
 
     // Validity checks walk the page tables of the System process, which map all of kernel memory.
     // (Calling them with a constant in place of a CR3 checks against the wrong tables.)
@@ -353,9 +355,9 @@ address GetNtoskrnl()
         // Ntoskrnl.exe
         print(INFO("GetNtoskrnl: found ntoskrnl.exe at %p after %llu steps"), (void *) base, Steps);
         return base;
-    } while (base -= 0x1000);
+    } while (Steps < MaxScanSteps && (base -= 0x1000));
 
-    print(ERROR("GetNtoskrnl: NOT FOUND after %llu steps, %llu valid DOS headers, base reached 0"), Steps, MzSeen);
+    print(ERROR("GetNtoskrnl: NOT FOUND after %llu steps, %llu valid DOS headers"), Steps, MzSeen);
     return nullptr;
 }
 

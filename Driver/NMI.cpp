@@ -304,6 +304,12 @@ __asm__(
     "    push %r14\n"
     "    push %r15\n"
     "    mov %rsp, %rbx\n"                    // rbx = the saved registers; it is callee-saved, so it survives the call
+    // The CPU frame sits right after the 15 saved registers (120 bytes), and its CS is 8 bytes further (offset 0x80).
+    // RPL 3 means the NMI interrupted usermode. Then the GS base is the user's, not the kernel's (Windows' own NMI entry
+    // does swapgs before it touches per-processor data), so the C code must not run. Usermode NMIs are not recorded
+    // anyway, since CountNmiInterruptsOutsideModules skips them. Such NMIs are only handed to Windows
+    "    testb $3, 0x80(%rbx)\n"
+    "    jnz 2f\n"
     "    and $-16, %rsp\n"                    // the calling convention needs a 16-byte aligned stack at the call
     "    sub $0x20, %rsp\n"                   // 32 bytes of shadow space (Windows x64)
 #ifdef _WIN32
@@ -312,6 +318,10 @@ __asm__(
     "    mov %rbx, %rdi\n"                    // first argument (System V, used by the host test build)
 #endif
     "    call " C_LABEL(NMIInterruptHandler) "\n"
+    "    jmp 3f\n"
+    "2:\n"
+    "    xor %eax, %eax\n"                    // usermode NMI: not ours, so the result is 'not handled'
+    "3:\n"
     "    mov %rbx, %rsp\n"                    // back to the saved registers
     "    test %al, %al\n"                     // pops do not change the flags, so the result survives them
     "    pop %r15\n"
@@ -389,6 +399,13 @@ bool IDTHook()
     // Decide now, at normal level, whether the NMI handler may run
     NmiHandlerEnabled = !IsHVCIEnabled();
     print(INFO("IDTHook: HVCI %s, NMI handler %s"), NmiHandlerEnabled ? "off" : "on", NmiHandlerEnabled ? "enabled" : "disabled");
+
+#ifdef NO_IDT_HOOK
+    // Test build only: leave the NMI gate alone, so NMIs reach Windows' handler directly
+    NmiHandlerEnabled = false;
+    print(INFO("IDTHook: NO_IDT_HOOK test build, NMI gate not changed"));
+    return true;
+#endif
 
     // With HVCI on the handler never runs, so the IDT is left alone (the call-stack method does not need it)
     if (!NmiHandlerEnabled) return true;
