@@ -67,6 +67,9 @@ constexpr uint32_t NmiRecording = 2;
 constexpr uint32_t NmiRecorded = 3;
 uint32_t NmiState[MaxNmiProcessors];
 
+// How many times CollectNmiRecord checks a record that is still being written before it gives up on it
+constexpr uint32_t MaxCollectSpins = 1000000;
+
 // Set by IDTHook. The handler does nothing unless this is true, and IDTHook turns it on only when HVCI is off.
 // (The HVCI query itself cannot run at NMI level, so it is asked once here and the result is stored.)
 bool NmiHandlerEnabled = false;
@@ -254,7 +257,11 @@ void RecordArmedNmi(const NMI_FRAME *Frame)
     Record->Rip = Frame->Rip;
     Record->Rsp = Frame->Rsp;
     Record->Cs = Frame->Cs;
-    CaptureNmiStack(Record);
+
+    // Only kernel-mode stacks are copied. For an NMI in usermode, Rsp is a user address that may not be resident, and
+    // touching it at NMI level faults and takes the machine down. The caller skips usermode records anyway
+    if ((Frame->Cs & 3) == 0) CaptureNmiStack(Record);
+    else Record->StackBytes = 0;
 
     Record->Recorded = true;
     __atomic_store_n(&NmiState[Cpu], NmiRecorded, __ATOMIC_SEQ_CST);
@@ -381,6 +388,7 @@ bool IDTHook()
 {
     // Decide now, at normal level, whether the NMI handler may run
     NmiHandlerEnabled = !IsHVCIEnabled();
+    print(INFO("IDTHook: HVCI %s, NMI handler %s"), NmiHandlerEnabled ? "off" : "on", NmiHandlerEnabled ? "enabled" : "disabled");
 
     // With HVCI on the handler never runs, so the IDT is left alone (the call-stack method does not need it)
     if (!NmiHandlerEnabled) return true;
@@ -388,7 +396,12 @@ bool IDTHook()
     // Get windows IDT
     WindowsIDTR = sidt();
     IDT_GATE *windowsIDT = (IDT_GATE *) WindowsIDTR.base;
-    if (!windowsIDT) return false;
+    print(INFO("IDTHook: Windows IDT at %p, limit %u"), (void *) WindowsIDTR.base, (uint32_t) WindowsIDTR.limit);
+    if (!windowsIDT)
+    {
+        print(ERROR("IDTHook: IDT base is null"));
+        return false;
+    }
 
     // Construct local handler
     memcpy(localIDT, windowsIDT, sizeof(localIDT));
@@ -403,7 +416,9 @@ bool IDTHook()
     interrupt_descriptor_table LocalIDTR;
     LocalIDTR.base = &localIDT;
     LocalIDTR.limit = sizeof(localIDT) - 1;
+    print(INFO("IDTHook: loading the new IDT on every processor (KeGenericCallDpc)"));
     KeGenericCallDpc(LoadIDTROnProcessor, &LocalIDTR);
+    print(INFO("IDTHook: new IDT loaded on every processor"));
 
     return true;
 }
@@ -526,10 +541,19 @@ bool CollectNmiRecord(uint32_t Cpu)
     if (__atomic_compare_exchange_n(&NmiState[Cpu], &State, NmiIdle, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return false;
     if (State == NmiIdle) return false;
 
-    State = NmiRecorded;
-    while (!__atomic_compare_exchange_n(&NmiState[Cpu], &State, NmiIdle, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+    // The handler is still writing this record. Wait for it, but not forever: a handler that never finishes must not
+    // hang the scan. After the limit, the processor is disarmed and its record is dropped
+    for (uint32_t Spin = 0; Spin < MaxCollectSpins; Spin++)
+    {
         State = NmiRecorded;
-    return true;
+        if (__atomic_compare_exchange_n(&NmiState[Cpu], &State, NmiIdle, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return true;
+        __asm__ volatile("pause");
+    }
+
+    __atomic_store_n(&NmiState[Cpu], NmiIdle, __ATOMIC_SEQ_CST);
+    NmiRecords[Cpu].Recorded = false;
+    print(WARN("CPU %u: NMI record did not finish, dropped"), Cpu);
+    return false;
 }
 
 // Sends an NMI to every processor and records what each one interrupted.

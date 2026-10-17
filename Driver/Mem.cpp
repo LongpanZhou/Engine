@@ -313,8 +313,15 @@ bool LinkMapTable()
     cr3 SystemCR3 = {((_KPROCESS *) *__imp_PsInitialSystemProcess)->DirectoryTableBase};
     address TablePA{};
     pagesize PageSize{};
-    if (!GetPhysicalAddress(address((uint64_t) MapTableStorage), SystemCR3, TablePA, PageSize)) return false;
-    return LinkTable(SystemCR3, TablePA, MapTableStorage, MapTablePml4Index, MapTablePdptIndex, MapTablePdIndex);
+    if (!GetPhysicalAddress(address((uint64_t) MapTableStorage), SystemCR3, TablePA, PageSize))
+    {
+        print(ERROR("LinkMapTable: could not translate the table storage %p"), (void *) MapTableStorage);
+        return false;
+    }
+    print(INFO("LinkMapTable: table storage %p is at physical %p"), (void *) MapTableStorage, (void *) TablePA);
+    bool Linked = LinkTable(SystemCR3, TablePA, MapTableStorage, MapTablePml4Index, MapTablePdptIndex, MapTablePdIndex);
+    print(INFO("LinkMapTable: LinkTable returned %u"), (uint32_t) Linked);
+    return Linked;
 }
 
 // Clears the link and stops using the dedicated table, so later mappings search the tables as before. Other processors

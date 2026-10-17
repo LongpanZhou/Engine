@@ -290,7 +290,9 @@ address GetNtoskrnl()
 {
     // IDT
     interrupt_descriptor_table idt = sidt();
-    address base = idt.base;
+
+    // Start on a page boundary. The scan steps 4 KB at a time, so an unaligned start never lands on a page header
+    address base = (address) ((uint64_t) idt.base & ~0xFFFull);
 
     // Validity checks walk the page tables of the System process, which map all of kernel memory.
     // (Calling them with a constant in place of a CR3 checks against the wrong tables.)
@@ -298,39 +300,62 @@ address GetNtoskrnl()
 
     // Brute Force
     auto NtoskrnlFile = Decode(NtoskrnlName);
+    uint64_t Steps = 0;     // pages visited by the scan
+    uint64_t MzSeen = 0;    // pages where a valid DOS header was found
+    print(INFO("GetNtoskrnl: start, IDT base %p, scanning down in 4 KB steps"), (void *) base);
     do {
+        Steps++;
+        if ((Steps & 0x3FF) == 0) print(INFO("GetNtoskrnl: step %llu at %p"), Steps, (void *) base);
+
         // Get Data Directory
         auto dosHeader = (_IMAGE_DOS_HEADER *)base;
         if (!IsAddressValid(dosHeader, SystemCR3) || dosHeader->e_magic != 0x5A4D)
             continue;
+        MzSeen++;
+        print(INFO("GetNtoskrnl: MZ header at %p (step %llu)"), (void *) base, Steps);
 
         auto ntHeader = (_IMAGE_NT_HEADERS64 *)(base + dosHeader->e_lfanew);
         if (!IsAddressValid(ntHeader, SystemCR3) || ntHeader->Signature != 0x4550)
+        {
+            print(INFO("GetNtoskrnl: %p has no valid PE header"), (void *) base);
             continue;
+        }
 
         auto dataDir = ntHeader->OptionalHeader.DataDirectory;
         if (dataDir->VirtualAddress == 0)
+        {
+            print(INFO("GetNtoskrnl: %p has no export directory"), (void *) base);
             continue;
+        }
 
         auto exportDir = (_IMAGE_EXPORT_DIRECTORY *)(base + dataDir->VirtualAddress);
         if (!IsAddressValid(exportDir, SystemCR3))
+        {
+            print(INFO("GetNtoskrnl: export directory of %p is not mapped"), (void *) base);
             continue;
+        }
 
         // Get module name from export directory
         const char* name = (const char*)(base + exportDir->Name);
         if (!IsAddressValid(name, SystemCR3))
+        {
+            print(INFO("GetNtoskrnl: export name of %p is not mapped"), (void *) base);
             continue;
+        }
 
         // Check ntoskrnl.exe
         if (strcmp(name, NtoskrnlFile.data()))
+        {
+            print(INFO("GetNtoskrnl: %p is module %s, not ntoskrnl"), (void *) base, name);
             continue;
+        }
 
         // Ntoskrnl.exe
-        print(INFO("ntoskrnl.exe: %p"), base);
+        print(INFO("GetNtoskrnl: found ntoskrnl.exe at %p after %llu steps"), (void *) base, Steps);
         return base;
     } while (base -= 0x1000);
 
-    print(ERROR("ntoskrnl.exe NOT FOUND!"));
+    print(ERROR("GetNtoskrnl: NOT FOUND after %llu steps, %llu valid DOS headers, base reached 0"), Steps, MzSeen);
     return nullptr;
 }
 

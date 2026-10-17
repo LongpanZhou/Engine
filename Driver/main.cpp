@@ -38,20 +38,37 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
     // print(INFO("Encoded: %ws"), Wstr.data());
     // print(INFO("Decoded: %ws"), Decode(Wstr).data());
 
+    print(INFO("DriverEntry: start, DriverObject %p"), (void *) DriverObject);
+
     // Hook (STATUS_UNSUCCESSFUL if ntoskrnl or the signature cannot be found)
-    if (!Hook()) return static_cast<win::ntstatus>(0xC0000001);
+    print(INFO("DriverEntry: step 1 Hook()"));
+    if (!Hook())
+    {
+        print(ERROR("DriverEntry: Hook() failed, returning 0xC0000001"));
+        return static_cast<win::ntstatus>(0xC0000001);
+    }
+    print(INFO("DriverEntry: step 1 Hook() ok"));
 
     // NMI. If it fails, undo the hook: a driver that fails to load must not leave a hook pointing at its code
+    print(INFO("DriverEntry: step 2 IDTHook()"));
     if (!IDTHook())
     {
+        print(ERROR("DriverEntry: IDTHook() failed, undoing Hook()"));
         UnHook();
         return static_cast<win::ntstatus>(0xC0000001);
     }
+    print(INFO("DriverEntry: step 2 IDTHook() ok"));
 
     // The dedicated mapping table, if it is enabled (off by default)
-    if (MapTableEnabled) LinkMapTable();
+    if (MapTableEnabled)
+    {
+        print(INFO("DriverEntry: step 3 LinkMapTable()"));
+        bool Linked = LinkMapTable();
+        print(INFO("DriverEntry: step 3 LinkMapTable() returned %u"), (uint32_t) Linked);
+    }
 
     // Set last, once everything is in place, so an unload only undoes what DriverEntry actually did
     DriverObject->DriverUnload = DriverExit;
+    print(INFO("DriverEntry: success"));
     return win::ntstatus::success;
 }

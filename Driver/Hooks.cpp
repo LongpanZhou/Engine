@@ -109,14 +109,26 @@ bool Hook()
     if (pData) return true;
 
     // Find the signature in the PAGE section of ntoskrnl; either step can fail
+    print(INFO("Hook: looking up ntoskrnl"));
     address ntoskrnl = GetNtoskrnl();
-    if (!ntoskrnl) return false;
+    if (!ntoskrnl)
+    {
+        print(ERROR("Hook: ntoskrnl not found"));
+        return false;
+    }
+    print(INFO("Hook: ntoskrnl base %p, searching PAGE section for the signature"), (void *) ntoskrnl);
     address match = SectionScan(ntoskrnl, Decode(PageSectionName).data(), Decode(Signature).data());
-    if (!match) return false;
+    if (!match)
+    {
+        print(ERROR("Hook: signature not found in PAGE section"));
+        return false;
+    }
+    print(INFO("Hook: signature match at %p"), (void *) match);
 
     // Data ptr swap. The displacement is signed: a global placed before the instruction has a negative offset
     address instruction = match + 0x3;
     pData = (address *) (instruction + 0x4 + *(int32_t *) instruction);
+    print(INFO("Hook: target pointer at %p, current value %p"), (void *) pData, (void *) *(uint64_t *) pData);
 
     // Exchange
     OriginalFunc = (func_type) __atomic_exchange_n((uint64_t *) pData, (uint64_t) &Func, __ATOMIC_SEQ_CST);
