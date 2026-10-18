@@ -23,9 +23,6 @@ bool CopyVirtualMemory(address SrcAddress, cr3 SrcCR3, address DestAddress, cr3 
     return true;
 }
 
-// Defined in NMI.cpp, which is included after this file
-uint32_t RunNmiScan();
-
 // PID of User.exe as last found. It is only a hint: FindUserProcess checks the process it names before using it
 uint64_t UserExePid = -1;
 
@@ -80,13 +77,6 @@ void HandleCommand(Command *pCommand)
             if (!CopyVirtualMemory(cmd.SrcAddress, usermodeCR3, cmd.DestAddress, processCR3, cmd.Size))
                 print(WARN("Write failed"));
             break;
-        case scan:
-        {
-            uint32_t Suspicious = RunNmiScan();
-            if (!AccessVirtualMemory(cmd.DestAddress, usermodeCR3, &Suspicious, sizeof(Suspicious), true))
-                print(WARN("Scan result not written"));
-            break;
-        }
         default:
             print(WARN("Invalid OpCode %d"), cmd.OpCode);
     }
