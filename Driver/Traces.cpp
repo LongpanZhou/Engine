@@ -1,6 +1,10 @@
 // Trace cleaning. Three cleaners, all located by runtime signature + export table, no imports, no
-// hardcoded offsets beyond the record layouts. Compiled after Scan.cpp, Mem.cpp, Process.cpp and Strings.h:
-// reuses SectionScan, FindFuncExports, GetNtoskrnl, EnumerateKProcess and the encoded strings
+// hardcoded offsets beyond the record layouts. Uses ScanModuleImage, ResolveRipRelative, GetNtoskrnl,
+// EnumerateKProcess and the encoded strings.
+// DEBUG builds only: the whole file compiles to nothing in release, so no trace-cleaning code
+// (and no driver already in place during that boot) ever touches it
+
+#ifdef DEBUG
 
 // Shared helpers
 // ---------------------------------------------------------------------------
@@ -11,30 +15,6 @@ constexpr uint64_t KernelPointerFloor = 0xFFFF800000000000;
 bool IsKernelPointer(uint64_t Value)
 {
     return Value >= KernelPointerFloor;
-}
-
-// rip-relative reference -> absolute address: disp32 sits at OffsetOffset, the instruction ends after
-// InstructionSize bytes (the reference cleaner's ResolveRelativeAddress, renamed)
-address ResolveRipRelative(const void *Instruction, uint32_t OffsetOffset, uint32_t InstructionSize)
-{
-    auto Instr = (size_t) Instruction;
-    int32_t Offset = *(int32_t *) (Instr + OffsetOffset);
-    return (address) (Instr + InstructionSize + Offset);
-}
-
-// Pattern scan over one module image: PAGE first, then .text, like the reference cleaner's FindPatternImage
-address ScanModuleImage(address Base, const char *Pattern)
-{
-    if (!Base)
-    {
-        print(ERROR("ScanModuleImage: no base address"));
-        return nullptr;
-    }
-
-    if (address Match = SectionScan(Base, Decode(PageSectionName).data(), Pattern))
-        return Match;
-
-    return SectionScan(Base, Decode(TextSectionName).data(), Pattern);
 }
 
 // Walks the export directory by hand so the cleaners create no import table entries; data exports come
@@ -51,6 +31,30 @@ address ResolveKernelSymbol(const char *Name)
     return FindFuncExports(Nt, Name);
 }
 
+// Batch variant: one walk of ntoskrnl's export table resolves every name at once — the single
+// variant above re-walks the whole table per symbol. Names[i] lands in Results[i]; a name
+// not exported leaves that slot null
+static void ResolveKernelSymbols(const char *const *Names, address *Results, uint32_t Count)
+{
+    address Nt = GetNtoskrnl();
+    if (!Nt)
+    {
+        print(ERROR("ResolveKernelSymbols: ntoskrnl not found"));
+        return;
+    }
+
+    FindFuncExportsBatch(Nt, Names, Results, Count);
+}
+
+// Cached addresses of the boot-stable scan targets below, the same three-state pattern as GetNtoskrnl:
+// 0 = not scanned yet, Failed = scanned and missed (deterministic, never retried), else the address.
+// Each target is a data global or image base that does not move for the rest of the boot
+static uint64_t CachedPiDDBCacheList = 0;
+static uint64_t CachedMmUnloadedDrivers = 0;
+static uint64_t CachedMmLastUnloadedDriver = 0;
+static uint64_t CachedCiBase = 0;
+static uint64_t CachedHashBucketList = 0;
+
 // Case-folded equality of two UNICODE_STRINGs (the names compared here are ASCII file names, so
 // folding the 6th bit is exact). Null buffers, odd lengths or mismatched lengths do not match
 static bool WideNameEquals(const _UNICODE_STRING* A, const _UNICODE_STRING* B)
@@ -65,33 +69,14 @@ static bool WideNameEquals(const _UNICODE_STRING* A, const _UNICODE_STRING* B)
     return true;
 }
 
-// PE timestamp of a loaded image (file header), the second PiDDB lookup key next to the driver name
-uint32_t GetImageDataTimeStamp(address ImageBase)
-{
-    if (!ImageBase || !IsKernelPointer(ImageBase)) return 0;
-
-    auto Dos = (_IMAGE_DOS_HEADER *) ImageBase;
-    if (Dos->e_magic != 0x5A4D) return 0;
-
-    auto Nt = (_IMAGE_NT_HEADERS64 *) (ImageBase + Dos->e_lfanew);
-    if (Nt->Signature != 0x4550) return 0;
-
-    return Nt->FileHeader.TimeDateStamp;
-}
-
 // ---------------------------------------------------------------------------
 // Cleaner 1: PiDDBCacheTable
 // ---------------------------------------------------------------------------
 
-// Every load attempt is filed in CI's "PiDDB process cache" (an AVL tree keyed by name, then PE
-// timestamp, plus a circular housekeeping list threading every entry, both in ntoskrnl), and cache
-// walks by anti-cheat tooling still see our entry after everything else about the load is gone. This
-// cleaner makes ZERO kernel calls: the list head comes from a code signature, and instead of deleting
-// the entry — a hand-rolled AVL delete would have to replicate Rtl's rebalancing exactly, and one
-// wrong balance byte corrupts the table for CI itself — it camouflages the entry in place by
-// copying a benign entry's name + timestamp + load status over ours. The tree's links and balance
-// factors stay untouched, and because the copied key already exists elsewhere in the tree, every
-// lookup still resolves to a record with identical data
+// Every load attempt is filed in CI's "PiDDB process cache" (an AVL tree plus a circular housekeeping
+// list, both in ntoskrnl), which cache walks still see after everything else is scrubbed. Instead of a
+// hand-rolled AVL delete (one wrong balance byte corrupts the table for CI itself) the entry is
+// camouflaged in place: a benign entry's name + timestamp + load status is copied over ours
 struct _PiDDB_CACHE_ENTRY
 {
     struct _LIST_ENTRY List;             //0x0 housekeeping list every entry is threaded onto
@@ -114,10 +99,14 @@ typedef int (*ExReleaseResourceLite_t)(VOID* Resource);
 // to the head, so the whole cache is reachable without ever touching the AVL tree
 static _LIST_ENTRY* FindPiDDBCacheList(address Nt)
 {
+    uint64_t Cached = __atomic_load_n(&CachedPiDDBCacheList, __ATOMIC_SEQ_CST);
+    if (Cached) return Cached == Failed ? nullptr : (_LIST_ENTRY *) Cached;
+
     address Match = ScanModuleImage(Nt, Decode(PiDDBCacheListSignature).data());
     if (!Match)
     {
         print(ERROR("PiDDB: list signature not found"));
+        __atomic_store_n(&CachedPiDDBCacheList, Failed, __ATOMIC_SEQ_CST);
         return nullptr;
     }
 
@@ -126,15 +115,16 @@ static _LIST_ENTRY* FindPiDDBCacheList(address Nt)
     if (!IsKernelPointer((uint64_t) List))
     {
         print(ERROR("PiDDB: list head %p is not a kernel pointer"), (void *) List);
+        __atomic_store_n(&CachedPiDDBCacheList, Failed, __ATOMIC_SEQ_CST);
         return nullptr;
     }
 
+    __atomic_store_n(&CachedPiDDBCacheList, (uint64_t) List, __ATOMIC_SEQ_CST);
     return List;
 }
 
-// Copies Donor's identity (name + timestamp + load status) onto Target, if the name fits Target's
-// own buffer. Every write is small and naturally aligned, so a CI thread reading the entry
-// concurrently sees either the old or the new value — both valid records — and no lock is needed
+// Copies Donor's identity onto Target if the name fits Target's own buffer. Every write is small and
+// aligned, so a concurrent CI reader always sees a valid record
 static bool CamouflagePiDDBEntry(_PiDDB_CACHE_ENTRY* Target, const _PiDDB_CACHE_ENTRY* Donor)
 {
     if (Donor->DriverName.Length + sizeof(wchar_t) > Target->DriverName.MaximumLength)
@@ -179,10 +169,8 @@ static bool ForEachPiDDBEntry(_LIST_ENTRY* Head, F Visitor)
     return Walked < MaxPiDDBEntries;
 }
 
-// Hides this driver's records in the PiDDB cache without calling a single kernel routine. Matching is
-// by name only: earlier load cycles of the same binary carry different timestamps, and every entry
-// naming this driver is a trace. True when the walk completed; false means a structure was missing,
-// not that a record existed
+// Hides this driver's records by matching name only (earlier load cycles carry different timestamps).
+// True when the walk completed; false means a missing structure, not that a record existed
 bool ClearPiDDBCache(win::DRIVER_OBJECT* DriverObject)
 {
     if (!DriverObject || !DriverObject->DriverSection)
@@ -206,14 +194,19 @@ bool ClearPiDDBCache(win::DRIVER_OBJECT* DriverObject)
     _LIST_ENTRY* Head = FindPiDDBCacheList(Nt);
     if (!Head) return false;
 
-    // Pass 1: the identity source — the first benign entry on the list. All entries naming this
-    // driver share its name, so one donor covers every one of them; the fit against each target's
-    // own buffer is checked per copy below
+    // Pass 1: find a donor — the first benign entry. All entries naming this driver share the name, so
+    // one donor covers them all. A walk that stops early means the clean is not attempted at all
     _PiDDB_CACHE_ENTRY* Donor = nullptr;
-    ForEachPiDDBEntry(Head, [&](auto Entry) {
+    bool ListOk = ForEachPiDDBEntry(Head, [&](auto Entry) {
         if (!Donor && Entry->DriverName.Length && !WideNameEquals(&Entry->DriverName, &Kldr->BaseDllName))
             Donor = Entry;
     });
+
+    if (!ListOk)
+    {
+        print(WARN("PiDDB: donor walk stopped early (damaged list), clean not attempted"));
+        return false;
+    }
 
     if (!Donor)
     {
@@ -238,13 +231,20 @@ bool ClearPiDDBCache(win::DRIVER_OBJECT* DriverObject)
         print(INFO("PiDDB: no entry for this driver out of %u walked (nothing to clean)"), Walked);
     else
         print(OK("PiDDB: %u of %u entries camouflaged"), Camouflaged, Walked);
+
+    // A clean that stopped early leaves entries past the malformed one unvisited — that is a
+    // partial clean, and the caller must not read it as a complete one
+    if (!ListOk)
+    {
+        print(WARN("PiDDB: clean walk stopped early (damaged list), result may be partial"));
+        return false;
+    }
     return true;
 }
 
 // Debug-only self-check of the PiDDB cleaner, run right after it inside CleanDriverTraces: walks the
 // housekeeping list again and confirms the stealth property directly — no entry still names this
-// driver — over a fully intact list. Non-static like VerifyMemory, so release builds compile it
-// without an unused warning and --gc-sections drops it from the image
+// driver — over a fully intact list
 void VerifyPiDDBCache(win::DRIVER_OBJECT* DriverObject)
 {
     if (!DriverObject || !DriverObject->DriverSection)
@@ -314,25 +314,46 @@ typedef uint32_t (*RtlRandomEx_t)(uint32_t* Seed);
 static ExAcquireResourceExclusiveLite_t MmUnloadAcquireFn = nullptr;
 static ExReleaseResourceLite_t MmUnloadReleaseFn = nullptr;
 static ExFreePoolWithTag_t MmUnloadFreeFn = nullptr;
-static RtlRandomEx_t MmUnloadRandomFn = nullptr;
 static VOID* MmUnloadResource = nullptr;
+
+// The one RtlRandomEx resolution, shared with the hash-bucket cleaner below (both randomize
+// bytes through it); resolved once, by whichever cleaner needs it first
+static RtlRandomEx_t RandomFn = nullptr;
+
+static RtlRandomEx_t ResolveRandomFn()
+{
+    if (RandomFn) return RandomFn;
+
+    RandomFn = (RtlRandomEx_t) ResolveKernelSymbol(Decode(RtlRandomExName).data());
+    if (!RandomFn)
+        print(ERROR("RtlRandomEx not exported, randomizing cleaners will fail"));
+    return RandomFn;
+}
 
 static bool ResolveMmUnloadRoutines()
 {
     if (MmUnloadFreeFn) return true;
 
-    MmUnloadAcquireFn = (ExAcquireResourceExclusiveLite_t) ResolveKernelSymbol(Decode(ExAcquireResourceName).data());
-    MmUnloadReleaseFn = (ExReleaseResourceLite_t) ResolveKernelSymbol(Decode(ExReleaseResourceName).data());
-    MmUnloadFreeFn = (ExFreePoolWithTag_t) ResolveKernelSymbol(Decode(ExFreePoolTagName).data());
-    MmUnloadRandomFn = (RtlRandomEx_t) ResolveKernelSymbol(Decode(RtlRandomExName).data());
+    // One walk of the export table covers all three routines; RtlRandomEx resolves separately
+    // above, shared with the hash-bucket cleaner. The decoded names are kept in named locals:
+    // the arrays handed to the batch resolver must outlive its call
+    auto AcquireName = Decode(ExAcquireResourceName);
+    auto ReleaseName = Decode(ExReleaseResourceName);
+    auto FreeName = Decode(ExFreePoolTagName);
+    const char *Names[3] = { AcquireName.data(), ReleaseName.data(), FreeName.data() };
+    address Found[3] = {};
 
-    bool Ok = MmUnloadAcquireFn && MmUnloadReleaseFn && MmUnloadFreeFn && MmUnloadRandomFn;
+    ResolveKernelSymbols(Names, Found, 3);
+    MmUnloadAcquireFn = (ExAcquireResourceExclusiveLite_t) Found[0];
+    MmUnloadReleaseFn = (ExReleaseResourceLite_t) Found[1];
+    MmUnloadFreeFn = (ExFreePoolWithTag_t) Found[2];
+
+    bool Ok = MmUnloadAcquireFn && MmUnloadReleaseFn && MmUnloadFreeFn && ResolveRandomFn();
     if (!Ok)
     {
         MmUnloadAcquireFn = nullptr;
         MmUnloadReleaseFn = nullptr;
         MmUnloadFreeFn = nullptr;
-        MmUnloadRandomFn = nullptr;
         print(ERROR("MmUnloaded: one or more exported routines not found"));
     }
     return Ok;
@@ -354,10 +375,14 @@ static VOID* ResolveMmUnloadResource()
 // The array itself: the mov loads &MmUnloadedDrivers, one deref reads the array pointer out
 static _MM_UNLOADED_DRIVER* FindMmUnloadedDrivers(address Nt)
 {
+    uint64_t Cached = __atomic_load_n(&CachedMmUnloadedDrivers, __ATOMIC_SEQ_CST);
+    if (Cached) return Cached == Failed ? nullptr : (_MM_UNLOADED_DRIVER *) Cached;
+
     address Match = ScanModuleImage(Nt, Decode(MmUnloadedDriversSignature).data());
     if (!Match)
     {
         print(ERROR("MmUnloaded: array signature not found"));
+        __atomic_store_n(&CachedMmUnloadedDrivers, Failed, __ATOMIC_SEQ_CST);
         return nullptr;
     }
 
@@ -366,9 +391,12 @@ static _MM_UNLOADED_DRIVER* FindMmUnloadedDrivers(address Nt)
     {
         print(ERROR("MmUnloaded: slot %p dereferences to %p, not a kernel pointer"),
               Slot, Slot ? (void*) *Slot : nullptr);
+        __atomic_store_n(&CachedMmUnloadedDrivers, Failed, __ATOMIC_SEQ_CST);
         return nullptr;
     }
 
+    // The slot holds &MmUnloadedDrivers; the array it points at is a static ntoskrnl global
+    __atomic_store_n(&CachedMmUnloadedDrivers, (uint64_t) *Slot, __ATOMIC_SEQ_CST);
     print(INFO("MmUnloaded: array %p"), (void*) *Slot);
     return *Slot;
 }
@@ -376,24 +404,34 @@ static _MM_UNLOADED_DRIVER* FindMmUnloadedDrivers(address Nt)
 // The used-slot count, behind the "cmp eax, 0x32"
 static uint32_t* FindMmLastUnloadedDriver(address Nt)
 {
+    uint64_t Cached = __atomic_load_n(&CachedMmLastUnloadedDriver, __ATOMIC_SEQ_CST);
+    if (Cached) return Cached == Failed ? nullptr : (uint32_t *) Cached;
+
     address Match = ScanModuleImage(Nt, Decode(MmLastUnloadedDriverSignature).data());
     if (!Match)
     {
         print(ERROR("MmUnloaded: count signature not found"));
+        __atomic_store_n(&CachedMmLastUnloadedDriver, Failed, __ATOMIC_SEQ_CST);
         return nullptr;
     }
 
+    // Only the POINTER is cached; the count itself changes with every unload and is read live.
+    // The value check below validates the scan-time snapshot: a sane count there means the
+    // slot really is MmLastUnloadedDriver, which stays true for the rest of the boot
     uint32_t* Count = (uint32_t*) ResolveRipRelative(Match, 2, 6);
     if (!IsKernelPointer((uint64_t) Count) || *Count > MmUnloadedDriversSize)
     {
         print(ERROR("MmUnloaded: count %p holds %u, not a plausible slot count"), Count, Count ? *Count : 0);
+        __atomic_store_n(&CachedMmLastUnloadedDriver, Failed, __ATOMIC_SEQ_CST);
         return nullptr;
     }
 
+    __atomic_store_n(&CachedMmLastUnloadedDriver, (uint64_t) Count, __ATOMIC_SEQ_CST);
     print(INFO("MmUnloaded: count %p = %u slots in use"), Count, *Count);
     return Count;
 }
 
+// A slot is empty when it carries no name
 static bool IsUnloadEntryEmpty(_MM_UNLOADED_DRIVER* Entry)
 {
     return Entry->Name.MaximumLength == 0 || Entry->Name.Length == 0 || Entry->Name.Buffer == nullptr;
@@ -430,39 +468,44 @@ static bool MmUnloadNameMatches(_MM_UNLOADED_DRIVER* Entry, const wchar_t* Drive
     return true;
 }
 
-// One removal pass: matching records freed + zeroed, later records slide down one slot, last slot zeroed.
-// Duplicates that slide into place mid-pass are caught by the next pass
-static bool RemoveMmUnloadRecords(const wchar_t* DriverName, _MM_UNLOADED_DRIVER* Table, uint32_t* Count, bool Filled)
+    // Remove every matching record in one pass: survivors compact down over the holes, past-count slots
+    // are zeroed. The old code removed one record per pass and chased duplicates with up to four passes
+static uint32_t RemoveMmUnloadRecords(const wchar_t* DriverName, _MM_UNLOADED_DRIVER* Table, uint32_t* Count, bool Filled)
 {
-    bool Modified = false;
+    uint32_t Removed = 0;
+    uint32_t Out = 0;      // the next slot a surviving record takes
 
     for (uint32_t Index = 0; Index < MmUnloadedDriversSize; ++Index)
     {
         auto Entry = &Table[Index];
-        if (IsUnloadEntryEmpty(Entry)) continue;
 
-        if (Modified)
-        {
-            auto Prev = &Table[Index - 1];
-            *Prev = *Entry;
-            if (Index == MmUnloadedDriversSize - 1)
-                *Entry = {};
-        }
-        else if (MmUnloadNameMatches(Entry, DriverName))
+        // A matching record is freed, zeroed and dropped; everything else compacts over the holes
+        if (!IsUnloadEntryEmpty(Entry) && MmUnloadNameMatches(Entry, DriverName))
         {
             VOID* Buffer = Entry->Name.Buffer;
             *Entry = {};
             MmUnloadFreeFn(Buffer, MmDtPoolTag);
-
-            // Full array: the count sat at the cap; otherwise the record was already counted. Either way
-            // one removal is one decrement
-            *Count = (Filled ? MmUnloadedDriversSize : *Count) - 1;
-            Modified = true;
+            Removed++;
             print(INFO("MmUnloaded: record %u removed"), Index);
+            continue;
         }
+
+        if (Out != Index)
+        {
+            Table[Out] = *Entry;      // survivor (or trailing empty) slides down
+            *Entry = {};             // source slot cleared
+        }
+        Out++;
     }
 
-    return Modified;
+    if (Removed)
+    {
+        // Full array: the count sat at the cap; otherwise the records were already counted.
+        // Either way the count drops by exactly the number removed
+        *Count = (Filled ? MmUnloadedDriversSize : *Count) - Removed;
+    }
+
+    return Removed;
 }
 
 // Restore the descending UnloadTime order the kernel's inserts maintain
@@ -479,15 +522,15 @@ static void NormalizeMmUnloadTimes(_MM_UNLOADED_DRIVER* Table)
         if (PreviousTime && Entry->UnloadTime > PreviousTime)
         {
             if (!Seed) Seed = (uint32_t) ((size_t) &Seed ^ Entry->UnloadTime);
-            Entry->UnloadTime = PreviousTime - (MmUnloadRandomFn(&Seed) % 100) - 1;
+            Entry->UnloadTime = PreviousTime - (RandomFn(&Seed) % 100) - 1;
         }
 
         PreviousTime = Entry->UnloadTime;
     }
 }
 
-// Removes this driver's records from MmUnloadedDrivers and fixes the count; up to four passes bound the
-// duplicate-chasing. True when the walk completed
+// Removes this driver's records from MmUnloadedDrivers and fixes the count in one pass. True
+// when the walk completed
 bool ClearMmUnloadedDrivers(win::DRIVER_OBJECT* DriverObject)
 {
     if (!DriverObject || !DriverObject->DriverSection)
@@ -520,13 +563,10 @@ bool ClearMmUnloadedDrivers(win::DRIVER_OBJECT* DriverObject)
     VOID* Resource = ResolveMmUnloadResource();
     bool Locked = Resource && MmUnloadAcquireFn(Resource, 1);
 
-    bool Modified = false;
-    for (uint32_t Pass = 0; Pass < 4 &&
-         RemoveMmUnloadRecords(Kldr->BaseDllName.Buffer, Table, Count, IsMmUnloadedFilled(Table)); ++Pass)
-    {
-        NormalizeMmUnloadTimes(Table);
-        Modified = true;
-    }
+    // One pass removes every matching record; duplicates no longer need the old four-pass chase
+    uint32_t Removed = RemoveMmUnloadRecords(Kldr->BaseDllName.Buffer, Table, Count, IsMmUnloadedFilled(Table));
+    bool Modified = Removed != 0;
+    if (Modified) NormalizeMmUnloadTimes(Table);
 
     if (Locked) MmUnloadReleaseFn(Resource);
 
@@ -542,38 +582,34 @@ bool ClearMmUnloadedDrivers(win::DRIVER_OBJECT* DriverObject)
 // Cleaner 3: the CI kernel hash bucket list
 // ---------------------------------------------------------------------------
 
-// ci.dll keeps a chain of loaded kernel image hashes ("g_KernelHashBucketList") behind a rip-relative lea.
-// Found by the 21H1 pattern (1903-21H1, our 19041 included), 22H2 pattern as fallback; ci.dll's base comes
-// from the module walk. Entries are qword-linked (*(ULONGLONG*)Entry is the next entry), name at +0x48,
-// 20-byte hash at +0x18. The reference cleaner scrambles the hash instead of unlinking: removing a node
-// from CI's chain is invasive, random bytes just read as a stale cache record
+// ci.dll keeps a chain of loaded kernel image hashes ("g_KernelHashBucketList") behind a rip-relative
+// lea. Found by the 21H1 pattern (our 19041), 22H2 as fallback; base from the module walk. The
+// reference cleaner scrambles the hash instead of unlinking: random bytes read as a stale record
 constexpr uint32_t HashBucketEntryNameOffset = 0x48;
 constexpr uint32_t HashBucketEntryHashOffset = 0x18;
 constexpr uint32_t HashBucketEntryHashSize = 20;
 constexpr uint32_t MaxHashBucketEntries = 0x800;
 
-static RtlRandomEx_t HashBucketRandomFn = nullptr;
-
+// RtlRandomEx resolves once and is shared with the MmUnloaded cleaner above
 static bool ResolveHashBucketRoutines()
 {
-    if (HashBucketRandomFn) return true;
-
-    HashBucketRandomFn = (RtlRandomEx_t) ResolveKernelSymbol(Decode(RtlRandomExName).data());
-    if (!HashBucketRandomFn)
-    {
-        print(ERROR("HashBucket: RtlRandomEx not exported"));
-        return false;
-    }
-
-    return true;
+    return ResolveRandomFn() != nullptr;
 }
 
 // ci.dll's base from the kernel module list; needs this driver's loader entry relinked, which both call
 // sites guarantee
 static address FindCiBase()
 {
+    uint64_t Cached = __atomic_load_n(&CachedCiBase, __ATOMIC_SEQ_CST);
+    if (Cached) return Cached == Failed ? nullptr : (address) Cached;
+
     auto Ci = Decode(CiDllName);
-    return EnumerateKProcess(Ci.data());
+    address Base = EnumerateKProcess(Ci.data());
+
+    // ci.dll loads at boot and is never unloaded or moved, so a miss is as deterministic as the
+    // signature misses above and is not retried either
+    __atomic_store_n(&CachedCiBase, Base ? (uint64_t) Base : Failed, __ATOMIC_SEQ_CST);
+    return Base;
 }
 
 // Resolves the chain head from one signature: the rip-relative lea sits at match+3 with its disp32
@@ -599,42 +635,64 @@ static ULONGLONG* FindBucketListByPattern(address CiBase, const std::array<char,
 // pattern (1903-21H1, our 19041 included) is tried first, the 22H2 pattern as fallback
 static ULONGLONG* FindKernelHashBucketList(address CiBase)
 {
+    uint64_t Cached = __atomic_load_n(&CachedHashBucketList, __ATOMIC_SEQ_CST);
+    if (Cached) return Cached == Failed ? nullptr : (ULONGLONG *) Cached;
+
     if (!CiBase)
     {
         print(ERROR("HashBucket: ci.dll not found, nothing to scan"));
+        __atomic_store_n(&CachedHashBucketList, Failed, __ATOMIC_SEQ_CST);
         return nullptr;
     }
 
     print(INFO("HashBucket: ci.dll at %p"), (void*) CiBase);
 
     if (ULONGLONG* List = FindBucketListByPattern(CiBase, Decode(KernelHashBucketListSignature21H1)))
+    {
+        __atomic_store_n(&CachedHashBucketList, (uint64_t) List, __ATOMIC_SEQ_CST);
         return List;
+    }
     if (ULONGLONG* List = FindBucketListByPattern(CiBase, Decode(KernelHashBucketListSignature22H2)))
+    {
+        __atomic_store_n(&CachedHashBucketList, (uint64_t) List, __ATOMIC_SEQ_CST);
         return List;
+    }
 
     print(ERROR("HashBucket: no signature matched in ci.dll"));
+    __atomic_store_n(&CachedHashBucketList, Failed, __ATOMIC_SEQ_CST);
     return nullptr;
 }
 
-// wcswcs-style substring search, no CRT
-static const wchar_t* WideContains(const wchar_t* Haystack, const wchar_t* Needle)
+// Most characters a hash-bucket name may hold before the walk treats it as garbage. Mirrors the
+// 512-byte bound ForEachPiDDBEntry puts on its names; image names are tens of characters, so a
+// well-formed entry never reaches it
+constexpr uint32_t MaxHashBucketNameChars = 512;
+
+// wcswcs-style substring search, no CRT. Cap bounds how much of the haystack may be read: a
+// corrupt, never-terminating name reads at most Cap characters and then reads as no-match,
+// instead of walking off into unmapped memory. ForEachPiDDBEntry bounds its names through the
+// UNICODE_STRING length; here the cap is the only bound available
+static const wchar_t* WideContains(const wchar_t* Haystack, const wchar_t* Needle, uint32_t Cap)
 {
     if (!Haystack || !Needle || !*Needle) return nullptr;
 
-    for (const wchar_t* h = Haystack; *h; ++h)
+    for (const wchar_t* h = Haystack; (uint32_t)(h - Haystack) < Cap && *h; ++h)
     {
         const wchar_t* a = h;
         for (const wchar_t* b = Needle; ; ++a, ++b)
         {
-            if (!*b) return h;          // needle fully matched
-            if (*a != *b) break;        // mismatch: move the window
-            if (!*a) break;             // haystack ended mid-needle
+            if (!*b) return h;                             // needle fully matched
+            if ((uint32_t)(a - Haystack) >= Cap) break;    // cap checked before the read
+            if (*a != *b) break;                           // mismatch: move the window
+            if (!*a) break;                                // haystack ended mid-needle
         }
     }
 
     return nullptr;
 }
 
+// Scrambles the hash of every entry whose name contains DriverName; entries stay on the list, the
+// bytes just read as a stale record
 static void ScrambleHashBucketHash(ULONGLONG* List, const wchar_t* DriverName)
 {
     static uint32_t Seed = 0;
@@ -647,13 +705,15 @@ static void ScrambleHashBucketHash(ULONGLONG* List, const wchar_t* DriverName)
         if (IsKernelPointer(Current))
         {
             auto Name = (const wchar_t*) (Current + HashBucketEntryNameOffset);
-            if (WideContains(Name, DriverName))
+            // An odd name pointer means the entry is garbage on an axis the cap below does not
+            // cover; a real UNICODE_STRING buffer is always 2-byte aligned
+            if (!((uint64_t) Name & 1) && WideContains(Name, DriverName, MaxHashBucketNameChars))
             {
                 auto Hash = (uint8_t*) (Current + HashBucketEntryHashOffset);
                 for (uint32_t j = 0; j < HashBucketEntryHashSize; ++j)
                 {
                     if (!Seed) Seed = (uint32_t) ((size_t) &Seed ^ Hash[j]);
-                    Hash[j] = (uint8_t) (HashBucketRandomFn(&Seed) % 255);
+                    Hash[j] = (uint8_t) (RandomFn(&Seed) % 255);
                 }
 
                 Removed++;
@@ -710,15 +770,21 @@ bool ClearKernelHashBucketList(win::DRIVER_OBJECT* DriverObject)
 // unload callback returns is cleaned by the next load's step 0)
 bool CleanDriverTraces(win::DRIVER_OBJECT* DriverObject)
 {
+    // TEMPORARY: testing one cleaner at a time — currently ClearPiDDBCache only (the camouflage clean);
+    // the other two cleaners are commented out until their turn. Only-true stand-ins keep the summary
+    // line and return value unchanged. (PiDDB note: a donor name longer than this driver's entry buffer
+    // leaves that entry in place — that is what VerifyPiDDBCache checks)
     bool PiDDB = ClearPiDDBCache(DriverObject);
+    // bool MmU = ClearMmUnloadedDrivers(DriverObject);
+    // bool Hash = ClearKernelHashBucketList(DriverObject);
+    bool MmU = true, Hash = true;   // not exercised in this build
 
 #ifdef DEBUG
-    // Only when the cleaner itself ran; release builds drop the call and the function with it
-    VerifyPiDDBCache(DriverObject);
+    // Only when the cleaner itself ran; release builds drop the call
+    // VerifyPiDDBCache(DriverObject);
 #endif
-
-    bool MmU = ClearMmUnloadedDrivers(DriverObject);
-    bool Hash = ClearKernelHashBucketList(DriverObject);
     print(INFO("CleanTraces: piddb %u, mmu %u, hashbucket %u"), (uint32_t) PiDDB, (uint32_t) MmU, (uint32_t) Hash);
     return PiDDB && MmU && Hash;
 }
+
+#endif // DEBUG

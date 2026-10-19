@@ -1,3 +1,5 @@
+// The NtCompareSigningLevels hook: receives User.exe's commands through the hooked syscall.
+// Unity order (main.cpp): after Mem.cpp and Process.cpp, before Traces.cpp
 #include "../Common/Command.h"
 
 // NtCompareSigningLevels: Signature, UserExeName and PageSectionName are in Strings.h
@@ -40,6 +42,21 @@ void HandleCommand(Command *pCommand)
     // A command that cannot be read is dropped, not replayed from an earlier call
     if (!AccessVirtualMemory(pCommand, usermodeCR3, &cmd, sizeof(cmd))) return;
 
+    // Heartbeat: names no target process, so it is answered before the destination lookup. The
+    // response packs the command secret (only the driver knows it) and a counter (so a fresh
+    // answer is distinguishable from a stale buffer) into the caller's own buffer
+    if (cmd.OpCode == ping)
+    {
+        static uint64_t Heartbeats = 0;
+        uint64_t Response = (CommandSecret << 32)
+                          | (__atomic_fetch_add(&Heartbeats, 1, __ATOMIC_SEQ_CST) & 0xFFFFFFFF);
+        if (!AccessVirtualMemory(cmd.SrcAddress, usermodeCR3, &Response, sizeof(Response), true))
+            print(WARN("Ping: could not write the response"));
+        else
+            print(INFO("Ping: heartbeat %llx"), (unsigned long long) Response);
+        return;
+    }
+
     _EPROCESS *pProcess = EnumerateEProcess(L"", cmd.DestPID);
     if (!pProcess) return;
     cr3 processCR3 = ((_KPROCESS *) pProcess)->DirectoryTableBase;
@@ -64,17 +81,16 @@ void HandleCommand(Command *pCommand)
     }
 }
 
-// Hook Func
+// Hook body: forwards User.exe's secret-bearing calls to HandleCommand, then always calls the original
 uint64_t __fastcall Func(uint64_t Secret, Command *pCommand)
 {
-    // I see dead people
     if (Secret == CommandSecret) HandleCommand(pCommand);
 
     // Return original, called with the same arguments it was called with
     return OriginalFunc(Secret, pCommand);
 }
 
-// Hook
+// Installs the hook: finds NtCompareSigningLevels by pattern, then swaps its data pointer to Func
 bool Hook()
 {
     // Check if dataptr empty
@@ -88,18 +104,17 @@ bool Hook()
         print(ERROR("Hook: ntoskrnl not found"));
         return false;
     }
-    print(INFO("Hook: ntoskrnl base %p, searching PAGE section for the signature"), (void *) ntoskrnl);
-    address match = SectionScan(ntoskrnl, Decode(PageSectionName).data(), Decode(Signature).data());
+    print(INFO("Hook: ntoskrnl base %p, searching PAGE then .text for the signature"), (void *) ntoskrnl);
+    address match = ScanModuleImage(ntoskrnl, Decode(Signature).data());
     if (!match)
     {
-        print(ERROR("Hook: signature not found in PAGE section"));
+        print(ERROR("Hook: signature not found in PAGE or .text"));
         return false;
     }
     print(INFO("Hook: signature match at %p"), (void *) match);
 
     // Data ptr swap. The displacement is signed: a global placed before the instruction has a negative offset
-    address instruction = match + 0x3;
-    pData = (address *) (instruction + 0x4 + *(int32_t *) instruction);
+    pData = (address *) ResolveRipRelative(match, 3, 7);
     print(INFO("Hook: target pointer at %p, current value %p"), (void *) pData, (void *) *(uint64_t *) pData);
 
     // Exchange
@@ -108,7 +123,7 @@ bool Hook()
     return true;
 }
 
-// UnHook
+// Restores the original function pointer
 void UnHook()
 {
     // Check if dataptr exist

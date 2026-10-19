@@ -69,6 +69,21 @@ address EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleNa
     return nullptr;
 }
 
+// Case-folded comparison, so the search finds the module however the loader stored its name's case
+// (ci.dll must match CI.dll). ASCII file names: folding a-z to A-Z is exact
+static bool WideEqualsIgnoreCase(const wchar_t *A, const wchar_t *B)
+{
+    while (*A || *B)
+    {
+        wchar_t a = (*A >= L'a' && *A <= L'z') ? (wchar_t) (*A - 0x20) : *A;
+        wchar_t b = (*B >= L'a' && *B <= L'z') ? (wchar_t) (*B - 0x20) : *B;
+        if (a != b) return false;
+        ++A;
+        ++B;
+    }
+    return true;
+}
+
 address EnumerateKProcess(const wchar_t *ProcessName)
 {
     // Parameters
@@ -96,10 +111,10 @@ address EnumerateKProcess(const wchar_t *ProcessName)
             continue;
 
         // Print info
-        print(INFO("Module Name: %ws"), moduleName.Buffer);
+        // print(INFO("Module Name: %ws"), moduleName.Buffer);
 
         // Str cmp
-        if (!wcscmp(moduleName.Buffer, ProcessName))
+        if (WideEqualsIgnoreCase(moduleName.Buffer, ProcessName))
             return entry->DllBase;
     }
 
@@ -133,15 +148,24 @@ _EPROCESS *EnumerateEProcess(const wchar_t *ProcessName, const uint64_t PID = -1
     _LIST_ENTRY *pHead = &(Process->ActiveProcessLinks);
     _LIST_ENTRY *pCurrent = pHead;
 
-    // Loop through all process
+    // Walk bound: a torn or corrupt Flink must not turn this into an endless walk or a walk off
+    // the list (the same MaxWalk pattern as the module-list walkers in Hide.cpp). Real process
+    // counts are far below the bound, so a well-formed list ends long before it
+    constexpr uint32_t MaxProcessWalk = 4096;
+    uint32_t Count = 0;
+
+    // The Flink read has a race window: the list is mutated at process create/exit under locks
+    // this walk does not take, so an entry may unlink between being observed and being followed.
+    // The walk only follows links it just observed valid; no EPROCESS lifetime is extended here
     do
     {
         // Get EProcess from ListEntry
         _EPROCESS *pProcess = CONTAINING_RECORD(pCurrent, _EPROCESS, ActiveProcessLinks);
         pCurrent = pCurrent->Flink;
+        Count++;
 
         // PID cmp
-        print(INFO("Process Name: %s, PID: %p"), pProcess->ImageFileName, pProcess->UniqueProcessId);
+        // print(INFO("Process Name: %s, PID: %p"), pProcess->ImageFileName, pProcess->UniqueProcessId);
         if (pProcess->UniqueProcessId == (void *) PID)
             return pProcess;
 
@@ -150,11 +174,11 @@ _EPROCESS *EnumerateEProcess(const wchar_t *ProcessName, const uint64_t PID = -1
             continue;
 
         // Print info
-        print(INFO("File Path: %ws"),
-              pProcess->ImageFilePointer->FileName.Buffer);
+        // print(INFO("File Path: %ws"),
+        //       pProcess->ImageFilePointer->FileName.Buffer);
 
         if (ProcessHasName(pProcess, ProcessName)) return pProcess;
-    } while (pCurrent != pHead);
+    } while (pCurrent && pCurrent != pHead && Count < MaxProcessWalk);
 
     // Not Found
     print(ERROR("%ws NOT FOUND!"), ProcessName);

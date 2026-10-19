@@ -2,13 +2,11 @@ enum pagesize : uint32_t
 {
     Page_4KB,
     Page_2MB,
-    Page_1GB,
-    Page_Unmap
+    Page_1GB
 };
 
-// CR3 of the System process: maps all kernel memory and is fixed for the rest of the boot, so every page-table
-// walker (here and in the extractors below) reads the same runtime global. It cannot be compile-initialized (the value only
-// exists once the kernel has booted), so the first GetSystemCr3() call fills it and every later caller reuses it
+// CR3 of the System process: maps all kernel memory and is fixed for the rest of the boot. Filled lazily
+// (the value only exists after boot); every later caller reuses the runtime global
 static uint64_t SystemCr3Value = 0;
 cr3 GetSystemCr3()
 {
@@ -21,8 +19,7 @@ cr3 GetSystemCr3()
     return cr3{Value};
 }
 
-// Claims an empty entry for a mapping. An entry is empty only when all of its bits are zero, so a claim never
-// takes an entry that a live mapping still uses, or overwrites a non-present entry that holds other state
+// Claims an empty entry (all-zero) for a mapping, atomically, so a live mapping's entry is never taken
 template<typename T>
 bool ClaimEntry(T *Entry, T Value)
 {
@@ -39,15 +36,14 @@ void ReleaseEntry(T *Entry)
     __atomic_store_n((uint64_t *) Entry, 0, __ATOMIC_SEQ_CST);
 }
 
-// The dedicated table: one 4 KB page of 512 slots that only the driver uses for 4 KB mappings. Its storage is in the
-// driver image. While it is linked (MapTableEntries is set), a mapping claims a slot in it instead of searching the tables
+// The dedicated table: one 4 KB page of 512 slots in the driver image, for 4 KB mappings while linked
 alignas(4096) uint64_t MapTableStorage[512];
 uint64_t *MapTableEntries = nullptr;     // the slots the mapper claims; null while the table is not linked
 uint64_t MapTableBase = 0;               // virtual address of slot 0 while linked
 address MapTablePdEntry{};               // physical address of the page directory entry that links the table
 
-// Maps one 4 KB page through a free slot in the dedicated table. The slot's address is known, so no tables are searched.
-// Returns false if the table has no free slot; the caller then searches as usual
+// Maps one 4 KB page through a free slot in the dedicated table; no table search needed. False when no
+// slot is free, and the caller falls back to the search
 template<typename T>
 bool MapInDedicatedTable(address PhysicalAddress, T &&Callback)
 {
@@ -57,6 +53,7 @@ bool MapInDedicatedTable(address PhysicalAddress, T &&Callback)
         pte Value{};
         Value.present = 1;
         Value.write = 1;
+        Value.execute_disable = 1;
         Value.page_frame_number = PhysicalAddress >> 12;
         if (!ClaimEntry(Entry, Value)) continue;
 
@@ -67,18 +64,17 @@ bool MapInDedicatedTable(address PhysicalAddress, T &&Callback)
     return false;
 }
 
-// The most page tables one mapping may open while it searches for an empty entry. Each open reads a whole table, so
-// this bounds the work one mapping can do
+// Most page tables one mapping may open while searching for an empty entry (each open reads a whole table)
 constexpr int MaxTablesPerMapping = 16;
 
-// Declared here because the two AccessPhysicalMemory overloads below call it, and defined after GetVirtualAddress
-// further down: the walk's table lookups go through GetVirtualAddress, whose extractor chain (GetNtoskrnl,
-// GetPteBase, ...) sits on those accessors, so the cycle cannot be ordered away
+// Forward declarations: the walk's table lookups go through GetVirtualAddress, whose extractor chain sits
+// on the accessors defined below — the dependency cycle cannot be ordered away in the unity build
 template<typename T>
 bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSize);
 
-// PhysicalMemory. Returns false when no mapping could be made, and then Value is left untouched, so a failed read is
-// never mistaken for zero
+address GetVirtualAddress(address PhysicalAddress);
+
+// AccessPhysicalMemory. On failure Value is left untouched, so a failed read is never mistaken for zero
 template<typename T>
 bool AccessPhysicalMemory(address PhysicalAddress, pagesize PageSize, T &Value)
 {
@@ -92,7 +88,8 @@ bool AccessPhysicalMemory(address PhysicalAddress, pagesize PageSize, T &Value)
         );
 }
 
-// Size must not cross the page the mapping covers; AccessVirtualMemory guarantees that
+// Buffer form: copies Size bytes between pBuffer and the mapped page (read by default, write=true)
+// Size must not cross the page boundary; AccessVirtualMemory guarantees that. False when unmapped
 bool AccessPhysicalMemory(address PhysicalAddress, address pBuffer, size_t Size, pagesize PageSize, bool write = false)
 {
     return MapPhysicalToVirtual(PhysicalAddress,
@@ -106,16 +103,32 @@ bool AccessPhysicalMemory(address PhysicalAddress, address pBuffer, size_t Size,
     );
 }
 
-// Translate Virtual Address to Physical Address. Returns false if the page is not present, or if a table could not be
-// read because no mapping slot was free. Translation...       Type 0: 4KB, Type 1: 2MB, Type 2: 1GB
+// Reads one page-table entry. Direct route first, through GetVirtualAddress (same translation the
+// search below would use): plain reads instead of claimed mapping slots + invlpg. Falls back to the
+// physical-mapping path when the extractors are not resolved yet or the entry is unreadable
+template<typename E>
+bool ReadTableEntry(address EntryPA, E &Entry)
+{
+    address Mapped = GetVirtualAddress(EntryPA);
+    if (Mapped)
+    {
+        Entry = *(E *) Mapped;
+        return true;
+    }
+
+    return AccessPhysicalMemory(EntryPA, Page_4KB, Entry);
+}
+
+// VA to PA walk down the page tables. False when a level is not present or a table read fails.
+// PageSize: Page_4KB / Page_2MB / Page_1GB according to the entry that resolved the address
 bool GetPhysicalAddress(address VirtualAddress, cr3 CR3, address &Physical, pagesize &PageSize)
 {
     pml4e PML4E{};
-    if (!AccessPhysicalMemory({(CR3.pml4_frame_number << 12) + VirtualAddress.p4_index * 8}, Page_4KB, PML4E)) return false;
+    if (!ReadTableEntry({(CR3.pml4_frame_number << 12) + VirtualAddress.p4_index * 8}, PML4E)) return false;
     if (!PML4E.present) return false;
 
     pdpe PDPTE{};
-    if (!AccessPhysicalMemory({(PML4E.page_frame_number << 12) + VirtualAddress.p3_index * 8}, Page_4KB, PDPTE)) return false;
+    if (!ReadTableEntry({(PML4E.page_frame_number << 12) + VirtualAddress.p3_index * 8}, PDPTE)) return false;
     if (!PDPTE.present) return false;
     if (((pdpe_1gb)PDPTE).page_size)
     {
@@ -125,7 +138,7 @@ bool GetPhysicalAddress(address VirtualAddress, cr3 CR3, address &Physical, page
     }
 
     pde PDE{};
-    if (!AccessPhysicalMemory({(PDPTE.page_frame_number << 12) + VirtualAddress.p2_index * 8}, Page_4KB, PDE)) return false;
+    if (!ReadTableEntry({(PDPTE.page_frame_number << 12) + VirtualAddress.p2_index * 8}, PDE)) return false;
     if (!PDE.present) return false;
     if (((pde_2mb)PDE).page_size)
     {
@@ -135,23 +148,15 @@ bool GetPhysicalAddress(address VirtualAddress, cr3 CR3, address &Physical, page
     }
 
     pte PT{};
-    if (!AccessPhysicalMemory({(PDE.page_frame_number << 12) + VirtualAddress.p1_index * 8}, Page_4KB, PT)) return false;
+    if (!ReadTableEntry({(PDE.page_frame_number << 12) + VirtualAddress.p1_index * 8}, PT)) return false;
     if (!PT.present) return false;
     Physical = address(PT.page_frame_number << 12 | VirtualAddress.offset);
     PageSize = Page_4KB;
     return true;
 }
 
-// VirtualMemory. Returns false if the page is not present or the read failed; Value is left untouched in that case
-template<typename T>
-bool AccessVirtualMemory(address VirtualAddress, cr3 CR3, T &Value)
-{
-    address Physical{};
-    pagesize PageSize{};
-    if (!GetPhysicalAddress(VirtualAddress, CR3, Physical, PageSize)) return false;
-    return AccessPhysicalMemory(Physical, PageSize, Value);
-}
-
+// VirtualMemory, buffer form: copies Size bytes between pBuffer and VirtualAddress's address space
+// (read by default, write with write=true). Returns false if a page is not present or the access failed
 bool AccessVirtualMemory(address VirtualAddress, cr3 CR3, address pBuffer, size_t Size, bool write = false)
 {
     // Copy one page at a time: the next virtual page can map to an unrelated physical frame
@@ -190,7 +195,7 @@ bool CopyVirtualMemory(address SrcAddress, cr3 SrcCR3, address DestAddress, cr3 
     return true;
 }
 
-// MmIsAddressValid
+// MmIsAddressValid equivalent: the walk succeeds only when every level is present
 inline bool IsAddressValid(address VirtualAddress, cr3 CR3)
 {
     address Physical{};
@@ -198,15 +203,16 @@ inline bool IsAddressValid(address VirtualAddress, cr3 CR3)
     return GetPhysicalAddress(VirtualAddress, CR3, Physical, PageSize);
 }
 
-// The link is off by default. It changes kernel page tables, so the placeholder entry below must be checked on the
-// Windows VM (it has to be empty, and shared by every process) before this is turned on
+// The table is linked through the shared kernel half of the page tables (PML4 index >= 256), so it works
+// from any process context. The anchor is KUSER_SHARED_DATA's entry: fixed address, present since boot,
+// fully static mappings, so its PD slot is verifiably empty (checked in VerifyMapTableAnchor below)
 constexpr bool MapTableEnabled = true;
-constexpr uint64_t MapTablePml4Index = 2;
+constexpr uint64_t MapTablePml4Index = 0x1EF;
 constexpr uint64_t MapTablePdptIndex = 0;
-constexpr uint64_t MapTablePdIndex = 2;
+constexpr uint64_t MapTablePdIndex = 0x100;
 
-// Writes the page directory entry at (PML4Idx, PDPTIdx, PDIdx) under CR3, so it points at the table at TablePA, and starts
-// using the table at TableEntries. Refused if the path is not present, the entry is not empty, or the path is a 1 GB page
+// Writes the page directory entry at the given level path so it points at TablePA, then adopts the table.
+// Refused if the path is not present, the entry is not empty, or the path is a 1 GB page
 bool LinkTable(cr3 CR3, address TablePA, uint64_t *TableEntries, uint64_t PML4Idx, uint64_t PDPTIdx, uint64_t PDIdx)
 {
     pml4e PML4E{};
@@ -220,7 +226,7 @@ bool LinkTable(cr3 CR3, address TablePA, uint64_t *TableEntries, uint64_t PML4Id
     uint64_t Current = 0;
     if (!AccessPhysicalMemory(address(PdEntry), Page_4KB, Current) || Current != 0) return false;
 
-    uint64_t Value = ((uint64_t) TablePA & 0x000FFFFFFFFFF000ull) | 0x3;   // present and writable, supervisor only
+    uint64_t Value = ((uint64_t) TablePA & 0x000FFFFFFFFFF000ull) | 0x3 | (1ull << 63);   // present, writable, no-execute, supervisor only
     if (!AccessPhysicalMemory(address(PdEntry), (void *) &Value, sizeof(Value), Page_4KB, true)) return false;
 
     MapTablePdEntry = address(PdEntry);
@@ -230,7 +236,29 @@ bool LinkTable(cr3 CR3, address TablePA, uint64_t *TableEntries, uint64_t PML4Id
     return true;
 }
 
-// Links the dedicated table into the System process's tables at the configured entry
+// Debug-only: confirms the anchor region is really KUSER_SHARED_DATA before anything links: walks to
+// the page and reads NtMajorVersion (10 since Windows 10). A wrong guess must not link into unknown
+// memory. Release builds skip it and rely on LinkTable's own empty-entry validation
+#ifdef DEBUG
+bool VerifyMapTableAnchor(cr3 SystemCR3)
+{
+    pml4e PML4E{};
+    if (!AccessPhysicalMemory({(SystemCR3.pml4_frame_number << 12) + MapTablePml4Index * 8}, Page_4KB, PML4E) || !PML4E.present) return false;
+    pdpe PDPTE{};
+    if (!AccessPhysicalMemory({(PML4E.page_frame_number << 12) + MapTablePdptIndex * 8}, Page_4KB, PDPTE) || !PDPTE.present || ((pdpe_1gb) PDPTE).page_size) return false;
+    pde PDE{};
+    if (!AccessPhysicalMemory({(PDPTE.page_frame_number << 12)}, Page_4KB, PDE) || !PDE.present || ((pde_2mb) PDE).page_size) return false;
+    pte PTE4KB{};
+    if (!AccessPhysicalMemory({(PDE.page_frame_number << 12)}, Page_4KB, PTE4KB) || !PTE4KB.present) return false;
+
+    uint32_t NtMajorVersion = 0;
+    if (!AccessPhysicalMemory({(PTE4KB.page_frame_number << 12) + 0x26C}, Page_4KB, NtMajorVersion) || NtMajorVersion != 10) return false;
+    return true;
+}
+#endif
+
+// Links the dedicated table into the shared kernel half of the page tables. The anchor entry is tried
+// first; if taken, the same page directory is searched for another empty (LinkTable re-validates each candidate)
 bool LinkMapTable()
 {
     cr3 SystemCR3 = GetSystemCr3();
@@ -242,13 +270,38 @@ bool LinkMapTable()
         return false;
     }
     print(INFO("LinkMapTable: table storage %p is at physical %p"), (void *) MapTableStorage, (void *) TablePA);
-    bool Linked = LinkTable(SystemCR3, TablePA, MapTableStorage, MapTablePml4Index, MapTablePdptIndex, MapTablePdIndex);
-    print(INFO("LinkMapTable: LinkTable returned %u"), (uint32_t) Linked);
-    return Linked;
+
+#ifdef DEBUG
+    if (!VerifyMapTableAnchor(SystemCR3))
+    {
+        print(ERROR("LinkMapTable: the anchor region did not verify as KUSER_SHARED_DATA"));
+        return false;
+    }
+#endif
+
+    if (LinkTable(SystemCR3, TablePA, MapTableStorage, MapTablePml4Index, MapTablePdptIndex, MapTablePdIndex))
+    {
+        print(INFO("LinkMapTable: linked at PML4 %llx PDPT %llx PD %llx"), (unsigned long long) MapTablePml4Index, (unsigned long long) MapTablePdptIndex, (unsigned long long) MapTablePdIndex);
+        return true;
+    }
+
+    // The configured entry is taken; search the same page directory downwards. LinkTable re-validates every
+    // candidate itself, so an already-used entry just fails and the next one is tried
+    for (uint64_t PdIdx = 511; ; --PdIdx)
+    {
+        if (LinkTable(SystemCR3, TablePA, MapTableStorage, MapTablePml4Index, MapTablePdptIndex, PdIdx))
+        {
+            print(INFO("LinkMapTable: configured entry was taken, linked at PML4 %llx PDPT %llx PD %llx"), (unsigned long long) MapTablePml4Index, (unsigned long long) MapTablePdptIndex, (unsigned long long) PdIdx);
+            return true;
+        }
+        if (PdIdx == 0) break;
+    }
+    print(ERROR("LinkMapTable: no empty entry in the page directory"));
+    return false;
 }
 
-// Clears the link and stops using the dedicated table, so later mappings search the tables as before. Other processors
-// may still cache translations of the table's addresses. Nothing uses them after this, but they are not flushed on each processor
+// Unlinks the dedicated table. Other processors may still cache its translations; nothing uses them after
+// this, and they are not flushed per-processor
 void UnlinkMapTable()
 {
     if (!MapTableEntries) return;
@@ -264,30 +317,30 @@ void UnlinkMapTable()
 // below it) uses for its table lookups
 // ---------------------------------------------------------------------------
 
-// Most pages the scan may visit before giving up: 0x4000 pages = 64 MB, far more than the ntoskrnl image spans
+// Most pages the scan may visit before giving up: 0x4000 pages = 64 MB
 constexpr uint64_t MaxScanSteps = 0x4000;
 
-// Get ntoskrnl.exe address
+// Cached-result marker shared by GetNtoskrnl, GetPteBase and GetPfnPteAddressBase: 0 = not computed
+// yet, Failed = computed and missed (a miss is deterministic per boot, so never retried). Real kernel
+// pointers are >= 0xFFFF800000000000, so 1 is unambiguous
+constexpr uint64_t Failed = 1;
+
+// ntoskrnl base, found by scanning pages downwards from inside the image and cached for the boot
 address GetNtoskrnl()
 {
-    // The base never changes while the driver is loaded, but the scan below costs up to 64 MB of page-table
-    // walks and every ResolveKernelSymbol call repeats it. Scan once, then serve the cached result
+    // The base never changes while loaded; the scan costs up to 64 MB of walks, so serve it from cache
     static uint64_t CachedBase = 0;
     uint64_t Cached = __atomic_load_n(&CachedBase, __ATOMIC_SEQ_CST);
-    if (Cached) return (address) Cached;
+    if (Cached) return Cached == Failed ? nullptr : (address) Cached;
 
-    // Start inside ntoskrnl, not at the IDT base: the IDT is not always inside the image (it was below it on one boot).
-    // __imp_PsInitialSystemProcess is the loader's import slot for a variable in ntoskrnl's data, so its address is
-    // inside the image. Round it down to a page boundary so the 4 KB steps land on page headers
+    // Start inside the image (the import slot of PsInitialSystemProcess lands in its data), page-aligned
     address base = (address) ((uint64_t) (void *) __imp_PsInitialSystemProcess & ~0xFFFull);
 
-    // The scan reads the image pages DIRECTLY, with no IsAddressValid checks: a validity walk goes through
-    // MapPhysicalToVirtual and GetVirtualAddress, whose extractor chain calls back into this scan while the
-    // cache is still empty (unbounded recursion, kernel stack overflow, bugcheck 0x7F/8). Direct reads are
-    // safe: the start is inside the image, every page down to its base belongs to it (permanently mapped,
-    // a paged-out one pages back in at PASSIVE_LEVEL), and the name check stops the scan at the base
+    // The scan reads image pages directly, with no IsAddressValid checks: a validity walk re-enters the
+    // extractor chain while the cache is empty — unbounded recursion, kernel stack overflow, bugcheck
+    // 0x7F/0x8. Direct reads are safe down to the base because every page belongs to the image
 
-    // Brute Force
+    // Brute-force scan down in 4 KB steps
     auto NtoskrnlFile = Decode(NtoskrnlName);
     uint64_t Steps = 0;     // pages visited by the scan
     uint64_t MzSeen = 0;    // pages where a valid DOS header was found
@@ -295,18 +348,14 @@ address GetNtoskrnl()
     do {
         Steps++;
 
-        // Get Data Directory
         auto dosHeader = (_IMAGE_DOS_HEADER *)base;
         if (dosHeader->e_magic != 0x5A4D)
             continue;
         MzSeen++;
 
-        // Header-chain validation: the scan only guarantees the page is mapped, not that it is a real
-        // image. Pages inside ntoskrnl's own data can start with "MZ" by coincidence, and a bogus
-        // e_lfanew / export RVA then turns the name pointer into a wild address (live bugcheck 0x50
-        // in strcmp, caught on 19041 with name = base + garbage 0xC5B0800). Real headers always
-        // sit in the image's first page, and every RVA must stay inside the declared image size
-        if (dosHeader->e_lfanew < 0x40 || dosHeader->e_lfanew > 0x1000 - sizeof(_IMAGE_NT_HEADERS64))
+        // Header-chain validation: the page being mapped does not make it a real image. Bogus e_lfanew
+        // or an out-of-image export RVA turned the name pointer wild before (live bugcheck 0x50, 19041)
+        if (dosHeader->e_lfanew < 0x40 || dosHeader->e_lfanew > (LONG)(0x1000 - sizeof(_IMAGE_NT_HEADERS64)))
             continue;
 
         auto ntHeader = (_IMAGE_NT_HEADERS64 *)(base + dosHeader->e_lfanew);
@@ -326,36 +375,32 @@ address GetNtoskrnl()
         if (exportDir->Name >= SizeOfImage)
             continue;
 
-        // Get module name from export directory
         const char* name = (const char*)(base + exportDir->Name);
-
-        // Check ntoskrnl.exe
         if (strcmp(name, NtoskrnlFile.data()))
             continue;
 
-        // Ntoskrnl.exe
+        // Match: cache and return
         __atomic_store_n(&CachedBase, (uint64_t) base, __ATOMIC_SEQ_CST);
         print(INFO("GetNtoskrnl: found ntoskrnl.exe at %p after %llu steps"), (void *) base, Steps);
         return base;
     } while (Steps < MaxScanSteps && (base -= 0x1000));
 
     print(ERROR("GetNtoskrnl: NOT FOUND after %llu steps, %llu valid DOS headers"), Steps, MzSeen);
+    __atomic_store_n(&CachedBase, Failed, __ATOMIC_SEQ_CST);
     return nullptr;
 }
 
-// Shared body of the two extractors below: scans PAGE then .text of ntoskrnl for Pattern (an
-// instruction-shaped signature), verifies the shl displacement byte at Match + GuardOffset (a stray
-// mov imm64 cannot match), then reads the imm64 at Match + 2 and checks it is a canonical kernel
-// pointer. Returns nullptr on any miss; the caller does the caching
+// Shared body of the two extractors below: scans PAGE then .text of ntoskrnl for the instruction
+// signature, verifies the shl displacement byte at Match + GuardOffset, and reads the imm64 at
+// Match + 2 (must be a canonical kernel pointer). The caller does the caching
 template<size_t N>
 static address ExtractImm64(const std::array<char, N> &Pattern, uint32_t GuardOffset, const char *What)
 {
     address Base = GetNtoskrnl();
     if (!Base) return nullptr;
 
-    // The pattern can live in PAGE or .text depending on build; try both
-    address Match = SectionScan(Base, Decode(PageSectionName).data(), Pattern.data());
-    if (!Match) Match = SectionScan(Base, Decode(TextSectionName).data(), Pattern.data());
+    // The pattern can live in PAGE or .text depending on build; the shared helper tries both
+    address Match = ScanModuleImage(Base, Pattern.data());
     if (!Match) return nullptr;
     print(INFO("%s: instruction at %p matches"), What, (void *) Match);
 
@@ -388,9 +433,7 @@ address GetPteBase()
     if (Cached) return (address) Cached;
 
     address PteBase = ExtractImm64(Decode(PteBaseSignature), 13, "GetPteBase");
-    if (!PteBase) return nullptr;
-
-    __atomic_store_n(&CachedBase, (uint64_t) PteBase, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&CachedBase, PteBase ? (uint64_t) PteBase : Failed, __ATOMIC_SEQ_CST);
     return PteBase;
 }
 
@@ -404,18 +447,13 @@ address GetPfnPteAddressBase()
     if (Cached) return (address) Cached;
 
     address PfnPteAddressBase = ExtractImm64(Decode(PfnPteAddressSignature), 17, "GetPfnPteAddressBase");
-    if (!PfnPteAddressBase) return nullptr;
-
-    __atomic_store_n(&CachedBase, (uint64_t) PfnPteAddressBase, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&CachedBase, PfnPteAddressBase ? (uint64_t) PfnPteAddressBase : Failed, __ATOMIC_SEQ_CST);
     return PfnPteAddressBase;
 }
 
-// Our own GetVirtualAddress, the same steps as the kernel routine with both tables taken from signatures:
-//   1. PFN = PA >> 12; PteAddress = PfnDatabase[PFN].PteAddress
-//   2. VA of that PTE = sign-extend48((PteAddress - PTE_BASE) << 9), which is MiGetVirtualAddressMappedByPte
-//      (PTE_BASE is the self-map: idx * 8 bytes of PTEs map idx * 4 KB, and << 9 turns idx * 8 into idx * 4096)
-//   3. Add the byte offset of PA inside its page
-// Returns nullptr when a table cannot be found, the PFN entry is not readable, or the PteAddress is outside the self-map
+// PA -> VA through the self-map: read PfnDatabase[PA >> 12].PteAddress, then the PTE's index in the
+// self-map gives the VA (sign-extended from bit 47), plus the page offset. Null when a table is
+// missing/unreadable or the PteAddress is outside the self-map
 address GetVirtualAddress(address PhysicalAddress)
 {
     uint64_t PteBase = (uint64_t) GetPteBase();
@@ -425,10 +463,8 @@ address GetVirtualAddress(address PhysicalAddress)
     uint64_t Pa = (uint64_t) PhysicalAddress;
     uint64_t Entry = PfnPteAddressBase + (Pa >> 12) * 0x30;
 
-    // The PfnDatabase entry is read directly: it sits in permanently-mapped system space, and the
-    // extracted base is already pinned by the shl guard and the canonical-pointer check in ExtractImm64.
-    // A validity walk here would recurse (IsAddressValid -> MapPhysicalToVirtual -> back into this
-    // function) with no base case, because the walk itself needs this function's translations
+    // The PfnDatabase entry is read directly: this function's own translations are on the validity-walk
+    // path, so a check would recurse. The base itself is pinned by ExtractImm64's shl guard + canonical check
     uint64_t PteAddress = *(uint64_t *) Entry;
     if (!PteAddress) return nullptr;
 
@@ -442,15 +478,15 @@ address GetVirtualAddress(address PhysicalAddress)
     return (address) (Va + (Pa & 0xFFF));
 }
 
-// MapPhysicalToVirtual. The search tries every present entry at each level, so a full table is skipped and the next
-// one is tried. It gives up after MaxTablesPerMapping tables (declared above, next to the accessors that call it)
+// MapPhysicalToVirtual: scans the page tables for an empty entry at any level (a full table is
+// skipped), giving up after MaxTablesPerMapping opens. A dedicated-table hit short-circuits the search
 template<typename T>
 bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSize)
 {
     // While the dedicated table is linked, a 4 KB mapping takes a slot in it. If it has no free slot, the search below runs
     if (PageSize == Page_4KB && MapTableEntries && MapInDedicatedTable(PhysicalAddress, Callback)) return true;
 
-    // Local variables. They are per call, so concurrent callers never share mapping state
+    // Per-call state, so concurrent mappings never share anything
     int Opened = 0;
     cr3 CR3 = read_cr3();
     address VA{};
@@ -478,6 +514,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                 pdpe_1gb Value{};
                 Value.present = 1;
                 Value.write = 1;
+                Value.execute_disable = 1;
                 Value.page_size = 1;
                 Value.page_frame_number = PhysicalAddress >> 30;
                 if (!ClaimEntry((pdpe_1gb *) PDPTE, Value)) continue;
@@ -510,6 +547,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                     pde_2mb Value{};
                     Value.present = 1;
                     Value.write = 1;
+                    Value.execute_disable = 1;
                     Value.page_size = 1;
                     Value.page_frame_number = PhysicalAddress >> 21;
                     if (!ClaimEntry((pde_2mb *) PDE, Value)) continue;
@@ -540,6 +578,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                     pte Value{};
                     Value.present = 1;
                     Value.write = 1;
+                    Value.execute_disable = 1;
                     Value.page_frame_number = PhysicalAddress >> 12;
                     if (!ClaimEntry(PTE_4KB, Value)) continue;
 
@@ -560,12 +599,8 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
     return false;
 }
 
-// Verifies the PTE_BASE extracted by GetPteBase() against the kernel itself. No user-mode API can hand out
-// PTE_BASE (kernel memory is invisible to user mode), but ntoskrnl exports the two MM routines that answer
-// the same question (win::MmGetPhysicalAddress / win::MmGetVirtualForPhysical, declared by the vendor
-// headers). For a virtual address of ours, win::MmGetPhysicalAddress gives the real physical page as ground
-// truth: the self-map translation of Va must come out as Physical. The PDE is read first: when its PS bit is
-// set the VA is covered by a 2 MB large page that has no PTE page, so the frame comes from the PDE instead
+// Verifies the PTE_BASE extracted by GetPteBase() against the kernel itself: the exported MM routines
+// are ground truth, and the self-map walk must agree with them on each sample
 static bool SelfMapAgrees(address PteBase, address Va, address Physical, cr3 Cr3)
 {
     const uint64_t Mask = (1ULL << 39) - 8;
@@ -629,7 +664,7 @@ bool VerifyPteBase()
 // directly readable at DriverEntry's IRQL). Returns the number of failed checks
 static uint32_t VerifyOneAddress(address Va, cr3 SystemCR3, const char *What)
 {
-    uint32_t Failed = 0;
+    uint32_t Failures = 0;
 
     // VA -> PA, our walk against the kernel's
     address Physical{};
@@ -645,7 +680,7 @@ static uint32_t VerifyOneAddress(address Va, cr3 SystemCR3, const char *What)
     {
         print(ERROR("VerifyMemory: %s %p: VA->PA ours %p, MM %p"), What, (void *) Va,
               (void *) Physical, (void *) MmPhysical);
-        Failed++;
+        Failures++;
     }
 
     // PA -> VA, our translator against the kernel's
@@ -654,14 +689,14 @@ static uint32_t VerifyOneAddress(address Va, cr3 SystemCR3, const char *What)
     {
         print(ERROR("VerifyMemory: %s %p: PA->VA ours %p, MM %p"), What, (void *) Va,
               (void *) GetVirtualAddress(MmPhysical), (void *) MmVirtual);
-        Failed++;
+        Failures++;
     }
 
     // Validity, our walk against the kernel's
     if (IsAddressValid(Va, SystemCR3) != win::MmIsAddressValid(Va))
     {
         print(ERROR("VerifyMemory: %s %p: IsAddressValid disagrees with MmIsAddressValid"), What, (void *) Va);
-        Failed++;
+        Failures++;
     }
 
     // Read path: the rest of the page (capped at 32 bytes, so the physical read stays inside one
@@ -677,7 +712,7 @@ static uint32_t VerifyOneAddress(address Va, cr3 SystemCR3, const char *What)
         memcmp(Direct, ViaVirtual, Bytes))
     {
         print(ERROR("VerifyMemory: %s %p: AccessVirtualMemory read mismatch"), What, (void *) Va);
-        Failed++;
+        Failures++;
     }
 
     uint8_t ViaPhysical[32] = {};
@@ -685,10 +720,10 @@ static uint32_t VerifyOneAddress(address Va, cr3 SystemCR3, const char *What)
         memcmp(Direct, ViaPhysical, Bytes))
     {
         print(ERROR("VerifyMemory: %s %p: AccessPhysicalMemory read mismatch"), What, (void *) Va);
-        Failed++;
+        Failures++;
     }
 
-    return Failed;
+    return Failures;
 }
 
 // Write path on stack memory, so no kernel or image data is touched: a pattern goes in through the
@@ -716,14 +751,14 @@ static uint32_t VerifyWritePath(cr3 SystemCR3)
         return 1;
     }
 
-    uint32_t Failed = 0;
+    uint32_t Failures = 0;
 
     // Physical write: the pattern goes in through the mapper, comes back out through a direct read
     if (!AccessPhysicalMemory(Physical, (void *) Expected, Bytes, PageSize, true) ||
         memcmp(Scratch, Expected, Bytes))
     {
         print(ERROR("VerifyMemory: AccessPhysicalMemory write mismatch"));
-        Failed++;
+        Failures++;
     }
 
     memcpy(Scratch, Zeros, sizeof(Scratch));
@@ -736,10 +771,10 @@ static uint32_t VerifyWritePath(cr3 SystemCR3)
         memcmp(Scratch, Expected, sizeof(Expected)))
     {
         print(ERROR("VerifyMemory: CopyVirtualMemory mismatch"));
-        Failed++;
+        Failures++;
     }
 
-    return Failed;
+    return Failures;
 }
 
 // Runs the memory self-test: code, data, stack and kernel-image samples through VerifyOneAddress, the
@@ -748,7 +783,7 @@ static uint32_t VerifyWritePath(cr3 SystemCR3)
 bool VerifyMemory()
 {
     const cr3 SystemCR3 = GetSystemCr3();
-    uint32_t Failed = 0;
+    uint32_t Failures = 0;
 
     // Samples: the driver's own code and data, a stack local, and ntoskrnl's first page
     address Nt = GetNtoskrnl();
@@ -766,19 +801,19 @@ bool VerifyMemory()
     {
         if (!Samples[i]) continue;
         print(INFO("VerifyMemory: sample %s at %p"), Names[i], (void *) Samples[i]);
-        Failed += VerifyOneAddress(Samples[i], SystemCR3, Names[i]);
+        Failures += VerifyOneAddress(Samples[i], SystemCR3, Names[i]);
     }
 
     // An address nothing maps (low user half of the System process): both sides must call it invalid
     if (IsAddressValid(address(0x1000), SystemCR3) != win::MmIsAddressValid(address(0x1000)))
     {
         print(ERROR("VerifyMemory: IsAddressValid disagrees with MmIsAddressValid on an unmapped address"));
-        Failed++;
+        Failures++;
     }
 
-    Failed += VerifyWritePath(SystemCR3);
+    Failures += VerifyWritePath(SystemCR3);
 
-    if (Failed) print(ERROR("VerifyMemory: %u check(s) FAILED"), Failed);
+    if (Failures) print(ERROR("VerifyMemory: %u check(s) FAILED"), Failures);
     else print(OK("VerifyMemory: all checks passed (VA->PA, PA->VA, validity, virtual/physical read, physical write, copy)"));
-    return Failed == 0;
+    return Failures == 0;
 }

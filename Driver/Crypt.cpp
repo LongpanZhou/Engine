@@ -1,9 +1,7 @@
 #include <array>
 #include "seed.h"
 
-// No more ChatGPT
-// XOR is self-inverse, so one core serves encoding and decoding: every element except the
-// terminator (the last one) is XORed with SEED
+// XOR with SEED is self-inverse, so one core serves Encode and Decode; the trailing NUL is left as it is
 template<typename T, size_t N>
 constexpr std::array<T, N> XorSeed(const std::array<T, N> &In)
 {
@@ -13,7 +11,7 @@ constexpr std::array<T, N> XorSeed(const std::array<T, N> &In)
     return out;
 }
 
-// Don't criticize this pls, i want to keep naming constant with constexpr
+// Copies the string into an array first (Encode returns a new array, not a pointer into the literal)
 template<typename T, size_t N>
 constexpr std::array<T, N> Encode(const T (&Str)[N])
 {
@@ -23,13 +21,14 @@ constexpr std::array<T, N> Encode(const T (&Str)[N])
     return XorSeed(tmp);
 }
 
+// Reverses Encode
 template<typename T, size_t N>
 constexpr std::array<T, N> Decode(const std::array<T, N> &Str)
 {
     return XorSeed(Str);
 }
 
-// Encodes a byte array the same way Encode encodes a string, so Decode gives the original bytes back for any SEED
+// Encodes a byte pattern like a string, so one Decode serves both
 template<size_t N>
 constexpr std::array<char, N> EncodeBytes(const std::array<char, N> &Bytes)
 {

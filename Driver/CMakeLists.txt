@@ -41,8 +41,8 @@ target_compile_definitions(Driver
         PRIVATE SEED=${SEED_VALUE} ${VARIANT_DEFINES} _ITERATOR_DEBUG_LEVEL=0
 )
 
-# Driver-specific codegen and size flags. -O2 stays (user choice); everything else here is pure size
-# reduction that does not touch optimization level. Deliberately NOT set here (already from the vendor
+# Driver-specific codegen and size flags. -Os replaces the vendor -O2 (user choice); everything else here is
+# pure size reduction on top of that. Deliberately NOT set here (already from the vendor
 # flags): -fno-rtti, -fno-exceptions, -freestanding, stack alignment / protector switches, warning levels
 target_compile_options(Driver
         PRIVATE -Os                                   # optimize for size while keeping most of -O2 speed

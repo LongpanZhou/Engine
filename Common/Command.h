@@ -6,6 +6,9 @@ enum
 {
     read,
     write,
+    // Heartbeat: the driver answers without touching a target process. Appended at the end — the
+    // numeric values are the wire format both sides share, so existing values must not move
+    ping,
 };
 
 // The first argument of a command call. The driver acts only on calls that carry this value

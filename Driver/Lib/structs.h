@@ -6,7 +6,6 @@
 
 #include <wdk/wdk.hpp>
 
-typedef bool BOOL;
 typedef void VOID;
 typedef void* PVOID;
 
@@ -27,7 +26,7 @@ extern "C" void **__imp_PsInitialSystemProcess;
 extern "C" void **__imp_PsLoadedModuleList;
 #define CONTAINING_RECORD(address, type, field) ((type *)((uint64_t)(address) - (uint64_t)(&((type *)0)->field)))
 
-// PE HEADER BS
+// PE header structures
 //0x8 bytes (sizeof)
 struct _IMAGE_DATA_DIRECTORY
 {
@@ -150,7 +149,7 @@ struct _IMAGE_SECTION_HEADER
     ULONG Characteristics;                                                  //0x24
 };
 
-// Kernel BS
+// Kernel runtime structures
 //0x8 bytes (sizeof)
 struct _SINGLE_LIST_ENTRY
 {
@@ -1353,7 +1352,7 @@ struct _EPROCESS
     ULONG* volatile PathRedirectionHashes;                                  //0xa28
 };
 
-// Object manager BS: the structures behind a named kernel object, so driver-object hiding can be done with
+// Object manager structures: the layouts behind a named kernel object, so driver-object hiding can be done with
 // raw memory work only, no object-manager routine calls. Layouts are the Windows 10 19041 x64 ones
 
 //0x10 bytes (sizeof)

@@ -8,8 +8,9 @@ using namespace arch;
 using namespace intrin;
 
 #include "Crypt.cpp"   // compile-time string crypto: Encode, Decode, EncodeBytes
-#include "Scan.cpp"    // pattern parsing + PE image scanning: HexToByte, PatternToBytes, SignatureScan, SectionScan, FindFuncExports
+#include "Scan.cpp"    // pattern parsing + PE image scanning: HexToByte, PatternToBytes, SignatureScan, SectionScan, FindFuncExports, FindFuncExportsBatch
 #include "Strings.h"   // encoded runtime names + byte signatures (needs EncodeBytes + PatternToBytes above)
+#include "Locate.cpp"  // locate-by-signature helpers: ScanModuleImage + ResolveRipRelative (needs Strings.h's section names, and every memory/process/hook/trace file below)
 
 #include "Mem.cpp"     // kernel memory: CR3, page-table walk, mapping table, Access*/CopyVirtualMemory, GetNtoskrnl, GetPteBase, GetVirtualAddress
 #include "Process.cpp" // process & module enumeration: EnumerateEProcess, EnumerateKProcess, EnumerateModuleBaseAddress
@@ -23,20 +24,25 @@ extern "C" void (*__CTOR_LIST__[2])() = {nullptr, nullptr};
 
 win::ntstatus DriverExit(win::DRIVER_OBJECT* DriverObject)
 {
-    // Re-attach the loader entry before anything else: Mm's unload path removes the entry it created at load
-    // time, and if the entry was left detached by UnlinkDriverFromModuleList the loader-list bookkeeping ends up
-    // inconsistent, so the next load of this driver bugchecks 0x1A (0x2101) inside MiProcessLoaderEntry
+    // Unhook the command channel: restoring is safe here, the image is only freed after this callback
+    // returns. Release builds must unhook too — the swapped pointer would otherwise dangle into this
+    // freed image after unload
+    UnHook();
+
+#ifdef DEBUG
+    // Rest of the teardown, debug builds only: an unloaded release build leaves the loader entry
+    // detached (next load bugchecks 0x1A) — do not unload a release build
+    //
+    // Re-attach the loader entry first, so Mm's unload path finds the bookkeeping consistent
     RelinkDriverIntoModuleList(DriverObject);
 
-    // Second trace pass: this load cycle left its own records behind (previous unload's MmUnloadedDrivers
-    // slot, the PiDDB entry CI filed at load). Needs the relinked loader entry above, so it runs first
+    // Second trace pass: this load cycle's own records (MmUnloadedDrivers slot, PiDDB entry, hash bucket)
     CleanDriverTraces(DriverObject);
 
-    // Unhook the command channel and free the mapping table first. Restoring is safe this late: the
-    // image is only freed after this callback returns, inside Mm's unload path
-    UnHook();
     UnlinkMapTable();
     UnhideDriverObject();
+#endif
+    (void) DriverObject;   // used by the teardown only in debug builds
     return win::ntstatus::success;
 }
 
@@ -44,26 +50,24 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
 {
     print(INFO("DriverEntry: start, DriverObject %p"), (void *) DriverObject);
 
-    // TEMPORARY: trace cleaning is commented out for now (the user will come back to it). The three
-    // cleaners in Traces.cpp stay available; restoring the two calls below re-enables everything
     // Step 0: clean the traces of earlier cycles (PiDDB / MmUnloadedDrivers / CI hash bucket) before the
     // hook, so Hook() works against pristine state. A NULL DriverObject (manual mapping) skips everything
-    // print(INFO("DriverEntry: step 0 CleanDriverTraces()"));
-    // if (DriverObject) CleanDriverTraces(DriverObject);
+    // Debug-only while the zero-API PiDDB cleaner is being verified live; flip to unconditional once it
+    // passes. print() output only exists in debug builds anyway
+#ifdef DEBUG
+    print(INFO("DriverEntry: step 0 CleanDriverTraces()"));
+    if (DriverObject) CleanDriverTraces(DriverObject);
+#endif
 
-    // TEMPORARY: verification is commented out for now (Same situation as step 0): PTE_BASE extraction has been
-    // proven against the live kernel across repeated boots (four randomized bases, both 4 KB and 2 MB pages).
-    // Restore the call to re-verify a build on demand; the function stays available
-    // Debug-only (print() compiles out without DEBUG). Release builds run neither this step nor its scan
+    // TEMPORARY: disabled; PTE_BASE extraction is proven live (randomized bases, 4 KB and 2 MB pages).
+    // Restore the call to re-verify a build. Debug-only, release builds drop this with print()
     //#ifdef DEBUG
     //    print(INFO("DriverEntry: step 0.5 VerifyPteBase()"));
     //    VerifyPteBase();
     //#endif
 
-    // Memory self-test (debug builds only): our page-table walk, PA->VA translator, validity check
-    // and read/write/copy paths against the kernel's own MM routines. Release builds never call it,
-    // so --gc-sections drops it and no import table entries are created. Verified passing against the
-    // live kernel (19041): all checks green before the hook; restore the calls to re-run on demand
+    // TEMPORARY: disabled; VerifyMemory() passed against the live kernel (19041). Restore the call to
+    // re-run on demand. Debug-only: release builds drop it (--gc-sections) and gain no imports
     //#ifdef DEBUG
     //    print(INFO("DriverEntry: step 0.6 VerifyMemory()"));
     //    if (!VerifyMemory()) print(WARN("DriverEntry: VerifyMemory() reported failures (see output above)"));
@@ -83,7 +87,8 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
     print(INFO("DriverEntry: NO_HOOK test build, NtCompareSigningLevels not hooked"));
 #endif
 
-    // The dedicated mapping table, if it is enabled (off by default)
+    // The dedicated mapping table (compile-time switch in Mem.cpp). If linking fails at runtime the
+    // table stays unlinked and mappings search the page tables as usual
     if (MapTableEnabled)
     {
         print(INFO("DriverEntry: step 2 LinkMapTable()"));
@@ -100,12 +105,9 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
     print(INFO("DriverEntry: step 3 UnlinkDriverFromModuleList()"));
     if (DriverObject) UnlinkDriverFromModuleList(DriverObject);
 
-    // Hide the driver object itself, so walks of the \Driver directory (the reference tool's "validate driver
-    // objects" check) see neither this driver's module nor its object, and flag nothing as invalid
-    // TEMPORARY: HideDriverObject is commented out for now (Same situation as step 0): on 19045 the object
-    // header's NameInfoOffset reads as 1, so NameInfo lands on garbage and the bucket walk faults (bugcheck
-    // 0x7E, AV at driver+0x4046) — classic _OBJECT_HEADER/_OBJECT_HEADER_NAME_INFO layout mismatch with
-    // Lib/structs.h on this build. Restore the call once those offsets are verified/dified
+    // Hide the driver object itself, so \Driver walks see neither the module nor the object
+    // TEMPORARY: disabled; on 19045 NameInfoOffset reads 1, so the bucket walk faults (bugcheck 0x7E) —
+    // layout mismatch with Lib/structs.h. Restore the call once those offsets are verified
     // if (DriverObject)
     // {
     //     print(INFO("DriverEntry: step 4 HideDriverObject()"));
