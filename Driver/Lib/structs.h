@@ -1352,3 +1352,46 @@ struct _EPROCESS
     ULONG DisabledComponentFlags;                                           //0xa20
     ULONG* volatile PathRedirectionHashes;                                  //0xa28
 };
+
+// Object manager BS: the structures behind a named kernel object, so driver-object hiding can be done with
+// raw memory work only, no object-manager routine calls. Layouts are the Windows 10 19041 x64 ones
+
+//0x10 bytes (sizeof)
+struct _OBJECT_DIRECTORY_ENTRY
+{
+    struct _OBJECT_DIRECTORY_ENTRY* ChainLink;                              //0x0
+    VOID* Object;                                                           //0x8
+};
+
+//0x128 bytes (sizeof)
+// 37 = the object manager's hash bucket count on this build
+struct _OBJECT_DIRECTORY
+{
+    struct _OBJECT_DIRECTORY_ENTRY* HashBuckets[37];                        //0x0
+};
+
+struct _OBJECT_TYPE;
+
+//0x30 bytes (sizeof)
+struct _OBJECT_HEADER
+{
+    LONG PointerCount;                                                      //0x0
+    UCHAR Padding0[4];                                                      //0x4
+    LONG HandleCount;                                                       //0x8
+    UCHAR Padding1[4];                                                      //0xc
+    VOID* NextToFree;                                                       //0x10
+    struct _OBJECT_TYPE* Type;                                              //0x18
+    UCHAR NameInfoOffset;                                                   //0x20
+    UCHAR HandleInfoOffset;                                                 //0x21
+    UCHAR QuotaInfoOffset;                                                  //0x22
+    UCHAR DataInfoOffset;                                                   //0x23
+    UCHAR Flags;                                                            //0x24
+};
+
+//0x20 bytes (sizeof)
+struct _OBJECT_HEADER_NAME_INFO
+{
+    struct _OBJECT_DIRECTORY* Directory;                                    //0x0
+    struct _UNICODE_STRING Name;                                            //0x8
+    ULONG QueryReferences;                                                  //0x18
+};

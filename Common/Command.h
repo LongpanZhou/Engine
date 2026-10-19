@@ -6,7 +6,6 @@ enum
 {
     read,
     write,
-    scan,   // runs the NMI scan and writes the count of suspicious processors to DestAddress
 };
 
 // The first argument of a command call. The driver acts only on calls that carry this value

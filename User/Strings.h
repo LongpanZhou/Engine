@@ -28,4 +28,8 @@ constexpr std::array<T, N> Decode(const std::array<T, N> &Encoded)
 constexpr auto NtdllName = Encode("ntdll.dll");
 constexpr auto NtCompareSigningLevelsName = Encode("NtCompareSigningLevels");
 constexpr auto PidLabel = Encode("PID: ");
-constexpr auto ScanLabel = Encode("NMI outside modules: ");
+
+// HVCI ("Memory integrity") state. The registry's own storage is the SYSTEM hive file on disk, which
+// is parsed directly here, so no registry API is involved anywhere
+constexpr auto SystemHivePath = Encode("C:\\Windows\\System32\\config\\SYSTEM");
+constexpr auto HvciLabel = Encode("HVCI: ");
