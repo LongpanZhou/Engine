@@ -42,6 +42,15 @@ void HandleCommand(Command *pCommand)
     // A command that cannot be read is dropped, not replayed from an earlier call
     if (!AccessVirtualMemory(pCommand, usermodeCR3, &cmd, sizeof(cmd))) return;
 
+    // Bound the copy: a corrupt or malicious Size must not keep the syscall busy for gigabytes. The
+    // real client moves a few bytes at a time; 16 MiB is far above any legitimate command
+    constexpr uint32_t MaxCommandSize = 0x1000000;
+    if (cmd.Size > MaxCommandSize)
+    {
+        print(WARN("Command: Size %u exceeds the %u-byte cap, dropped"), cmd.Size, MaxCommandSize);
+        return;
+    }
+
     // Heartbeat: names no target process, so it is answered before the destination lookup. The
     // response packs the command secret (only the driver knows it) and a counter (so a fresh
     // answer is distinguishable from a stale buffer) into the caller's own buffer
@@ -105,7 +114,7 @@ bool Hook()
         return false;
     }
     print(INFO("Hook: ntoskrnl base %p, searching PAGE then .text for the signature"), (void *) ntoskrnl);
-    address match = ScanModuleImage(ntoskrnl, Decode(Signature).data());
+    address match = ScanModuleImage(ntoskrnl, Decode(Signature));
     if (!match)
     {
         print(ERROR("Hook: signature not found in PAGE or .text"));
@@ -131,5 +140,10 @@ void UnHook()
 
     // Exchange
     __atomic_exchange_n((uint64_t *) pData, (uint64_t) OriginalFunc, __ATOMIC_SEQ_CST);
+
+    // Clear only the target, so a later Hook() rescans and installs again. OriginalFunc stays set:
+    // an in-flight Func() may still load it after the exchange, and Hook() overwrites it on the next
+    // install. Clearing it here would turn a concurrent call into a call through null
+    pData = nullptr;
     print(INFO("UNHOOKED"));
 }

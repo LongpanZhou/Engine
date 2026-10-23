@@ -1,11 +1,19 @@
 # Automated driver test loop. Repeats until `sc start Driver` completes with the service RUNNING and it
 # survives the soak, or the cycle budget runs out. Each cycle: hard reset, boot, copy, create, start, verify.
-param([int]$MaxCycles = 3, [int]$SoakSeconds = 30)
+# The default is the shipping release build. Pass -Config debug when diagnosing under a debugger: that
+# build carries print() output, but also debug-only code paths, so it is not the artifact to soak-test.
+param(
+    [int]$MaxCycles = 3,
+    [int]$SoakSeconds = 30,
+    [ValidateSet('release', 'debug')]
+    [string]$Config = 'release'
+)
 
 $ErrorActionPreference = 'Continue'
 $vmrun     = 'C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe'
 $vmx       = 'C:\Users\27175\Downloads\Vmware\Windows 10 x64.vmx'
-$driverSrc = 'C:\Users\27175\Engine-ci\Driver\build\Driver.sys'
+$buildDir  = if ($Config -eq 'debug') { 'build-debug' } else { 'build' }
+$driverSrc = Join-Path $PSScriptRoot "Driver\$buildDir\Driver.sys"
 $gDir      = 'C:\Users\vmdebug\Desktop'
 $logHost   = $PSScriptRoot
 

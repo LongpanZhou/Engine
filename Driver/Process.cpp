@@ -17,18 +17,21 @@ address EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleNa
     _PEB *pPeb = pEProcess->Peb;
     if (!pPeb) return nullptr;
 
-    // Read LDR (Loader Dynamic Resources): the pointer stored at &pPeb->Ldr, not the struct it points to
-    _PEB_LDR_DATA *pLdr;
-    AccessVirtualMemory(&pPeb->Ldr, CR3, &pLdr, sizeof(pLdr));
-    if (!pLdr) return nullptr;
+    // Read LDR (Loader Dynamic Resources): the pointer stored at &pPeb->Ldr, not the struct it points to.
+    // Both locals start initialized and both returns are checked: AccessVirtualMemory can fail without
+    // filling the destination (or after partially filling a buffer that spans pages), and feeding that
+    // uninitialized data to the walk below is a wild read
+    _PEB_LDR_DATA *pLdr = nullptr;
+    if (!AccessVirtualMemory(&pPeb->Ldr, CR3, &pLdr, sizeof(pLdr)) || !pLdr) return nullptr;
 
     // Init variables for loop
     wchar_t pBuffer[256];
-    _LIST_ENTRY moduleList;
-    AccessVirtualMemory(&pLdr->InLoadOrderModuleList, CR3, &moduleList, sizeof(_LIST_ENTRY));
+    _LIST_ENTRY moduleList{};
+    if (!AccessVirtualMemory(&pLdr->InLoadOrderModuleList, CR3, &moduleList, sizeof(_LIST_ENTRY)))
+        return nullptr;
 
-    _LDR_DATA_TABLE_ENTRY entry;
-    win::UNICODE_STRING moduleName;
+    _LDR_DATA_TABLE_ENTRY entry{};
+    win::UNICODE_STRING moduleName{};
 
     // The head is the sentinel inside PEB_LDR_DATA; it is not a module, so the walk stops when it comes back
     _LIST_ENTRY *pHead = (_LIST_ENTRY *) &pLdr->InLoadOrderModuleList;
@@ -60,7 +63,7 @@ address EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleNa
         print(INFO("Module Name: %ws"), pBuffer);
 
         // Str cmp
-        if (!wcscmp(pBuffer, ModuleName))
+        if (WideStringEquals(pBuffer, ModuleName))
             return entry.DllBase;
     }
 
@@ -70,18 +73,22 @@ address EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleNa
 }
 
 // Case-folded comparison, so the search finds the module however the loader stored its name's case
-// (ci.dll must match CI.dll). ASCII file names: folding a-z to A-Z is exact
-static bool WideEqualsIgnoreCase(const wchar_t *A, const wchar_t *B)
+// (ci.dll must match CI.dll). ASCII file names: folding a-z to A-Z is exact. A is a counted
+// UNICODE_STRING buffer, so Count bounds every read; B must be NUL-terminated and end exactly at Count
+static bool WideEqualsIgnoreCase(const wchar_t *A, const wchar_t *B, size_t Count)
 {
-    while (*A || *B)
+    for (size_t i = 0; i < Count; ++i)
     {
-        wchar_t a = (*A >= L'a' && *A <= L'z') ? (wchar_t) (*A - 0x20) : *A;
-        wchar_t b = (*B >= L'a' && *B <= L'z') ? (wchar_t) (*B - 0x20) : *B;
+        wchar_t a = A[i];
+        wchar_t b = B[i];
+        if (!a || !b) return false;                     // A ended early, or B is shorter than A
+
+        if (a >= L'a' && a <= L'z') a = (wchar_t) (a - 0x20);
+        if (b >= L'a' && b <= L'z') b = (wchar_t) (b - 0x20);
         if (a != b) return false;
-        ++A;
-        ++B;
     }
-    return true;
+
+    return B[Count] == L'\0';                           // B must not have extra characters
 }
 
 address EnumerateKProcess(const wchar_t *ProcessName)
@@ -106,15 +113,15 @@ address EnumerateKProcess(const wchar_t *ProcessName)
         moduleName = entry->BaseDllName;
         pCurrent = pCurrent->Flink;
 
-        // Check if module is valid
-        if (!(entry->DllBase && moduleName.Length && moduleName.Buffer))
+        // Check if module is valid. Length is a byte count, so an odd value is malformed
+        if (!(entry->DllBase && moduleName.Length && !(moduleName.Length & 1) && moduleName.Buffer))
             continue;
 
         // Print info
         // print(INFO("Module Name: %ws"), moduleName.Buffer);
 
         // Str cmp
-        if (WideEqualsIgnoreCase(moduleName.Buffer, ProcessName))
+        if (WideEqualsIgnoreCase(moduleName.Buffer, ProcessName, moduleName.Length / sizeof(wchar_t)))
             return entry->DllBase;
     }
 
@@ -128,13 +135,13 @@ bool ProcessHasName(_EPROCESS *pProcess, const wchar_t *ProcessName)
 {
     if (!pProcess->ImageFilePointer || !pProcess->ImageFilePointer->FileName.Length) return false;
 
-    size_t targetLen = wcslen(ProcessName);
+    size_t targetLen = WideStringLength(ProcessName);
     size_t processLen = pProcess->ImageFilePointer->FileName.Length / sizeof(wchar_t);
     if (!targetLen || processLen <= targetLen) return false;
 
     const wchar_t *FileName = pProcess->ImageFilePointer->FileName.Buffer;
     size_t NameStart = processLen - targetLen;
-    return FileName[NameStart - 1] == L'\\' && !memcmp(FileName + NameStart, ProcessName, targetLen * sizeof(wchar_t));
+    return FileName[NameStart - 1] == L'\\' && BytesEqual(FileName + NameStart, ProcessName, targetLen * sizeof(wchar_t));
 }
 
 _EPROCESS *EnumerateEProcess(const wchar_t *ProcessName, const uint64_t PID = -1)

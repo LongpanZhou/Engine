@@ -29,20 +29,26 @@ win::ntstatus DriverExit(win::DRIVER_OBJECT* DriverObject)
     // freed image after unload
     UnHook();
 
-#ifdef DEBUG
-    // Rest of the teardown, debug builds only: an unloaded release build leaves the loader entry
-    // detached (next load bugchecks 0x1A) — do not unload a release build
+    // Rest of the teardown, both variants: an unloaded build that leaves the loader entry detached
+    // makes the next load bugcheck 0x1A in MiProcessLoaderEntry
     //
     // Re-attach the loader entry first, so Mm's unload path finds the bookkeeping consistent
-    RelinkDriverIntoModuleList(DriverObject);
+    if (!RelinkDriverIntoModuleList(DriverObject))
+        print(ERROR("DriverExit: relink failed, next load may bugcheck 0x1A"));
 
     // Second trace pass: this load cycle's own records (MmUnloadedDrivers slot, PiDDB entry, hash bucket)
     CleanDriverTraces(DriverObject);
 
     UnlinkMapTable();
-    UnhideDriverObject();
+
+    bool WasHidden = UnhideDriverObject();
+#ifdef DEBUG
+    // Re-check through the same raw directory walk that the name is reachable again
+    if (WasHidden && !VerifyHideDriverObject(DriverObject, false))
+        print(ERROR("DriverExit: unhide verification failed"));
+#else
+    (void) WasHidden;
 #endif
-    (void) DriverObject;   // used by the teardown only in debug builds
     return win::ntstatus::success;
 }
 
@@ -51,27 +57,25 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
     print(INFO("DriverEntry: start, DriverObject %p"), (void *) DriverObject);
 
     // Step 0: clean the traces of earlier cycles (PiDDB / MmUnloadedDrivers / CI hash bucket) before the
-    // hook, so Hook() works against pristine state. A NULL DriverObject (manual mapping) skips everything
-    // Debug-only while the zero-API PiDDB cleaner is being verified live; flip to unconditional once it
-    // passes. print() output only exists in debug builds anyway
-#ifdef DEBUG
+    // hook, so Hook() works against pristine state. A NULL DriverObject (manual mapping) skips everything.
+    // Runs in both variants; release builds just lose the print() output
     print(INFO("DriverEntry: step 0 CleanDriverTraces()"));
     if (DriverObject) CleanDriverTraces(DriverObject);
+
+    // Debug-only self-test: checks the PTE_BASE extraction against the kernel's own MM routines.
+    // Release builds compile this out; both the call and the function are absent
+#ifdef DEBUG
+    print(INFO("DriverEntry: step 0.5 VerifyPteBase()"));
+    if (!VerifyPteBase())
+        print(ERROR("DriverEntry: VerifyPteBase() failed"));
 #endif
 
-    // TEMPORARY: disabled; PTE_BASE extraction is proven live (randomized bases, 4 KB and 2 MB pages).
-    // Restore the call to re-verify a build. Debug-only, release builds drop this with print()
-    //#ifdef DEBUG
-    //    print(INFO("DriverEntry: step 0.5 VerifyPteBase()"));
-    //    VerifyPteBase();
-    //#endif
-
-    // TEMPORARY: disabled; VerifyMemory() passed against the live kernel (19041). Restore the call to
-    // re-run on demand. Debug-only: release builds drop it (--gc-sections) and gain no imports
-    //#ifdef DEBUG
-    //    print(INFO("DriverEntry: step 0.6 VerifyMemory()"));
-    //    if (!VerifyMemory()) print(WARN("DriverEntry: VerifyMemory() reported failures (see output above)"));
-    //#endif
+    // Debug-only self-test: runs every hand-written memory path against the kernel's MM routines.
+    // Release builds compile this out; both the call and the function are absent
+#ifdef DEBUG
+    print(INFO("DriverEntry: step 0.6 VerifyMemory()"));
+    if (!VerifyMemory()) print(WARN("DriverEntry: VerifyMemory() reported failures (see output above)"));
+#endif
 
     // Hook (STATUS_UNSUCCESSFUL if ntoskrnl or the signature cannot be found). NO_HOOK test builds skip it: the hook
     // writes a function pointer inside ntoskrnl's SeCiCallbacks table, which PatchGuard checks (bugcheck 0x109)
@@ -103,15 +107,23 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
     // Unlink the driver from PsLoadedModuleList, so module walks no longer report it. A manually mapped driver
     // (kdmapper) has no loader entry, so this reports and skips
     print(INFO("DriverEntry: step 3 UnlinkDriverFromModuleList()"));
-    if (DriverObject) UnlinkDriverFromModuleList(DriverObject);
+    if (DriverObject && !UnlinkDriverFromModuleList(DriverObject))
+        print(ERROR("DriverEntry: UnlinkDriverFromModuleList failed, driver may still be visible"));
 
-    // Hide the driver object itself, so \Driver walks see neither the module nor the object
-    // TEMPORARY: disabled; on 19045 NameInfoOffset reads 1, so the bucket walk faults (bugcheck 0x7E) —
-    // layout mismatch with Lib/structs.h. Restore the call once those offsets are verified
+    // Hide the driver object itself, so \Driver walks see neither the module nor the object.
+    // TEMPORARY: disabled while testing SCM status. Leaving the object in \Driver lets SCM report
+    // the service as RUNNING. Restore this block when object hiding is required.
     // if (DriverObject)
     // {
     //     print(INFO("DriverEntry: step 4 HideDriverObject()"));
-    //     HideDriverObject(DriverObject);
+    //     bool Hidden = HideDriverObject(DriverObject);
+    //     if (!Hidden)
+    //         print(ERROR("DriverEntry: HideDriverObject failed, driver object may remain visible"));
+    //
+    // #ifdef DEBUG
+    //     if (Hidden && !VerifyHideDriverObject(DriverObject, true))
+    //         print(ERROR("DriverEntry: step 4 hide verification failed"));
+    // #endif
     // }
 
     print(INFO("DriverEntry: success"));

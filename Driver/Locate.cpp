@@ -12,8 +12,9 @@ address ResolveRipRelative(const void *Instruction, uint32_t OffsetOffset, uint3
     return (address) (Instr + InstructionSize + Offset);
 }
 
-// Pattern scan over one module image: PAGE first, then .text, like the reference cleaner's FindPatternImage
-address ScanModuleImage(address Base, const char *Pattern)
+// Pattern scan over one module image: PAGE first, then .text, like the reference cleaner's FindPatternImage.
+// The section scans are quiet; exactly one result is reported after all attempts are finished
+address ScanModuleImage(address Base, const char *Sig, size_t Size)
 {
     if (!Base)
     {
@@ -21,8 +22,22 @@ address ScanModuleImage(address Base, const char *Pattern)
         return nullptr;
     }
 
-    if (address Match = SectionScan(Base, Decode(PageSectionName).data(), Pattern))
-        return Match;
+    address Match = SectionScan(Base, Decode(PageSectionName).data(), Sig, Size);
+    if (!Match)
+        Match = SectionScan(Base, Decode(TextSectionName).data(), Sig, Size);
 
-    return SectionScan(Base, Decode(TextSectionName).data(), Pattern);
+    if (Match)
+        print(INFO("Signature: %p"), Match);
+    else
+        print(ERROR("SIGNATURE NOT FOUND!"));
+
+    return Match;
+}
+
+// Overload for the length-carrying signatures built by PatternToBytes. Embedded NUL bytes in the
+// pattern are part of the pattern, not a terminator.
+template<size_t N>
+address ScanModuleImage(address Base, const Pattern<N> &Sig)
+{
+    return ScanModuleImage(Base, Sig.data(), Sig.Length);
 }

@@ -1,6 +1,78 @@
 // Pattern parsing and PE image scanning: 'AA BB ??' signature strings to byte arrays, byte scans over
 // image sections, and export-table walks. Pure byte/PE parsing, no kernel memory access happens here
 
+// Self-implemented string/byte helpers. The scan path must not pull CRT routines into the import
+// table: strlen/strcmp/memcmp are exported by ntoskrnl and would be listed next to DbgPrintEx,
+// which is exactly the kind of import the trace cleaners are meant to avoid
+static size_t StringLength(const char* String)
+{
+    size_t Length = 0;
+    while (String[Length]) ++Length;
+    return Length;
+}
+
+static bool StringEquals(const char* Left, const char* Right)
+{
+    while (*Left && *Left == *Right)
+    {
+        ++Left;
+        ++Right;
+    }
+    return *Left == *Right;
+}
+
+static bool BytesEqual(const void* Left, const void* Right, size_t Size)
+{
+    auto A = (const uint8_t*) Left;
+    auto B = (const uint8_t*) Right;
+    for (size_t i = 0; i < Size; ++i)
+        if (A[i] != B[i]) return false;
+    return true;
+}
+
+// Wide variants for the module/process name comparisons (wcslen/wcscmp are ntoskrnl exports too)
+static size_t WideStringLength(const wchar_t* String)
+{
+    size_t Length = 0;
+    while (String[Length]) ++Length;
+    return Length;
+}
+
+static bool WideStringEquals(const wchar_t* Left, const wchar_t* Right)
+{
+    while (*Left && *Left == *Right)
+    {
+        ++Left;
+        ++Right;
+    }
+    return *Left == *Right;
+}
+
+// A binary signature plus its true byte count. Patterns cannot be NUL-terminated: real instruction
+// bytes include 00, so a terminator would silently shorten the scan.
+template<size_t N>
+struct Pattern
+{
+    std::array<char, N> Bytes;
+    size_t Length;
+
+    const char *data() const { return Bytes.data(); }
+};
+
+// Encode/decode a whole pattern, preserving the length that PatternToBytes computed. The byte array
+// is XORed exactly like a string; only the length is carried separately.
+template<size_t N>
+constexpr Pattern<N> EncodeBytes(const Pattern<N> &In)
+{
+    return {XorSeed(In.Bytes), In.Length};
+}
+
+template<size_t N>
+constexpr Pattern<N> Decode(const Pattern<N> &In)
+{
+    return {XorSeed(In.Bytes), In.Length};
+}
+
 // Hex to bytes
 constexpr uint8_t HexToByte(char c) {
     return (c >= '0' && c <= '9') ? c - '0' :
@@ -12,7 +84,7 @@ constexpr uint8_t HexToByte(char c) {
 // Pattern to Bytes: each '?' or hex pair consumes two characters, so single-space-separated
 // tokens like "AA ? BB" come out one byte each
 template<size_t N>
-constexpr std::array<char, N> PatternToBytes(const char (&Signature)[N])
+constexpr Pattern<N> PatternToBytes(const char (&Signature)[N])
 {
     std::array<char, N> Bytes{};
     size_t i = 0;
@@ -27,7 +99,7 @@ constexpr std::array<char, N> PatternToBytes(const char (&Signature)[N])
     }
 
     Bytes[len] = '\0';
-    return Bytes;
+    return {Bytes, len};
 }
 
 // True if the signature matches at Current ('?' matches any byte)
@@ -39,18 +111,26 @@ static bool Matches(const char *Current, const char *Signature, size_t size)
     return true;
 }
 
-// Signature scan over a range
-address SignatureScan(const void *StartAddress, const void *EndAddress, const char *Signature)
+// Per-scan address dumps are debug-only noise on a normal load; flip this when a signature miss needs
+// the exact range that was searched
+constexpr bool VerboseScan = false;
+
+// Signature scan over a range. This is intentionally quiet: ScanModuleImage tries .PAGE and then
+// .text and logs one result after all section attempts are done
+address SignatureScan(const void *StartAddress, const void *EndAddress, const char *Signature, size_t Size)
 {
-    print(INFO("Start Address: %p"), StartAddress);
-    print(INFO("End Address: %p"), EndAddress);
-    print(INFO("Signature Address: %p"), Signature);
-    size_t size = strlen(Signature);
+    if constexpr (VerboseScan)
+    {
+        print(INFO("Start Address: %p"), StartAddress);
+        print(INFO("End Address: %p"), EndAddress);
+        print(INFO("Signature Address: %p"), Signature);
+    }
+    size_t size = Size;
 
     // Nothing to search: a missing range, or one shorter than the signature (the bound below would wrap)
-    if (!StartAddress || !EndAddress || (size_t) EndAddress - (size_t) StartAddress < size)
+    if (!StartAddress || !EndAddress || !Signature || !size ||
+        (size_t) EndAddress - (size_t) StartAddress < size)
     {
-        print(ERROR("SIGNATURE NOT FOUND!"));
         return nullptr;
     }
 
@@ -67,18 +147,14 @@ address SignatureScan(const void *StartAddress, const void *EndAddress, const ch
         // In range by construction: First < size, and the loop bound holds Current + size <= EndAddress
         if (First < size && Current[First] != Signature[First]) continue;
         if (Matches(Current, Signature, size))
-        {
-            print(INFO("Signature: %p"), Current);
             return Current;
-        }
     }
 
-    print(ERROR("SIGNATURE NOT FOUND!"));
     return nullptr;
 }
 
 // Pattern scan over one image section
-address SectionScan(address BaseAddress, const char *SectionName, const char *Signature)
+address SectionScan(address BaseAddress, const char *SectionName, const char *Signature, size_t Size)
 {
     // Get section
     auto dosHeader = (_IMAGE_DOS_HEADER *) BaseAddress;
@@ -92,10 +168,10 @@ address SectionScan(address BaseAddress, const char *SectionName, const char *Si
     void *sectionEnd{};
 
     // Find Section
-    size_t NameLen = strlen(SectionName);
+    size_t NameLen = StringLength(SectionName);
     for (int i = 0; i < fileHeader->NumberOfSections; i++)
     {
-        if (!memcmp(sectionHeader[i].Name, SectionName, NameLen))
+        if (BytesEqual(sectionHeader[i].Name, SectionName, NameLen))
         {
             sectionStart = BaseAddress + sectionHeader[i].VirtualAddress;
             sectionEnd = BaseAddress + sectionHeader[i].VirtualAddress + sectionHeader[i].Misc.VirtualSize;
@@ -103,15 +179,12 @@ address SectionScan(address BaseAddress, const char *SectionName, const char *Si
         }
     }
 
-    // Section not found: there is nothing to scan
+    // Section not found: there is nothing to scan; ScanModuleImage falls back to the next section
     if (!sectionStart)
-    {
-        print(ERROR("SECTION NOT FOUND!"));
         return nullptr;
-    }
 
     // Signature Scan
-    return SignatureScan(sectionStart, sectionEnd, Signature);
+    return SignatureScan(sectionStart, sectionEnd, Signature, Size);
 }
 
 // Lazy Import: resolves a name through the image's export table, so no import table entries are
@@ -135,7 +208,7 @@ address FindFuncExports(address BaseAddress, const char *FuncName)
     for (uint32_t i = 0; i < exportDir->NumberOfNames; ++i)
     {
         const char *funcName = (const char *) (BaseAddress + names[i]);
-        if (!strcmp(funcName, FuncName))
+        if (StringEquals(funcName, FuncName))
             return BaseAddress + functions[ordinals[i]];
     }
 
@@ -173,7 +246,7 @@ void FindFuncExportsBatch(address BaseAddress, const char *const *Names, address
 
         for (uint32_t j = 0; j < Count; ++j)
         {
-            if (!Results[j] && !strcmp(funcName, Names[j]))
+            if (!Results[j] && StringEquals(funcName, Names[j]))
             {
                 Results[j] = BaseAddress + functions[ordinals[i]];
                 Missing--;

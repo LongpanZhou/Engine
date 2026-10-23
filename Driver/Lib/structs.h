@@ -1372,19 +1372,27 @@ struct _OBJECT_DIRECTORY
 struct _OBJECT_TYPE;
 
 //0x30 bytes (sizeof)
+// Windows 10 19041/19045 x64 layout. InfoMask selects the optional headers that precede the header;
+// OBJECT_HEADER_NAME_INFO (when its 0x2 bit is set) sits immediately below the header
 struct _OBJECT_HEADER
 {
-    LONG PointerCount;                                                      //0x0
-    UCHAR Padding0[4];                                                      //0x4
-    LONG HandleCount;                                                       //0x8
-    UCHAR Padding1[4];                                                      //0xc
-    VOID* NextToFree;                                                       //0x10
-    struct _OBJECT_TYPE* Type;                                              //0x18
-    UCHAR NameInfoOffset;                                                   //0x20
-    UCHAR HandleInfoOffset;                                                 //0x21
-    UCHAR QuotaInfoOffset;                                                  //0x22
-    UCHAR DataInfoOffset;                                                   //0x23
-    UCHAR Flags;                                                            //0x24
+    LONGLONG PointerCount;                                                  //0x0
+    union
+    {
+        LONGLONG HandleCount;                                               //0x8
+        VOID* NextToFree;                                                   //0x8
+    };
+    struct _EX_PUSH_LOCK Lock;                                              //0x10
+    UCHAR TypeIndex;                                                        //0x18
+    UCHAR TraceFlags;                                                       //0x19
+    UCHAR InfoMask;                                                         //0x1a
+    UCHAR Flags;                                                            //0x1b
+    union
+    {
+        VOID* ObjectCreateInfo;                                             //0x20
+        VOID* QuotaBlockCharged;                                            //0x20
+    };
+    VOID* SecurityDescriptor;                                               //0x28
 };
 
 //0x20 bytes (sizeof)
@@ -1392,5 +1400,6 @@ struct _OBJECT_HEADER_NAME_INFO
 {
     struct _OBJECT_DIRECTORY* Directory;                                    //0x0
     struct _UNICODE_STRING Name;                                            //0x8
-    ULONG QueryReferences;                                                  //0x18
+    LONG ReferenceCount;                                                    //0x18
+    ULONG Reserved;                                                         //0x1c
 };

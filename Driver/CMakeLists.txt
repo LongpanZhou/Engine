@@ -30,6 +30,14 @@ else()
     set(VARIANT_DEFINES NDEBUG)
 endif()
 
+# Test builds can skip the SeCiCallbacks hook: trace cleaning does not need it, and PatchGuard eventually
+# bugchecks 0x109. The define is intentionally valueless (main.cpp uses #ifndef NO_HOOK), so never emit
+# NO_HOOK=0
+option(NO_HOOK "Skip the NtCompareSigningLevels hook (avoids PatchGuard 0x109 in test builds)" OFF)
+if(NO_HOOK)
+    list(APPEND VARIANT_DEFINES NO_HOOK)
+endif()
+
 # Driver entry point
 wdk_add_driver(Driver
         main.cpp

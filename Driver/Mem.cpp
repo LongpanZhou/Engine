@@ -42,13 +42,20 @@ uint64_t *MapTableEntries = nullptr;     // the slots the mapper claims; null wh
 uint64_t MapTableBase = 0;               // virtual address of slot 0 while linked
 address MapTablePdEntry{};               // physical address of the page directory entry that links the table
 
+// Rotating scan start: concurrent mappings then probe different slots instead of all hammering slot 0.
+// A hint only (ClaimEntry still decides ownership), and the full 512-slot scan below is preserved
+alignas(64) uint32_t MapTableNextSlot = 0;
+
 // Maps one 4 KB page through a free slot in the dedicated table; no table search needed. False when no
 // slot is free, and the caller falls back to the search
 template<typename T>
 bool MapInDedicatedTable(address PhysicalAddress, T &&Callback)
 {
-    for (uint64_t Slot = 0; Slot < 512; ++Slot)
+    const uint32_t Start = __atomic_fetch_add(&MapTableNextSlot, 1, __ATOMIC_RELAXED);
+
+    for (uint32_t i = 0; i < 512; ++i)
     {
+        const uint32_t Slot = (Start + i) & 511;
         pte *Entry = (pte *) &MapTableEntries[Slot];
         pte Value{};
         Value.present = 1;
@@ -57,7 +64,7 @@ bool MapInDedicatedTable(address PhysicalAddress, T &&Callback)
         Value.page_frame_number = PhysicalAddress >> 12;
         if (!ClaimEntry(Entry, Value)) continue;
 
-        Callback(address(MapTableBase + Slot * 0x1000 + PhysicalAddress.offset));
+        Callback(address(MapTableBase + (uint64_t) Slot * 0x1000 + PhysicalAddress.offset));
         ReleaseEntry(Entry);
         return true;
     }
@@ -181,10 +188,12 @@ bool AccessVirtualMemory(address VirtualAddress, cr3 CR3, address pBuffer, size_
 // never depends on the Size the caller sent
 bool CopyVirtualMemory(address SrcAddress, cr3 SrcCR3, address DestAddress, cr3 DestCR3, uint32_t Size)
 {
-    char buffer[0x400];
+    // One page per iteration: AccessVirtualMemory walks and maps once per call, so a 4 KB chunk costs one
+    // walk+map per side instead of four. Costs 4 KB of the ~24 KB x64 kernel stack
+    char buffer[0x1000];
     while (Size)
     {
-        uint32_t Chunk = Size < sizeof(buffer) ? Size : sizeof(buffer);
+        uint32_t Chunk = Size < sizeof(buffer) ? Size : (uint32_t) sizeof(buffer);
         if (!AccessVirtualMemory(SrcAddress, SrcCR3, (void *) buffer, Chunk, false)) return false;
         if (!AccessVirtualMemory(DestAddress, DestCR3, (void *) buffer, Chunk, true)) return false;
 
@@ -325,7 +334,26 @@ constexpr uint64_t MaxScanSteps = 0x4000;
 // pointers are >= 0xFFFF800000000000, so 1 is unambiguous
 constexpr uint64_t Failed = 1;
 
-// ntoskrnl base, found by scanning pages downwards from inside the image and cached for the boot
+// True when a loader BaseDllName equals Expected (ASCII, case-insensitive). The read is bounded by
+// Name.Length: BaseDllName is a counted string, not necessarily NUL-terminated
+static bool ModuleNameEquals(const _UNICODE_STRING &Name, const char *Expected)
+{
+    const size_t Length = Name.Length / sizeof(wchar_t);
+    if (!Name.Buffer || (Name.Length & 1) || Length != StringLength(Expected)) return false;
+
+    for (size_t i = 0; i < Length; ++i)
+    {
+        wchar_t Wide = Name.Buffer[i];
+        char Narrow = Expected[i];
+        if (Wide >= L'A' && Wide <= L'Z') Wide = (wchar_t) (Wide + 0x20);
+        if (Narrow >= 'A' && Narrow <= 'Z') Narrow = (char) (Narrow + 0x20);
+        if (Wide != (wchar_t) (unsigned char) Narrow) return false;
+    }
+    return true;
+}
+
+// ntoskrnl base, from PsLoadedModuleList when possible, else by scanning pages downwards from inside the
+// image. Cached for the boot
 address GetNtoskrnl()
 {
     // The base never changes while loaded; the scan costs up to 64 MB of walks, so serve it from cache
@@ -340,8 +368,39 @@ address GetNtoskrnl()
     // extractor chain while the cache is empty — unbounded recursion, kernel stack overflow, bugcheck
     // 0x7F/0x8. Direct reads are safe down to the base because every page belongs to the image
 
-    // Brute-force scan down in 4 KB steps
     auto NtoskrnlFile = Decode(NtoskrnlName);
+
+    // Fast path: PsLoadedModuleList already has the base. ntoskrnl is the first load-order entry, so this
+    // normally returns after one node. The walk is bounded and the candidate gets the same header checks as
+    // the scan (a torn entry falls through instead of returning a wild pointer). Read without the loader
+    // lock, like the existing module walkers; ntoskrnl itself is never unloaded
+    if (auto *Head = (_LIST_ENTRY *) __imp_PsLoadedModuleList)
+    {
+        uint64_t Walked = 0;
+        for (auto *Link = Head->Flink; Link && Link != Head && Walked < 0x1000; Link = Link->Flink)
+        {
+            ++Walked;
+            if ((uint64_t) Link < 0xFFFF800000000000ull) break;     // corrupt list: stop before dereferencing
+
+            auto *Entry = CONTAINING_RECORD(Link, _KLDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+            if (!ModuleNameEquals(Entry->BaseDllName, NtoskrnlFile.data())) continue;
+
+            auto Candidate = (uint64_t) Entry->DllBase;
+            if ((Candidate >> 48) != 0xFFFF || Candidate > (uint64_t) base ||
+                (uint64_t) base - Candidate >= MaxScanSteps * 0x1000 || *(uint16_t *) Candidate != 0x5A4D)
+            {
+                print(WARN("GetNtoskrnl: list entry %p has an unusable base %p"), (void *) Entry, (void *) Candidate);
+                break;
+            }
+
+            __atomic_store_n(&CachedBase, Candidate, __ATOMIC_SEQ_CST);
+            print(INFO("GetNtoskrnl: list walk found ntoskrnl.exe at %p after %llu entries"), (void *) Candidate, Walked);
+            return (address) Candidate;
+        }
+        print(INFO("GetNtoskrnl: list walk missed after %llu entries, scanning"), Walked);
+    }
+
+    // Brute-force scan down in 4 KB steps
     uint64_t Steps = 0;     // pages visited by the scan
     uint64_t MzSeen = 0;    // pages where a valid DOS header was found
     print(INFO("GetNtoskrnl: scanning down from %p in 4 KB steps"), (void *) base);
@@ -376,7 +435,7 @@ address GetNtoskrnl()
             continue;
 
         const char* name = (const char*)(base + exportDir->Name);
-        if (strcmp(name, NtoskrnlFile.data()))
+        if (!StringEquals(name, NtoskrnlFile.data()))
             continue;
 
         // Match: cache and return
@@ -394,13 +453,13 @@ address GetNtoskrnl()
 // signature, verifies the shl displacement byte at Match + GuardOffset, and reads the imm64 at
 // Match + 2 (must be a canonical kernel pointer). The caller does the caching
 template<size_t N>
-static address ExtractImm64(const std::array<char, N> &Pattern, uint32_t GuardOffset, const char *What)
+static address ExtractImm64(const Pattern<N> &Sig, uint32_t GuardOffset, const char *What)
 {
     address Base = GetNtoskrnl();
     if (!Base) return nullptr;
 
     // The pattern can live in PAGE or .text depending on build; the shared helper tries both
-    address Match = ScanModuleImage(Base, Pattern.data());
+    address Match = ScanModuleImage(Base, Sig);
     if (!Match) return nullptr;
     print(INFO("%s: instruction at %p matches"), What, (void *) Match);
 
@@ -430,7 +489,7 @@ address GetPteBase()
 {
     static uint64_t CachedBase = 0;
     uint64_t Cached = __atomic_load_n(&CachedBase, __ATOMIC_SEQ_CST);
-    if (Cached) return (address) Cached;
+    if (Cached) return Cached == Failed ? nullptr : (address) Cached;
 
     address PteBase = ExtractImm64(Decode(PteBaseSignature), 13, "GetPteBase");
     __atomic_store_n(&CachedBase, PteBase ? (uint64_t) PteBase : Failed, __ATOMIC_SEQ_CST);
@@ -444,7 +503,7 @@ address GetPfnPteAddressBase()
 {
     static uint64_t CachedBase = 0;
     uint64_t Cached = __atomic_load_n(&CachedBase, __ATOMIC_SEQ_CST);
-    if (Cached) return (address) Cached;
+    if (Cached) return Cached == Failed ? nullptr : (address) Cached;
 
     address PfnPteAddressBase = ExtractImm64(Decode(PfnPteAddressSignature), 17, "GetPfnPteAddressBase");
     __atomic_store_n(&CachedBase, PfnPteAddressBase ? (uint64_t) PfnPteAddressBase : Failed, __ATOMIC_SEQ_CST);
@@ -453,7 +512,11 @@ address GetPfnPteAddressBase()
 
 // PA -> VA through the self-map: read PfnDatabase[PA >> 12].PteAddress, then the PTE's index in the
 // self-map gives the VA (sign-extended from bit 47), plus the page offset. Null when a table is
-// missing/unreadable or the PteAddress is outside the self-map
+// missing/unreadable or the PteAddress is outside the self-map.
+//
+// 4 KB mappings only: for a 2 MB/1 GB mapping PteAddress is the large-page PDE/PDPTE, not a PTE, so the
+// shift below derives an unrelated VA. Production callers pass page-table pages, which are always 4 KB;
+// the debug verifiers skip the PA -> VA comparison for large pages
 address GetVirtualAddress(address PhysicalAddress)
 {
     uint64_t PteBase = (uint64_t) GetPteBase();
@@ -524,6 +587,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                 VA.p2_index = PhysicalAddress.p2_index;
                 VA.p3_index = PDPT_IDX;
                 VA.p4_index = PML4_IDX;
+                VA.sign = (PML4_IDX >= 256) ? 0xFFFF : 0;   // kernel-half VAs sign-extend bit 47
 
                 Callback(VA);
                 ReleaseEntry((pdpe_1gb *) PDPTE);
@@ -557,6 +621,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                     VA.p2_index = PD_IDX;
                     VA.p3_index = PDPT_IDX;
                     VA.p4_index = PML4_IDX;
+                    VA.sign = (PML4_IDX >= 256) ? 0xFFFF : 0;   // kernel-half VAs sign-extend bit 47
 
                     Callback(VA);
                     ReleaseEntry((pde_2mb *) PDE);
@@ -587,6 +652,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                     VA.p2_index = PD_IDX;
                     VA.p3_index = PDPT_IDX;
                     VA.p4_index = PML4_IDX;
+                    VA.sign = (PML4_IDX >= 256) ? 0xFFFF : 0;   // kernel-half VAs sign-extend bit 47
 
                     Callback(VA);
                     ReleaseEntry(PTE_4KB);
@@ -599,6 +665,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
     return false;
 }
 
+#ifdef DEBUG
 // Verifies the PTE_BASE extracted by GetPteBase() against the kernel itself: the exported MM routines
 // are ground truth, and the self-map walk must agree with them on each sample
 static bool SelfMapAgrees(address PteBase, address Va, address Physical, cr3 Cr3)
@@ -638,6 +705,14 @@ bool VerifyPteBase()
 
         address Physical = win::MmGetPhysicalAddress(Sample);
         if (!SelfMapAgrees(PteBase, Sample, Physical, SystemCR3)) return false;
+
+        // PA -> VA is a 4 KB relation: on a large-page mapping the PFN's PteAddress is the PDE/PDPTE and
+        // MmGetVirtualForPhysical returns a different alias, so the comparison below is not meaningful.
+        // The VA -> PA walk above already covered the sample
+        address Walked{};
+        pagesize PageSize{};
+        if (!GetPhysicalAddress(Sample, SystemCR3, Walked, PageSize)) return false;
+        if (PageSize != Page_4KB) continue;
 
         // MmGetVirtualForPhysical may return the sample itself, in which case there is nothing new to test
         address MmSaid = win::MmGetVirtualForPhysical(Physical);
@@ -683,8 +758,10 @@ static uint32_t VerifyOneAddress(address Va, cr3 SystemCR3, const char *What)
         Failures++;
     }
 
-    // PA -> VA, our translator against the kernel's
-    address MmVirtual = win::MmGetVirtualForPhysical(MmPhysical);
+    // PA -> VA, our translator against the kernel's. GetVirtualAddress is 4 KB-only (on a large page the
+    // PFN's PteAddress is the PDE/PDPTE), so skip the comparison for large-page samples
+    address MmVirtual{};
+    if (PageSize == Page_4KB) MmVirtual = win::MmGetVirtualForPhysical(MmPhysical);
     if (MmVirtual && (uint64_t) GetVirtualAddress(MmPhysical) != (uint64_t) MmVirtual)
     {
         print(ERROR("VerifyMemory: %s %p: PA->VA ours %p, MM %p"), What, (void *) Va,
@@ -817,3 +894,4 @@ bool VerifyMemory()
     else print(OK("VerifyMemory: all checks passed (VA->PA, PA->VA, validity, virtual/physical read, physical write, copy)"));
     return Failures == 0;
 }
+#endif
