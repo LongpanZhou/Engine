@@ -215,7 +215,13 @@ inline bool IsAddressValid(address VirtualAddress, cr3 CR3)
 // The table is linked through the shared kernel half of the page tables (PML4 index >= 256), so it works
 // from any process context. The anchor is KUSER_SHARED_DATA's entry: fixed address, present since boot,
 // fully static mappings, so its PD slot is verifiably empty (checked in VerifyMapTableAnchor below)
+// The dedicated table is a standing page-table artifact (PTE/PFN audit), so the mapped profile drops it
+// and walks the live tables instead
+#ifdef NO_MAP_TABLE
+constexpr bool MapTableEnabled = false;   // mapped profile: no dedicated map table (PTE/PFN artifact)
+#else
 constexpr bool MapTableEnabled = true;
+#endif
 constexpr uint64_t MapTablePml4Index = 0x1EF;
 constexpr uint64_t MapTablePdptIndex = 0;
 constexpr uint64_t MapTablePdIndex = 0x100;
@@ -248,7 +254,6 @@ bool LinkTable(cr3 CR3, address TablePA, uint64_t *TableEntries, uint64_t PML4Id
 // Debug-only: confirms the anchor region is really KUSER_SHARED_DATA before anything links: walks to
 // the page and reads NtMajorVersion (10 since Windows 10). A wrong guess must not link into unknown
 // memory. Release builds skip it and rely on LinkTable's own empty-entry validation
-#ifdef DEBUG
 bool VerifyMapTableAnchor(cr3 SystemCR3)
 {
     pml4e PML4E{};
@@ -264,7 +269,6 @@ bool VerifyMapTableAnchor(cr3 SystemCR3)
     if (!AccessPhysicalMemory({(PTE4KB.page_frame_number << 12) + 0x26C}, Page_4KB, NtMajorVersion) || NtMajorVersion != 10) return false;
     return true;
 }
-#endif
 
 // Links the dedicated table into the shared kernel half of the page tables. The anchor entry is tried
 // first; if taken, the same page directory is searched for another empty (LinkTable re-validates each candidate)
@@ -665,7 +669,6 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
     return false;
 }
 
-#ifdef DEBUG
 // Verifies the PTE_BASE extracted by GetPteBase() against the kernel itself: the exported MM routines
 // are ground truth, and the self-map walk must agree with them on each sample
 static bool SelfMapAgrees(address PteBase, address Va, address Physical, cr3 Cr3)
@@ -894,4 +897,3 @@ bool VerifyMemory()
     else print(OK("VerifyMemory: all checks passed (VA->PA, PA->VA, validity, virtual/physical read, physical write, copy)"));
     return Failures == 0;
 }
-#endif

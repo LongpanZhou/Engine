@@ -38,13 +38,23 @@ if(NO_HOOK)
     list(APPEND VARIANT_DEFINES NO_HOOK)
 endif()
 
+# Mapped-payload profile: nothing may be left standing in the kernel that a checker can diff. The
+# SeCiCallbacks hook is a PatchGuard 0x109 and the dedicated map table is a PTE/PFN audit artifact, so
+# both are compiled out together. MAPPED_SAFE=OFF restores the stock behaviour (NO_HOOK still independent)
+option(MAPPED_SAFE "Compile the mapped-payload profile: no CI hook, no dedicated map table" ON)
+if(MAPPED_SAFE)
+    list(APPEND VARIANT_DEFINES NO_HOOK NO_MAP_TABLE)
+endif()
+
 # Driver entry point
 wdk_add_driver(Driver
         main.cpp
 )
 
 # All defines in one place: the shared seed plus the variant switch. _ITERATOR_DEBUG_LEVEL=0 turns the
-# STL's debug checks off, which -nostdlib (no CRT) cannot satisfy
+# STL's debug checks off, which -nostdlib (no CRT) cannot satisfy. NO_HOOK can arrive from either option,
+# so collapse duplicates before the list becomes compiler flags
+list(REMOVE_DUPLICATES VARIANT_DEFINES)
 target_compile_definitions(Driver
         PRIVATE SEED=${SEED_VALUE} ${VARIANT_DEFINES} _ITERATOR_DEBUG_LEVEL=0
 )

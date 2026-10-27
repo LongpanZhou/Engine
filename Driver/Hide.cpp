@@ -1,5 +1,6 @@
-// Driver hiding: unlink the image from PsLoadedModuleList and remove the driver object's name from
-// the object directory. Raw kernel structures throughout, no mapping layer in between
+// Driver hiding: unlink the image from PsLoadedModuleList, remove the driver object's name from the
+// object directory, and erase the mapped image's PE headers. Raw kernel structures throughout, no
+// mapping layer in between
 
 // Driver-object hiding is done on raw object-manager structures only: no kernel routine is called anywhere
 // here, just reads/writes on the _OBJECT_* layouts in Lib/structs.h. On Win10 19041/19045 x64 the object
@@ -246,7 +247,6 @@ bool UnhideDriverObject()
     return true;
 }
 
-#ifdef DEBUG
 // Self-check for HideDriverObject/UnhideDriverObject. Raw object-directory walk only: no Ob*/Rtl* call,
 // no handle or object-manager routine. ExpectedHidden checks that the driver object is unreachable from
 // its own directory and that the saved state and pins are consistent; false checks the inverse after
@@ -339,7 +339,6 @@ bool VerifyHideDriverObject(win::DRIVER_OBJECT* DriverObject, bool ExpectedHidde
           (void *) Lookup.Entry, Lookup.Bucket, Lookup.Walked);
     return true;
 }
-#endif
 
 // Unlinks the driver from PsLoadedModuleList, so module walks no longer report it. DriverSection is the
 // loader entry the kernel created at load time; a manually mapped driver has none and is skipped
@@ -493,4 +492,184 @@ bool RelinkDriverIntoModuleList(win::DRIVER_OBJECT *DriverObject)
 
     print(OK("RelinkDriver: entry %p re-attached at the list head"), (void *) Entry);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// PE header removal
+//
+// A scanner that knows where the driver was mapped often starts by reading MZ/PE at DllBase. This is
+// only safe for a manual map: after a normal DriverEntry returns, IopLoadDriver still calls
+// MiFreeDriverInitialization -> MiSnapDriverRange -> RtlImageNtHeader, so clearing the header first
+// bugchecks 0x7E. Manual maps have no IopLoadDriver cleanup; if the mapper calls DriverExit, the saved
+// copy is restored, otherwise the header stays erased for the lifetime of the mapping.
+//
+// The write goes through CR0.WP because the image header page is mapped read-only. Only the header
+// bytes are touched; the first section starts at 0x1000.
+// ---------------------------------------------------------------------------
+
+extern "C" _IMAGE_DOS_HEADER __ImageBase;
+
+constexpr uint32_t PeHeaderMaxBytes = 0x1000;
+constexpr uint32_t PeDosMagic = 0x5A4D;
+constexpr uint32_t PeNtSignature = 0x00004550;
+
+static uint8_t SavedPeHeader[PeHeaderMaxBytes];
+static uint32_t SavedPeHeaderSize = 0;
+static address SavedPeHeaderBase = nullptr;
+
+// Normal loads know their image base from the driver object. A manual map has no driver object, so
+// use the linker-provided image base symbol (the mapper relocates it like any other image address).
+static address GetOwnImageBase(win::DRIVER_OBJECT* DriverObject)
+{
+    if (DriverObject && DriverObject->DriverStart)
+        return (address) (uint64_t) DriverObject->DriverStart;
+
+    return (address) (uint64_t) &__ImageBase;
+}
+
+// Validates the mapped image before anything is overwritten. Size is capped to the first page so a
+// malformed SizeOfHeaders cannot make the erase walk into the first section.
+static bool GetPeHeaderRange(address Base, uint32_t& Size)
+{
+    if ((uint64_t) Base < 0xFFFF800000000000ull)
+        return false;
+
+    // kdmapper's default mapping skips the header page and reports the allocation start as image
+    // base + 0x1000. Base can then point at an unrelated pool block, or at an unmapped hole. Never
+    // dereference it before checking the page tables.
+    if (!IsAddressValid(Base, GetSystemCr3()))
+        return false;
+
+    const auto Dos = (const _IMAGE_DOS_HEADER *) (uint64_t) Base;
+    if (Dos->e_magic != PeDosMagic)
+        return false;
+
+    const uint32_t NtOffset = (uint32_t) Dos->e_lfanew;
+    if (NtOffset < (uint32_t) sizeof(_IMAGE_DOS_HEADER) ||
+        NtOffset > PeHeaderMaxBytes - (uint32_t) sizeof(_IMAGE_NT_HEADERS64))
+        return false;
+
+    const auto Nt = (const _IMAGE_NT_HEADERS64 *) ((uint64_t) Base + NtOffset);
+    if (Nt->Signature != PeNtSignature ||
+        Nt->OptionalHeader.Magic != 0x20B)
+        return false;
+
+    uint32_t HeaderBytes = Nt->OptionalHeader.SizeOfHeaders;
+    if (HeaderBytes < NtOffset + (uint32_t) sizeof(_IMAGE_NT_HEADERS64))
+        return false;
+    if (HeaderBytes > PeHeaderMaxBytes)
+        HeaderBytes = PeHeaderMaxBytes;
+
+    if (HeaderBytes < sizeof(_IMAGE_DOS_HEADER))
+        return false;
+
+    Size = HeaderBytes;
+    return true;
+}
+
+// Writes through the read-only image mapping. Restores the original CR0 value even when Bytes is null
+// (zero fill). The size is bounded by GetPeHeaderRange before this is called.
+static bool WritePeHeaderBytes(address Base, const uint8_t* Bytes, uint32_t Size)
+{
+    if (!Base || !Size || Size > PeHeaderMaxBytes)
+        return false;
+
+    const arch::cr0 OriginalCr0 = intrin::read_cr0();
+    arch::cr0 WritableCr0 = OriginalCr0;
+    WritableCr0.write_protect = 0;
+    intrin::write_cr0(WritableCr0);
+
+    auto Dest = (volatile uint8_t *) (uint64_t) Base;
+    for (uint32_t i = 0; i < Size; ++i)
+        Dest[i] = Bytes ? Bytes[i] : 0;
+
+    intrin::write_cr0(OriginalCr0);
+    return true;
+}
+
+// Erases the PE headers from the mapped image. Safe to call more than once for the same image; the
+// saved copy is the only thing DriverExit needs to restore a normal load.
+bool ErasePeHeader(win::DRIVER_OBJECT* DriverObject)
+{
+    const address Base = GetOwnImageBase(DriverObject);
+
+    if (SavedPeHeaderBase)
+    {
+        if (SavedPeHeaderBase == Base)
+            return true;
+
+        print(WARN("PE: another image header is already saved, refusing to overwrite it"));
+        return false;
+    }
+
+    if ((uint64_t) Base < 0xFFFF800000000000ull)
+    {
+        print(ERROR("PE: image base %p is not a kernel address"), (void *) Base);
+        return false;
+    }
+
+    uint32_t Size = 0;
+    if (!GetPeHeaderRange(Base, Size))
+    {
+        // kdmapper's default mapping does not copy the header page at all. Base can then be an
+        // unmapped hole or an unrelated pool allocation; either way there is no header of ours to
+        // erase. A present page that does start with MZ but has a broken PE header is an error.
+        if (!IsAddressValid(Base, GetSystemCr3()) ||
+            ((const _IMAGE_DOS_HEADER *) (uint64_t) Base)->e_magic != PeDosMagic)
+        {
+            print(INFO("PE: no header at image base %p, already absent"), (void *) Base);
+            return true;
+        }
+
+        print(ERROR("PE: invalid PE header at image base %p, refusing to erase"), (void *) Base);
+        return false;
+    }
+
+    auto Source = (const volatile uint8_t *) (uint64_t) Base;
+    for (uint32_t i = 0; i < Size; ++i)
+        SavedPeHeader[i] = Source[i];
+
+    if (!WritePeHeaderBytes(Base, nullptr, Size))
+        return false;
+
+    SavedPeHeaderBase = Base;
+    SavedPeHeaderSize = Size;
+    print(OK("PE: erased %u header bytes at %p"), Size, (void *) Base);
+    return true;
+}
+
+// Restores the bytes saved by ErasePeHeader. Returns true when there was nothing to restore, so
+// DriverExit can call it unconditionally.
+bool RestorePeHeader()
+{
+    if (!SavedPeHeaderBase || !SavedPeHeaderSize)
+        return true;
+
+    if (!WritePeHeaderBytes(SavedPeHeaderBase, SavedPeHeader, SavedPeHeaderSize))
+        return false;
+
+    print(OK("PE: restored %u header bytes at %p"), SavedPeHeaderSize, (void *) SavedPeHeaderBase);
+    SavedPeHeaderBase = nullptr;
+    SavedPeHeaderSize = 0;
+    return true;
+}
+
+// Debug-only check: MZ and e_lfanew are the two fields every PE walker starts with.
+bool VerifyPeHeaderRemoved(win::DRIVER_OBJECT* DriverObject)
+{
+    const address Base = SavedPeHeaderBase ? SavedPeHeaderBase : GetOwnImageBase(DriverObject);
+    if (!Base || (uint64_t) Base < 0xFFFF800000000000ull)
+        return false;
+
+    // A mapper that omitted the header page leaves Base unmapped or pointing at other pool memory.
+    // There is no DOS header there to find, so the no-MZ check below must not dereference it.
+    if (!IsAddressValid(Base, GetSystemCr3()))
+        return true;
+
+    const auto Dos = (const _IMAGE_DOS_HEADER *) (uint64_t) Base;
+    if (Dos->e_magic != PeDosMagic)
+        return true;
+
+    // MZ is still present: require the NT offset to be gone as well.
+    return Dos->e_lfanew == 0;
 }

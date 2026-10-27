@@ -18,6 +18,7 @@ constexpr auto PageSectionName = Encode("PAGE");
 // Trace-cleaning search targets
 constexpr auto TextSectionName = Encode(".text");
 constexpr auto CiDllName = Encode(L"ci.dll");
+constexpr auto WdFilterName = Encode(L"WdFilter.sys");
 
 // Exported routine/symbol names the trace cleaners resolve by hand through the export directory
 // (no import table entries; data exports come back as the variable's address)
@@ -55,6 +56,24 @@ constexpr auto KernelHashBucketListSignature21H1 = EncodeBytes(PatternToBytes(
     "4C 8D 35 ? ? ? ? E9 ? ? ? ? 8B 84 24"));
 constexpr auto KernelHashBucketListSignature22H2 = EncodeBytes(PatternToBytes(
     "48 8B 1D ? ? ? ? EB ? F7 43 40 ? 20 ? ?"));
+
+// WdFilter!MpBmDocOpenRules' runtime driver list. Defender's blocklist engine threads every kernel
+// image it has seen onto its own list and keeps a pointer array beside it; none of that lives in the
+// CI structures the cleaners above reach. The list reference is the rip-relative `lea` at the match
+// (head is 8 bytes before its target), the count is the `inc dword ptr [rip+disp]` in the same
+// routine, and the array pointer global sits 8 bytes past the count. Layout verified on 19041
+constexpr auto WdFilterRuntimeDriversListSignature = EncodeBytes(PatternToBytes(
+    "48 8B 0D ? ? ? ? FF 05"));
+constexpr auto WdFilterRuntimeDriversCountSignature = EncodeBytes(PatternToBytes(
+    "FF 05 ? ? ? ? 48 39 11"));
+
+// MpFreeDriverInfoEx, the routine that releases one record's DriverInfo block. Two instruction shapes
+// exist across builds: the call follows `mov [r8+8], rdx` (+3) on older ones and `mov [rdx+8], rcx`
+// after a `mov rcx, r8` (+6) on newer ones. The call opcode is at match+3 and match+6 respectively
+constexpr auto WdFilterFreeDriverInfoSignature = EncodeBytes(PatternToBytes(
+    "89 ? 08 E8 ? ? ? ? ? ? ? ? ? ? ? E9"));
+constexpr auto WdFilterFreeDriverInfoSignatureAlt = EncodeBytes(PatternToBytes(
+    "89 ? 08 ? ? ? E8 ? ? ? ? ? ? ? ? ? ? ? E9"));
 
 // 'mov rdx, imm64; shl rdx, 19h' inside MmGetVirtualForPhysical, where the imm64 IS PTE_BASE (GetPteBase
 // reads it at match + 2). The bytes at match + 10..13 are the shl opcode and its displacement byte 0x19
