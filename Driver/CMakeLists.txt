@@ -30,20 +30,12 @@ else()
     set(VARIANT_DEFINES NDEBUG)
 endif()
 
-# Test builds can skip the SeCiCallbacks hook: trace cleaning does not need it, and PatchGuard eventually
-# bugchecks 0x109. The define is intentionally valueless (main.cpp uses #ifndef NO_HOOK), so never emit
-# NO_HOOK=0
-option(NO_HOOK "Skip the NtCompareSigningLevels hook (avoids PatchGuard 0x109 in test builds)" OFF)
-if(NO_HOOK)
-    list(APPEND VARIANT_DEFINES NO_HOOK)
-endif()
-
 # Mapped-payload profile: nothing may be left standing in the kernel that a checker can diff. The
-# SeCiCallbacks hook is a PatchGuard 0x109 and the dedicated map table is a PTE/PFN audit artifact, so
-# both are compiled out together. MAPPED_SAFE=OFF restores the stock behaviour (NO_HOOK still independent)
-option(MAPPED_SAFE "Compile the mapped-payload profile: no CI hook, no dedicated map table" ON)
+# dedicated map table is a PTE/PFN audit artifact, so it is compiled out here. MAPPED_SAFE=OFF
+# restores the stock behaviour
+option(MAPPED_SAFE "Compile the mapped-payload profile: no dedicated map table" ON)
 if(MAPPED_SAFE)
-    list(APPEND VARIANT_DEFINES NO_HOOK NO_MAP_TABLE)
+    list(APPEND VARIANT_DEFINES NO_MAP_TABLE)
 endif()
 
 # Driver entry point
@@ -52,8 +44,8 @@ wdk_add_driver(Driver
 )
 
 # All defines in one place: the shared seed plus the variant switch. _ITERATOR_DEBUG_LEVEL=0 turns the
-# STL's debug checks off, which -nostdlib (no CRT) cannot satisfy. NO_HOOK can arrive from either option,
-# so collapse duplicates before the list becomes compiler flags
+# STL's debug checks off, which -nostdlib (no CRT) cannot satisfy. VARIANT_DEFINES can arrive from more
+# than one option, so collapse duplicates before the list becomes compiler flags
 list(REMOVE_DUPLICATES VARIANT_DEFINES)
 target_compile_definitions(Driver
         PRIVATE SEED=${SEED_VALUE} ${VARIANT_DEFINES} _ITERATOR_DEBUG_LEVEL=0
