@@ -36,8 +36,9 @@ using FnObReferenceObjectByHandle = int32_t (*)(void*, uint32_t, void*, int32_t,
 using FnMmMapViewInSystemSpace = int32_t (*)(void*, void**, size_t*);
 using FnMmUnmapViewInSystemSpace = int32_t (*)(void*);
 using FnZwClose = int32_t (*)(void*);
+using FnZwOpenSection = int32_t (*)(void**, uint32_t, ChannelObjectAttributes*);
 using FnObfDereferenceObject = void (*)(void*);
-using FnPsCreateSystemThread = int32_t (*)(void**, uint32_t, ChannelObjectAttributes*, void*, void (*)(void*), void*);
+using FnPsCreateSystemThread = int32_t (*)(void**, uint32_t, ChannelObjectAttributes*, void*, void*, void (*)(void*), void*);
 using FnPsTerminateSystemThread = int32_t (*)(int32_t);
 using FnKeDelayExecutionThread = int32_t (*)(uint8_t, uint8_t, int64_t*);
 using FnKeWaitForSingleObject = int32_t (*)(void*, uint32_t, uint8_t, uint8_t, int64_t*);
@@ -47,6 +48,7 @@ static address ChannelRefByHandle = 0;
 static address ChannelMapSystem = 0;
 static address ChannelUnmapSystem = 0;
 static address ChannelClose = 0;
+static address ChannelOpenSection = 0;
 static address ChannelDeref = 0;
 static address ChannelCreateThread = 0;
 static address ChannelTerminateThread = 0;
@@ -140,6 +142,7 @@ static bool ChannelResolve()
         "MmMapViewInSystemSpace",
         "MmUnmapViewInSystemSpace",
         "ZwClose",
+        "ZwOpenSection",
         "ObfDereferenceObject",
         "PsCreateSystemThread",
         "PsTerminateSystemThread",
@@ -147,21 +150,22 @@ static bool ChannelResolve()
         "KeWaitForSingleObject",
     };
 
-    address Functions[10] = {};
-    FindFuncExportsBatch(Ntoskrnl, Names, Functions, 10);
+    address Functions[11] = {};
+    FindFuncExportsBatch(Ntoskrnl, Names, Functions, 11);
 
     ChannelCreateSection = Functions[0];
     ChannelRefByHandle = Functions[1];
     ChannelMapSystem = Functions[2];
     ChannelUnmapSystem = Functions[3];
     ChannelClose = Functions[4];
-    ChannelDeref = Functions[5];
-    ChannelCreateThread = Functions[6];
-    ChannelTerminateThread = Functions[7];
-    ChannelDelayThread = Functions[8];
-    ChannelWaitObject = Functions[9];
+    ChannelOpenSection = Functions[5];
+    ChannelDeref = Functions[6];
+    ChannelCreateThread = Functions[7];
+    ChannelTerminateThread = Functions[8];
+    ChannelDelayThread = Functions[9];
+    ChannelWaitObject = Functions[10];
 
-    for (uint32_t i = 0; i < 10; ++i)
+    for (uint32_t i = 0; i < 11; ++i)
     {
         if (!Functions[i])
         {
@@ -178,7 +182,11 @@ bool ChannelStart()
     if (ChannelBase) return true;
     if (!ChannelResolve()) return false;
 
-    static const wchar_t kNameBuffer[] = L"\\BaseNamedObjects\\EngineCiShared";
+    // Session 1 is the interactive desktop this lab runs on. A kernel caller's
+    // \BaseNamedObjects is not the same directory User.exe resolves Local\ to,
+    // so the section is created in the session directory explicitly. User.exe
+    // opens Local\EngineCiShared.
+    static const wchar_t kNameBuffer[] = L"\\Sessions\\1\\BaseNamedObjects\\EngineCiShared";
     ChannelUnicodeString Name;
     Name.Buffer = (wchar_t*) kNameBuffer;
     Name.Length = (uint16_t) ((sizeof(kNameBuffer) / sizeof(wchar_t) - 1) * sizeof(wchar_t));
@@ -194,6 +202,17 @@ bool ChannelStart()
     int32_t Status = ((FnZwCreateSection) ChannelCreateSection)(
         &SectionHandle, kSectionAllAccess, &Attributes, &MaximumSize,
         kPageReadWrite, kSecCommit, nullptr);
+
+    // Diagnostics: does the name resolve back in the context that created it?
+    {
+        void* Probe = nullptr;
+        int32_t ProbeStatus = ((FnZwOpenSection) ChannelOpenSection)(
+            &Probe, kSectionAllAccess, &Attributes);
+        print(INFO("Channel: create 0x%x handle %p, open-by-name 0x%x"),
+              (uint32_t) Status, SectionHandle, (uint32_t) ProbeStatus);
+        if (ProbeStatus >= 0) ((FnZwClose) ChannelClose)(Probe);
+    }
+
     if (Status < 0)
     {
         print(ERROR("Channel: ZwCreateSection failed 0x%x"), (uint32_t) Status);
@@ -228,9 +247,17 @@ bool ChannelStart()
 
     __atomic_store_n(&ChannelRunning, 1, __ATOMIC_RELEASE);
 
+    print(INFO("Channel: PsCreateSystemThread=%p ChannelThread=%p"),
+          (void*) ChannelCreateThread, (void*) &ChannelThread);
+
     void* ThreadHandle = nullptr;
+    // 7 parameters: ThreadHandle, DesiredAccess, ObjectAttributes, ProcessHandle,
+    // ClientId, StartRoutine, StartContext. ClientId must stay NULL - passing the
+    // routine there shifts every later argument by one
     Status = ((FnPsCreateSystemThread) ChannelCreateThread)(
-        &ThreadHandle, kThreadAllAccess, nullptr, nullptr, ChannelThread, nullptr);
+        &ThreadHandle, kThreadAllAccess, nullptr, nullptr, nullptr, ChannelThread, nullptr);
+    print(INFO("Channel: PsCreateSystemThread status 0x%x handle %p"),
+          (uint32_t) Status, ThreadHandle);
     if (Status < 0)
     {
         print(ERROR("Channel: PsCreateSystemThread failed 0x%x"), (uint32_t) Status);

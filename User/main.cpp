@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 #include <iostream>
 #include "../Common/Command.h"
 
@@ -12,27 +13,95 @@ static uint8_t* g_Data = nullptr;
 
 static bool Connect()
 {
-    for (int attempt = 0; attempt < 100; ++attempt)
+    const wchar_t* Names[3] = { L"Global\\EngineCiShared", L"EngineCiShared", L"Local\\EngineCiShared" };
+    DWORD LastError = 0;
+
+    // Session-independent lookup: ask the object manager directly for the
+    // candidate paths the driver's context may have used.
+    static const wchar_t* NtPaths[3] = {
+        L"\\BaseNamedObjects\\EngineCiShared",
+        L"\\Sessions\\0\\BaseNamedObjects\\EngineCiShared",
+        L"\\Sessions\\1\\BaseNamedObjects\\EngineCiShared",
+    };
+
+    struct US { USHORT Length; USHORT MaximumLength; PWSTR Buffer; };
+    struct OA { ULONG Length; ULONG Pad; HANDLE Root; US* Name; ULONG Attributes;
+                ULONG Pad2; void* Sd; void* Sqos; };
+
+    HMODULE Ntdll = GetModuleHandleW(L"ntdll.dll");
+    auto NtOpenSection = (LONG (NTAPI*)(PHANDLE, ACCESS_MASK, OA*))
+        GetProcAddress(Ntdll, "NtOpenSection");
+    auto NtMapViewOfSection = (LONG (NTAPI*)(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T,
+        PLARGE_INTEGER, PSIZE_T, DWORD, ULONG, ULONG))
+        GetProcAddress(Ntdll, "NtMapViewOfSection");
+
+    for (int attempt = 0; attempt < 40; ++attempt)
     {
-        HANDLE Mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, L"Global\\EngineCiShared");
-        if (Mapping)
+        for (int i = 0; i < 3; ++i)
         {
-            void* View = MapViewOfFile(Mapping, FILE_MAP_ALL_ACCESS, 0, 0, ChannelBytes);
-            CloseHandle(Mapping);
-            if (View)
+            SetLastError(0);
+            HANDLE Mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, Names[i]);
+            if (Mapping)
             {
-                ChannelHeader* Header = (ChannelHeader*) View;
-                if (Header->Magic == ChannelMagic)
+                void* View = MapViewOfFile(Mapping, FILE_MAP_ALL_ACCESS, 0, 0, ChannelBytes);
+                CloseHandle(Mapping);
+                if (View)
                 {
-                    g_Header = Header;
-                    g_Data = (uint8_t*) View + ChannelDataAt;
-                    return true;
+                    ChannelHeader* Header = (ChannelHeader*) View;
+                    for (int spin = 0; spin < 100 && Header->Magic != ChannelMagic; ++spin) Sleep(10);
+                    if (Header->Magic == ChannelMagic)
+                    {
+                        std::cout << "channel: connected (name index " << i << ")" << std::endl;
+                        g_Header = Header;
+                        g_Data = (uint8_t*) View + ChannelDataAt;
+                        return true;
+                    }
+                    UnmapViewOfFile(View);
                 }
-                UnmapViewOfFile(View);
+            }
+            LastError = GetLastError();
+        }
+
+        if (NtOpenSection && NtMapViewOfSection)
+        {
+            for (int i = 0; i < 3; ++i)
+            {
+                US Name = {};
+                Name.Buffer = (PWSTR) NtPaths[i];
+                Name.Length = (USHORT) (wcslen(NtPaths[i]) * sizeof(wchar_t));
+                Name.MaximumLength = (USHORT) (Name.Length + sizeof(wchar_t));
+                OA Attr = {};
+                Attr.Length = sizeof(Attr);
+                Attr.Name = &Name;
+                Attr.Attributes = 0x40;   // OBJ_CASE_INSENSITIVE
+
+                HANDLE Section = NULL;
+                LONG Status = NtOpenSection(&Section, 0x000F001F, &Attr);
+                if (Status >= 0)
+                {
+                    void* Base = nullptr;
+                    SIZE_T Size = 0;
+                    LONG MapStatus = NtMapViewOfSection(Section, GetCurrentProcess(), &Base, 0, 0,
+                                                        nullptr, &Size, 1, 0, PAGE_READWRITE);
+                    std::cout << "channel: nt path " << i << " open=0 map=" << MapStatus << std::endl;
+                    if (MapStatus >= 0 && ((ChannelHeader*) Base)->Magic == ChannelMagic)
+                    {
+                        g_Header = (ChannelHeader*) Base;
+                        g_Data = (uint8_t*) Base + ChannelDataAt;
+                        return true;
+                    }
+                }
+                else if (attempt == 39)
+                {
+                    std::cout << "channel: nt path " << i << " open status 0x"
+                              << std::hex << (ULONG) Status << std::dec << std::endl;
+                }
             }
         }
         Sleep(50);
     }
+
+    std::cout << "channel: open failed, last error " << LastError << std::endl;
     return false;
 }
 
