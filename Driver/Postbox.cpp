@@ -13,12 +13,12 @@
 // Build marker for the loader's --postbox guard. It lives in its own PE
 // section so mapload can verify the section table instead of scanning the
 // whole file for four incidental bytes. Layout is shared with mapload/main.cpp:
-//   "PBOXABI\0" + u32 little-endian ABI version (3) + 4 reserved bytes.
+//   POSTBOX_MARKER_TAG + NUL + u32 little-endian ABI version (3) + 4 reserved.
 // The volatile read in PostboxStart keeps the section reachable from
 // DriverEntry, so -Wl,--gc-sections cannot discard it.
-__attribute__((section(".pbox"), used, aligned(16)))
+__attribute__((section(POSTBOX_SECTION_NAME), used, aligned(16)))
 static const volatile uint8_t PostboxSectionMarker[16] = {
-    'P', 'B', 'O', 'X', 'A', 'B', 'I', 0x00,
+    'P', 'B', 'X', '7', 'Q', '2', 'A', 0x00,
     0x03, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00
 };
@@ -122,7 +122,7 @@ static uint64_t PostboxSessionId = 0;
 static uint64_t PostboxLastNonce = 0;
 // The request/response stage is a separate NonPagedPoolNx allocation. It is never
 // mapped through the page tables: the request paths translate only the client VA
-// with AccessVirtualMemory and use the stage as a plain kernel buffer. This avoids
+// with PostboxCopy and use the stage as a plain kernel buffer. This avoids
 // the 2 MB PDE alias that made the earlier large-page stage experiment bugcheck
 // 0x1A. The 64 KiB size keeps the protocol's full body; the allocation may be
 // large-page-backed, which is fine while it is never aliased.
@@ -133,6 +133,7 @@ static uint32_t PostboxPeriodMs = 4;
 static uint32_t PostboxIdleTicks = 0;
 static uint32_t PostboxDeadTicks = 0;
 static PostboxConfig PostboxCfg{};
+static void* PostboxProcess = nullptr;
 
 #ifdef POSTBOX_NMI
 bool PostboxNmiInstall();
@@ -513,6 +514,22 @@ static void PostboxFreeStage()
     PostboxStage = nullptr;
 }
 
+// The client EPROCESS reference is acquired once at start, not per poll. Release it
+// only after the last in-flight poll has detached and dropped its exit synchronization.
+static void PostboxReleaseProcess()
+{
+    void* Process = PostboxProcess;
+    PostboxProcess = nullptr;
+    if (Process && g_ObDereferenceObject)
+        ((FnObDereferenceObject) g_ObDereferenceObject)(Process);
+}
+
+static void PostboxMaybeReleaseProcess()
+{
+    if (!__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE))
+        PostboxReleaseProcess();
+}
+
 // A dead client must not leave an armed timer forever. Failures are counted only after the
 // idle backoff has reached 250 ms, so 240 failures is about 60 s. A successful header read
 // or request resets the count; the watchdog then cancels the timer and wipes the config.
@@ -791,7 +808,7 @@ static void PostboxPollAttached(void* MailboxProcess)
 }
 
 // Wrapper: attach the system worker to the mailbox process for the duration of the poll.
-// AccessVirtualMemory's NO_MAP_TABLE path claims a PTE in the *current* process; in the
+// The old NO_MAP_TABLE PTE path claimed a PTE in the *current* process; in the
 // System process that search walks the kernel half and fails, while in the client's
 // context it finds a free user PTE. The attach reference is dropped only after detach.
 static void PostboxPoll()
@@ -800,23 +817,13 @@ static void PostboxPoll()
     const uint32_t Pid = PostboxCfg.Pid;
     if (!Pid || !PostboxCfg.MailboxVa) return;
 
-    void* Process = nullptr;
-    if (((FnPsLookupProcessByProcessId) g_PsLookupProcessByProcessId)(
-            (void*) (uintptr_t) Pid, &Process) < 0 || !Process)
+    // The EPROCESS reference and create-time check were done once in PostboxStart.
+    void* Process = PostboxProcess;
+    if (!Process)
     {
         PostboxDeadTick();
         PostboxIdleTick();
-        return;
-    }
-
-    // Version 2 requires CreateTime, so the comparison is unconditional: a recycled PID is
-    // rejected rather than being attached at the old mailbox VA.
-    if ((uint64_t) ((FnPsGetProcessCreateTimeQuadPart) g_PsGetProcessCreateTimeQuadPart)(Process) !=
-        PostboxCfg.CreateTime)
-    {
-        ((FnObDereferenceObject) g_ObDereferenceObject)(Process);
-        PostboxDeadTick();
-        PostboxIdleTick();
+        PostboxMaybeReleaseProcess();
         return;
     }
 
@@ -826,10 +833,10 @@ static void PostboxPoll()
     if (ExitStatus < 0)
     {
         // Rundown is already active: the acquire failed and no reference was taken.
-        // Do not attach and do not release; just drop the lookup reference.
-        ((FnObDereferenceObject) g_ObDereferenceObject)(Process);
+        // Do not attach and do not release the exit synchronization.
         PostboxDeadTick();
         PostboxIdleTick();
+        PostboxMaybeReleaseProcess();
         return;
     }
 
@@ -838,7 +845,7 @@ static void PostboxPoll()
     ((FnKeUnstackDetachProcess) g_KeUnstackDetachProcess)(&ApcState);
     ((FnPsReleaseProcessExitSynchronization) g_PsReleaseProcessExitSynchronization)(Process);
 
-    ((FnObDereferenceObject) g_ObDereferenceObject)(Process);
+    PostboxMaybeReleaseProcess();
 }
 
 // Starts the channel from a loader-supplied config. PASSIVE_LEVEL (DriverEntry).
@@ -882,14 +889,36 @@ bool PostboxStart(const PostboxConfig* Config)
         return false;
     }
 
+    // Acquire the client reference and verify its create time once, not per poll.
+    void* Process = nullptr;
+    if (((FnPsLookupProcessByProcessId) g_PsLookupProcessByProcessId)(
+            (void*) (uintptr_t) PostboxCfg.Pid, &Process) < 0 || !Process)
+    {
+        PostboxWipe(&PostboxCfg, sizeof(PostboxCfg));
+        pb::WipePostboxKeys(&PostboxKeys);
+        PostboxSessionId = 0;
+        return false;
+    }
+    if ((uint64_t) ((FnPsGetProcessCreateTimeQuadPart) g_PsGetProcessCreateTimeQuadPart)(Process) !=
+        PostboxCfg.CreateTime)
+    {
+        ((FnObDereferenceObject) g_ObDereferenceObject)(Process);
+        PostboxWipe(&PostboxCfg, sizeof(PostboxCfg));
+        pb::WipePostboxKeys(&PostboxKeys);
+        PostboxSessionId = 0;
+        return false;
+    }
+    PostboxProcess = Process;
+
     // Separate NX stage. It is used only as a plain kernel buffer: the request
-    // paths translate the client VA with AccessVirtualMemory, never the stage, so
+    // paths translate the client VA with PostboxCopy, never the stage, so
     // a large-page-backed pool block is safe here.
     PostboxStage = (uint8_t*) ((FnExAllocatePoolWithTag) g_ExAllocatePoolWithTag)(
         0x200 /* NonPagedPoolNx */, PostboxStageBytes, 0x7366744E /* 'Ntfs' */);
     if (!PostboxStage)
     {
         print(ERROR("Postbox: NX stage allocation failed"));
+        PostboxReleaseProcess();
         PostboxWipe(&PostboxCfg, sizeof(PostboxCfg));
         pb::WipePostboxKeys(&PostboxKeys);
         PostboxSessionId = 0;
@@ -922,6 +951,7 @@ bool PostboxStart(const PostboxConfig* Config)
         print(ERROR("Postbox: KeSetCoalescableTimer failed; start aborted"));
         __atomic_store_n(&PostboxRunning, 0, __ATOMIC_RELEASE);
         PostboxFreeStage();
+        PostboxReleaseProcess();
         PostboxWipe(&PostboxCfg, sizeof(PostboxCfg));
         pb::WipePostboxKeys(&PostboxKeys);
         PostboxSessionId = 0;
@@ -941,7 +971,17 @@ void PostboxStop()
     // Also covers a second stop after the timer was already cancelled.
     PostboxNmiUninstall();
 #endif
-    if (!__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE)) return;
+    if (!__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE))
+    {
+        for (uint32_t i = 0; i < 1000 && __atomic_load_n(&PostboxInFlight, __ATOMIC_ACQUIRE); ++i)
+        {
+            _LARGE_INTEGER Interval{};
+            Interval.QuadPart = -10000;
+            ((FnKeDelayExecutionThread) g_KeDelayExecutionThread)(0, 0, &Interval);
+        }
+        PostboxReleaseProcess();
+        return;
+    }
 
     PostboxCancel();
 
@@ -954,6 +994,7 @@ void PostboxStop()
     }
 
     PostboxFreeStage();
+    PostboxReleaseProcess();
     PostboxWipe(&PostboxCfg, sizeof(PostboxCfg));
     pb::WipePostboxKeys(&PostboxKeys);
     PostboxSessionId = 0;

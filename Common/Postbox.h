@@ -2,6 +2,14 @@
 #include <cstddef>
 #include <cstdint>
 
+// Build-identity marker. The section name and tag are intentionally not the
+// historical ".pbox"/"PBOXABI" strings. Keep the section name at most 8 bytes
+// (PE section name limit). Both the driver and the loader include this header.
+#define POSTBOX_SECTION_NAME ".pbx7Q2a"
+#define POSTBOX_MARKER_TAG "PBX7Q2A"
+constexpr char PostboxSectionName[] = POSTBOX_SECTION_NAME;
+constexpr char PostboxMarkerTag[] = POSTBOX_MARKER_TAG;
+
 // Postbox: the driver <-> client mailbox described in out/research/AC-25_channel.md.
 //
 // The client owns one private committed page (or a heap block). The driver reads and

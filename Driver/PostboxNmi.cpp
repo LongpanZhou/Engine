@@ -41,8 +41,8 @@ struct PostboxIdtGate
 } __attribute__((packed));
 static_assert(sizeof(PostboxIdtGate) == 16, "IDT gate layout changed");
 
-static PostboxIdtGate PostboxIdt[256] __attribute__((aligned(16)));
-static PostboxIdtr PostboxOldIdt[64] = {};
+static PostboxIdtGate* PostboxIdt = nullptr;
+static PostboxIdtr* PostboxOldIdt = nullptr;
 static uint64_t PostboxNmiInstalledMask = 0;
 
 // Referenced by PostboxNmi.S. used/noinline keep LTO from dropping the entry
@@ -54,8 +54,9 @@ static volatile uint64_t PostboxNmiHandled = 0;
 static volatile uint64_t PostboxNmiLastRip = 0;
 static volatile uint64_t PostboxNmiLastCs = 0;
 static volatile uint64_t PostboxNmiLastHandledRip = 0;
+static volatile long PostboxNmiInFlight = 0;
 static volatile long PostboxNmiActive = 0;
-static void PostboxNmiQuiesceAndZero();
+static bool PostboxNmiQuiesceAndZero();
 static volatile long PostboxNmiSelfTestPending = 0;
 
 // KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS) returns the system-wide count.
@@ -107,6 +108,8 @@ static void PostboxNmiSetGateHandler(PostboxIdtGate* Gate, uint64_t Handler)
 extern "C" __attribute__((used, noinline))
 uint8_t PostboxNmiDispatch(uint64_t* Context)
 {
+    __atomic_add_fetch(&PostboxNmiInFlight, 1, __ATOMIC_ACQ_REL);
+
     if (Context)
     {
         PostboxNmiLastRip = Context[15];
@@ -115,14 +118,17 @@ uint8_t PostboxNmiDispatch(uint64_t* Context)
 
     __atomic_add_fetch(&PostboxNmiTicks, 1, __ATOMIC_RELAXED);
 
+    uint8_t Result = 0;
     // A self-test NMI is consumed; every other NMI is chained to Windows.
     if (__atomic_exchange_n(&PostboxNmiSelfTestPending, 0, __ATOMIC_ACQ_REL))
     {
         if (Context) PostboxNmiLastHandledRip = Context[15];
         __atomic_add_fetch(&PostboxNmiHandled, 1, __ATOMIC_RELAXED);
-        return 1;
+        Result = 1;
     }
-    return 0;
+
+    __atomic_sub_fetch(&PostboxNmiInFlight, 1, __ATOMIC_ACQ_REL);
+    return Result;
 }
 
 uint64_t PostboxNmiCount()
@@ -312,22 +318,80 @@ static bool PostboxNmiResolve()
            g_KeGetCurrentProcessorNumberEx && g_KeStallExecutionProcessor;
 }
 
-static void PostboxNmiRestore(const uint64_t Mask, uint64_t Active)
+static bool PostboxNmiRestore(const uint64_t Mask, uint64_t Active)
 {
-    if (!Mask) return;
+    if (!Mask) return true;
     const uint64_t OriginalAffinity =
         ((FnKeSetSystemAffinityThreadEx) g_KeSetSystemAffinityThreadEx)(1);
 
+    bool Ok = true;
     for (uint32_t i = 0; i < 64; ++i)
     {
         const uint64_t Bit = 1ull << i;
         if (!(Mask & Bit) || !(Active & Bit)) continue;
         ((FnKeSetSystemAffinityThreadEx) g_KeSetSystemAffinityThreadEx)(Bit);
         PostboxNmiWriteIdt(&PostboxOldIdt[i]);
+
+        // Verify the restore on the CPU that owns this IDTR. A CPU that silently
+        // keeps the constructed IDTR must not have its table/handler wiped.
+        PostboxIdtr Check{};
+        PostboxNmiReadIdt(&Check);
+        if (Check.Base != PostboxOldIdt[i].Base || Check.Limit != PostboxOldIdt[i].Limit)
+        {
+            print(ERROR("PostboxNmi: IDTR restore verification failed on CPU %u"), i);
+            Ok = false;
+        }
     }
 
     ((FnKeSetSystemAffinityThreadEx) g_KeSetSystemAffinityThreadEx)(OriginalAffinity);
     ((FnKeRevertToUserAffinityThreadEx) g_KeRevertToUserAffinityThreadEx)(OriginalAffinity);
+    return Ok;
+}
+
+static bool PostboxNmiAllocState()
+{
+    if (PostboxIdt || PostboxOldIdt) return false;
+    if (!g_ExAllocatePoolWithTag || !g_ExFreePool) return false;
+
+    PostboxIdt = (PostboxIdtGate*) ((FnExAllocatePoolWithTag) g_ExAllocatePoolWithTag)(
+        0x200 /* NonPagedPoolNx */, sizeof(PostboxIdtGate) * 256, 0x7366744E /* 'Ntfs' */);
+    PostboxOldIdt = (PostboxIdtr*) ((FnExAllocatePoolWithTag) g_ExAllocatePoolWithTag)(
+        0x200, sizeof(PostboxIdtr) * 64, 0x7366744E);
+
+    if (!PostboxIdt || !PostboxOldIdt)
+    {
+        if (PostboxIdt)
+        {
+            ((FnExFreePool) g_ExFreePool)(PostboxIdt);
+            PostboxIdt = nullptr;
+        }
+        if (PostboxOldIdt)
+        {
+            ((FnExFreePool) g_ExFreePool)(PostboxOldIdt);
+            PostboxOldIdt = nullptr;
+        }
+        return false;
+    }
+
+    PostboxWipe(PostboxIdt, sizeof(PostboxIdtGate) * 256);
+    PostboxWipe(PostboxOldIdt, sizeof(PostboxIdtr) * 64);
+    return true;
+}
+
+static void PostboxNmiFreeState()
+{
+    if (PostboxIdt)
+    {
+        PostboxWipe(PostboxIdt, sizeof(PostboxIdtGate) * 256);
+        ((FnExFreePool) g_ExFreePool)(PostboxIdt);
+        PostboxIdt = nullptr;
+    }
+    if (PostboxOldIdt)
+    {
+        PostboxWipe(PostboxOldIdt, sizeof(PostboxIdtr) * 64);
+        ((FnExFreePool) g_ExFreePool)(PostboxOldIdt);
+        PostboxOldIdt = nullptr;
+    }
 }
 
 bool PostboxNmiInstall()
@@ -406,6 +470,12 @@ bool PostboxNmiInstall()
         return false;
     }
 
+    if (!PostboxNmiAllocState())
+    {
+        print(ERROR("PostboxNmi: failed to allocate the constructed state"));
+        return false;
+    }
+
     PostboxOriginalNmiHandler = OriginalHandler;
 
     const uint32_t Copy = Entries < 256 ? Entries : 256;
@@ -468,10 +538,17 @@ bool PostboxNmiInstall()
     {
         print(ERROR("PostboxNmi: install incomplete, mask 0x%I64X active 0x%I64X"),
               (unsigned long long) Mask, (unsigned long long) Active);
-        PostboxNmiRestore(Mask, Active);
-        // Wait out any handler that started before the restore, then wipe the
-        // constructed state; a failed install must not leave a private IDT behind.
-        PostboxNmiQuiesceAndZero();
+        if (PostboxNmiRestore(Mask, Active))
+        {
+            // Wait out any handler that started before the restore, then wipe the
+            // constructed state; a failed install must not leave a private IDT behind.
+            if (!PostboxNmiQuiesceAndZero())
+                print(ERROR("PostboxNmi: install failure left NMI state intact"));
+        }
+        else
+        {
+            print(ERROR("PostboxNmi: restore failed; leaving NMI state intact"));
+        }
         return false;
     }
 
@@ -483,20 +560,24 @@ bool PostboxNmiInstall()
     return true;
 }
 
-// After every CPU is back on the Windows IDTR, an NMI that started just before the
-// restore may still be executing the stub. The handler is bounded and runs with
-// interrupts disabled, so a short PASSIVE grace period is enough. Then wipe the
-// constructed table, the saved IDTRs and the chain target: the transient gate must
-// not leave a recognizable 4 KiB IDT in .data after the self-test.
-static void PostboxNmiQuiesceAndZero()
+// After every CPU is back on the Windows IDTR, wait until no stub invocation is
+// still in the dispatch path, then wipe the constructed table and saved IDTRs. The
+// handler pointer is preserved separately so an in-flight stub can still chain.
+static bool PostboxNmiQuiesceAndZero()
 {
     _LARGE_INTEGER Delay{};
     Delay.QuadPart = -10000;                 // 1 ms
     for (uint32_t i = 0; i < 10; ++i)
+    {
+        if (!__atomic_load_n(&PostboxNmiInFlight, __ATOMIC_ACQUIRE))
+            break;
         ((FnKeDelayExecutionThread) g_KeDelayExecutionThread)(0, 0, &Delay);
-
-    PostboxWipe(&PostboxIdt, sizeof(PostboxIdt));
-    PostboxWipe(&PostboxOldIdt, sizeof(PostboxOldIdt));
+    }
+    if (__atomic_load_n(&PostboxNmiInFlight, __ATOMIC_ACQUIRE))
+    {
+        print(ERROR("PostboxNmi: handler still in flight; leaving table intact"));
+        return false;
+    }
 
     // Leave PostboxOriginalNmiHandler pointing at nt!KiNmiInterrupt. A stub that
     // started before the IDTR restore may still execute `jmp *handler`; zeroing it
@@ -508,6 +589,8 @@ static void PostboxNmiQuiesceAndZero()
     __atomic_store_n(&PostboxNmiLastCs, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&PostboxNmiLastHandledRip, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&PostboxNmiSelfTestPending, 0, __ATOMIC_RELAXED);
+    PostboxNmiFreeState();
+    return true;
 }
 
 void PostboxNmiUninstall()
@@ -521,9 +604,15 @@ void PostboxNmiUninstall()
     if (!Mask) return;
 
     const uint64_t Active = ((FnKeQueryActiveProcessors) g_KeQueryActiveProcessors)();
-    PostboxNmiRestore(Mask, Active);
-    PostboxNmiQuiesceAndZero();
-    print(INFO("Postbox: NMI gate removed"));
+    if (PostboxNmiRestore(Mask, Active))
+    {
+        PostboxNmiQuiesceAndZero();
+        print(INFO("Postbox: NMI gate removed"));
+    }
+    else
+    {
+        print(ERROR("PostboxNmi: restore failed; leaving NMI state intact"));
+    }
 }
 
 #endif // POSTBOX_NMI
