@@ -390,11 +390,17 @@ static bool PostboxResolve()
             return false;
         }
     }
-    for (uint32_t i = 0; i < 19; ++i)
+    for (uint32_t i = 0; i < 22; ++i)
     {
         volatile char* p = Decoded[i];
         for (uint32_t j = 0; j < 40; ++j) p[j] = 0;
     }
+
+    // The ROT1 table stays resident for now. Wiping it at runtime requires a
+    // writable .rdata window and a global TLB flush; the first live attempt was
+    // not observable because the lab VM hung, so it is deferred to a clean-VM
+    // test. The loader-side import strip removes the PE descriptor/name strings.
+
     PostboxResolved = true;
     return true;
 }
@@ -815,7 +821,19 @@ static void PostboxPoll()
 {
     if (!__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE)) return;
     const uint32_t Pid = PostboxCfg.Pid;
-    if (!Pid || !PostboxCfg.MailboxVa) return;
+    if (!Pid || !PostboxCfg.MailboxVa)
+    {
+        // A zeroed/corrupted config must not leave the fast timer armed forever:
+        // the dead-client watchdog is bypassed by this early return, and a manual
+        // map has no unload callback. Cancel and wipe here (PASSIVE, work routine).
+        PostboxCancel();
+        PostboxFreeStage();
+        PostboxWipe(&PostboxCfg, sizeof(PostboxCfg));
+        pb::WipePostboxKeys(&PostboxKeys);
+        PostboxSessionId = 0;
+        PostboxLastNonce = 0;
+        return;
+    }
 
     // The EPROCESS reference and create-time check were done once in PostboxStart.
     void* Process = PostboxProcess;
@@ -868,6 +886,11 @@ bool PostboxStart(const PostboxConfig* Config)
     if (!KeyNonZero) return false;
 
     PostboxCfg = *Config;
+    // The magic/version are validation-only. Leaving the 8-byte "PBOX"+version
+    // prefix in .data makes the resident control block trivially findable by a
+    // magic scan; wipe it after the check.
+    PostboxCfg.Magic = 0;
+    PostboxCfg.Version = 0;
     // The section map is only needed by ProtectImageSections(), which ran before
     // this copy. Do not leave the RVAs/sizes in the resident .data image.
     PostboxWipe(&PostboxCfg.Layout, sizeof(PostboxCfg.Layout));
