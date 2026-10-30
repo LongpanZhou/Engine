@@ -809,6 +809,9 @@ bool PostboxStart(const PostboxConfig* Config)
     if (!KeyNonZero) return false;
 
     PostboxCfg = *Config;
+    // The section map is only needed by ProtectImageSections(), which ran before
+    // this copy. Do not leave the RVAs/sizes in the resident .data image.
+    PostboxWipe(&PostboxCfg.Layout, sizeof(PostboxCfg.Layout));
     PostboxLastSeq = 0;
     PostboxLastNonce = 0;
     PostboxInFlight = 0;

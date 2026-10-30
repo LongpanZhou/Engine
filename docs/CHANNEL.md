@@ -487,11 +487,11 @@ Expected evidence (AC-25 §8):
   `PostboxNmiStub`. The self-test is proven by `nmi: self-test handled=1`, not by the tick delta.
 
 **Live result (2026-10-30, 19041 clone):** the NMI build (28,672 bytes, `entryRva=0x434D`,
-`SizeOfImage=0xB000`, SHA-256 `4d70a9c9...`) returned entry success at image
-`0xFFFFA3870DE37000`; client PID 2140 reported `ping`, `read`, `write`, an invalid read
+`SizeOfImage=0xB000`, SHA-256 `080814c8...`) returned entry success at image
+`0xFFFFA3870DE6F000`; client PID 7956 reported `ping`, `read`, `write`, an invalid read
 (`0xC0000005`), `nmi: count=0`, `nmi: self-test handled=1`, `stop`, and a `0x8000`-byte bulk
 write/read all as expected (`read: x=1111 y=1111`, `write: x=4242 y=4242`, `bulk read: match=1`).
-The NMI-off build (25,600 bytes, `entryRva=0x3A78`, SHA-256 `1412e4a7...`) passed the same six
+The NMI-off build (25,600 bytes, `entryRva=0x3A78`, SHA-256 `a3f31953...`) passed the same six
 operations without the NMI op. The image PTE split is live: base R/NX, `.text` RX, `.data` RW/NX;
 no page in the block is RWX. The NMI table and saved IDTRs are wiped after the self-test, and
 `r idtr` is Windows. The mapper skips `.pbox`, so the mapped image has no `PBOXABI` marker. The
