@@ -379,9 +379,11 @@ driver inside the pending window can still be consumed; the test is functional, 
 
 Removal is idempotent: `PostboxNmiUninstall` clears the active flag and restores each saved IDTR.
 The gate is removed at the end of the `pb_nmi Address=1` work item, so no private IDTR survives the
-request. The table and saved handler address are deliberately not wiped, so an in-flight handler
-cannot jump into freed memory. `pb_stop`, `PostboxStop`, and the failed-poll watchdog still call it
-as defence in depth.
+request. After a 10 ms PASSIVE grace period (covering an NMI that started just before the restore),
+`PostboxNmiQuiesceAndZero` wipes the 4 KiB table, the 640-byte old-IDTR array and the
+counters/last-RIP/CS. `PostboxOriginalNmiHandler` is deliberately preserved so an in-flight stub can
+still chain to `nt!KiNmiInterrupt`. `pb_stop`, `PostboxStop`, and the failed-poll watchdog still call
+it as defence in depth.
 
 Artifacts: during the transient `pb_nmi Address=1` self-test, `sidt`/IDTR points at the driver image
 and vector 2 is the stub; the 4 KiB table is a static copy of the Windows IDT. The gate is removed
@@ -486,12 +488,12 @@ Expected evidence (AC-25 §8):
   while the gate is installed, `sidt`/IDTR points at the driver image's 4 KiB table and vector 2 is
   `PostboxNmiStub`. The self-test is proven by `nmi: self-test handled=1`, not by the tick delta.
 
-**Live result (2026-10-30, 19041 clone):** the NMI build (28,672 bytes, `entryRva=0x434D`,
-`SizeOfImage=0xB000`, SHA-256 `080814c8...`) returned entry success at image
-`0xFFFFA3870DE6F000`; client PID 7956 reported `ping`, `read`, `write`, an invalid read
+**Live result (2026-10-30, 19041 clone):** the NMI build (27,136 bytes, `entryRva=0x40E2`,
+`SizeOfImage=0xB000`, SHA-256 `73b645d3...`) returned entry success at image
+`0xFFFFA3870DF0E000`; client PID 3948 reported `ping`, `read`, `write`, an invalid read
 (`0xC0000005`), `nmi: count=0`, `nmi: self-test handled=1`, `stop`, and a `0x8000`-byte bulk
 write/read all as expected (`read: x=1111 y=1111`, `write: x=4242 y=4242`, `bulk read: match=1`).
-The NMI-off build (25,600 bytes, `entryRva=0x3A78`, SHA-256 `a3f31953...`) passed the same six
+The NMI-off build (24,576 bytes, `entryRva=0x37BB`, SHA-256 `d04dfc3b...`) passed the same six
 operations without the NMI op. The image PTE split is live: base R/NX, `.text` RX, `.data` RW/NX;
 no page in the block is RWX. The NMI table and saved IDTRs are wiped after the self-test, and
 `r idtr` is Windows. The mapper skips `.pbox`, so the mapped image has no `PBOXABI` marker. The

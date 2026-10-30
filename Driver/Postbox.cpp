@@ -90,6 +90,7 @@ using FnMmCopyMemory = int32_t (*)(void* Target, PostboxCopyAddress Source,
 using FnMmCopyVirtualMemory = int32_t (*)(void* SourceProcess, void* SourceAddress,
                                           void* TargetProcess, void* TargetAddress,
                                           size_t Size, int32_t PreviousMode, size_t* Done);
+using FnKeIpiGenericCall = uint64_t (*)(uint64_t (*)(uint64_t), uint64_t);
 
 static address g_KeInitializeTimerEx = 0;
 static address g_KeInitializeDpc = 0;
@@ -109,6 +110,7 @@ static address g_ExAllocatePoolWithTag = 0;
 static address g_ExFreePool = 0;
 static address g_MmCopyMemory = 0;
 static address g_MmCopyVirtualMemory = 0;
+static address g_KeIpiGenericCall = 0;
 
 static PostboxTimer PostboxTimerObject;
 static PostboxDpc PostboxDpcObject;
@@ -148,43 +150,68 @@ constexpr uint64_t PostboxUserLimit = 0x00007FFFFFFF0000ull;
 // pool base after the loader applies relocations, so this is the mapped image base.
 extern "C" _IMAGE_DOS_HEADER __ImageBase;
 
-// Walk the live tables to the 4 KB PTE for Va. Large-page mappings are refused:
-// the image is a page-granular pool block, so a 2 MB/1 GB entry means the layout
-// cannot be applied safely.
-static bool GetPteForVa(address Va, cr3 Cr3, address& EntryPa, pte& Entry)
+static bool PostboxResolve();
+
+// Self-map entry for a VA. The kernel's PTE_BASE maps the page tables, so this
+// is a direct kernel VA write with no physical alias and no user-half supervisor
+// PTE. Large-page mappings are refused: the image is a page-granular pool block.
+static uint64_t* SelfMapEntry(address Va)
 {
-    pml4e PML4E{};
-    if (!AccessPhysicalMemory({(Cr3.pml4_frame_number << 12) + Va.p4_index * 8}, Page_4KB, PML4E) ||
-        !PML4E.present) return false;
-
-    pdpe PDPTE{};
-    if (!AccessPhysicalMemory({(PML4E.page_frame_number << 12) + Va.p3_index * 8}, Page_4KB, PDPTE) ||
-        !PDPTE.present || ((pdpe_1gb) PDPTE).page_size) return false;
-
-    pde PDE{};
-    if (!AccessPhysicalMemory({(PDPTE.page_frame_number << 12) + Va.p2_index * 8}, Page_4KB, PDE) ||
-        !PDE.present || ((pde_2mb) PDE).page_size) return false;
-
-    EntryPa = address((PDE.page_frame_number << 12) + Va.p1_index * 8);
-    return AccessPhysicalMemory(EntryPa, Page_4KB, Entry) && Entry.present;
+    const uint64_t PteBase = (uint64_t) GetPteBase();
+    if (!PteBase) return nullptr;
+    constexpr uint64_t Mask = (1ull << 39) - 8;
+    return (uint64_t*) (uintptr_t) (PteBase + (((uint64_t) Va >> 9) & Mask));
 }
 
-// Set W and NX on one 4 KB image page. The PTE is written through the physical
-// mapping path, then invlpg flushes the current CPU. The loader pins the
-// map/copy/entry thread to one CPU, so no other CPU has a stale image TLB entry.
+static bool GetPteForVa(address Va, uint64_t*& Entry)
+{
+    uint64_t* Pte = SelfMapEntry(Va);
+    if (!Pte) return false;
+    uint64_t* Pde = SelfMapEntry(address((uint64_t) (uintptr_t) Pte));
+    uint64_t* Pdpte = SelfMapEntry(address((uint64_t) (uintptr_t) Pde));
+    uint64_t* Pml4e = SelfMapEntry(address((uint64_t) (uintptr_t) Pdpte));
+    if (!Pml4e || !Pdpte || !Pde || !Pte) return false;
+
+    if (!(*Pml4e & 1) || !(*Pdpte & 1) || !(*Pde & 1)) return false;
+    if (*Pdpte & (1ull << 7)) return false;       // 1 GB page
+    if (*Pde & (1ull << 7)) return false;         // 2 MB page
+    if (!(*Pte & 1)) return false;
+
+    Entry = Pte;
+    return true;
+}
+
+// Set W and NX on one 4 KB image page through the self-map, then invlpg the
+// current CPU. ProtectImageSections follows the loop with a global IPI flush.
 static bool SetPageProtection(address Va, bool Write, bool Execute)
 {
-    address EntryPa{};
-    pte Entry{};
-    if (!GetPteForVa(Va, GetSystemCr3(), EntryPa, Entry)) return false;
+    uint64_t* Entry = nullptr;
+    if (!GetPteForVa(Va, Entry)) return false;
 
-    Entry.write = Write ? 1 : 0;
-    Entry.execute_disable = Execute ? 0 : 1;
-    if (!AccessPhysicalMemory(EntryPa, (void*) &Entry, sizeof(Entry), Page_4KB, true))
-        return false;
+    uint64_t Value = *Entry;
+    if (Write) Value |= 2;
+    else       Value &= ~2ull;
+    if (Execute) Value &= ~(1ull << 63);
+    else         Value |= (1ull << 63);
 
+    __atomic_store_n(Entry, Value, __ATOMIC_RELEASE);
     invlpg(Va);
     return true;
+}
+
+struct PostboxTlbRange
+{
+    uint64_t Start;
+    uint64_t End;
+};
+
+// KeIpiGenericCall callback: runs on every CPU at IPI_LEVEL and only invlpg's.
+static uint64_t PostboxFlushTlb(uint64_t Context)
+{
+    const PostboxTlbRange* Range = (const PostboxTlbRange*) (uintptr_t) Context;
+    for (uint64_t Va = Range->Start; Va < Range->End; Va += 0x1000)
+        invlpg(address(Va));
+    return 0;
 }
 
 // Apply the loader-built section map to the image block. The header and
@@ -205,6 +232,13 @@ bool ProtectImageSections(const PostboxConfig* Config)
     if (L.ImageSize == 0 || L.AllocSize == 0 || L.SectionCount == 0 ||
         L.SectionCount > PostboxMaxSections)
         return false;
+
+    // Resolve KeIpiGenericCall before the PTE walk: the global flush needs it.
+    if (!PostboxResolve())
+    {
+        print(ERROR("Postbox: resolve failed before image protection"));
+        return false;
+    }
 
     const address ImageBase = address((uint64_t) (uintptr_t) &__ImageBase);
     if ((uint64_t) ImageBase != L.ImageBase || (L.ImageBase & 0xFFF) != 0)
@@ -252,6 +286,18 @@ bool ProtectImageSections(const PostboxConfig* Config)
         ++Pages;
     }
 
+    // The per-page invlpg only covers the current CPU. A T2 AC can cache the
+    // pre-protection RWX entry on the other CPU; flush every CPU so the stale
+    // entry cannot write .text or execute .data after the split.
+    if (!g_KeIpiGenericCall)
+    {
+        print(ERROR("Postbox: KeIpiGenericCall not resolved"));
+        return false;
+    }
+    PostboxTlbRange Range{ L.ImageBase, End };
+    ((FnKeIpiGenericCall) g_KeIpiGenericCall)(
+        &PostboxFlushTlb, (uint64_t) (uintptr_t) &Range);
+
     print(INFO("Postbox: image protections applied (%u pages, %u sections)"),
           Pages, L.SectionCount);
     return true;
@@ -259,8 +305,11 @@ bool ProtectImageSections(const PostboxConfig* Config)
 
 static void PostboxPoll();
 
+static bool PostboxResolved = false;
+
 static bool PostboxResolve()
 {
+    if (PostboxResolved) return true;
     address Ntoskrnl = GetNtoskrnl();
     if (!Ntoskrnl)
     {
@@ -287,14 +336,15 @@ static bool PostboxResolve()
         "FyGsffQppm",                      // ExFreePool
         "NnDpqzNfnpsz",                    // MmCopyMemory
         "NnDpqzWjsuvbmNfnpsz",             // MmCopyVirtualMemory
+        "LfJqjHfofsjdDbmm",                // KeIpiGenericCall
     };
 
     // The resolve table is stored ROT1-encoded so the image does not carry the plaintext
     // export names. This is anti-static-scan, not secrecy: it is decoded in a stack buffer
     // and wiped after the resolve. The resolved pointers remain in .data.
-    char Decoded[18][40] = {};
-    const char* Names[18] = {};
-    for (uint32_t i = 0; i < 18; ++i)
+    char Decoded[19][40] = {};
+    const char* Names[19] = {};
+    for (uint32_t i = 0; i < 19; ++i)
     {
         uint32_t j = 0;
         for (; j < 39 && EncodedNames[i][j]; ++j)
@@ -303,8 +353,8 @@ static bool PostboxResolve()
         Names[i] = Decoded[i];
     }
 
-    address Functions[18] = {};
-    FindFuncExportsBatch(Ntoskrnl, Names, Functions, 18);
+    address Functions[19] = {};
+    FindFuncExportsBatch(Ntoskrnl, Names, Functions, 19);
 
     g_KeInitializeTimerEx = Functions[0];
     g_KeInitializeDpc = Functions[1];
@@ -324,13 +374,14 @@ static bool PostboxResolve()
     g_ExFreePool = Functions[15];
     g_MmCopyMemory = Functions[16];
     g_MmCopyVirtualMemory = Functions[17];
+    g_KeIpiGenericCall = Functions[18];
 
-    for (uint32_t i = 0; i < 18; ++i)
+    for (uint32_t i = 0; i < 19; ++i)
     {
         if (!Functions[i])
         {
             print(ERROR("Postbox: export %s not found"), Names[i]);
-            for (uint32_t k = 0; k < 18; ++k)
+            for (uint32_t k = 0; k < 19; ++k)
             {
                 volatile char* p = Decoded[k];
                 for (uint32_t j = 0; j < 40; ++j) p[j] = 0;
@@ -338,11 +389,12 @@ static bool PostboxResolve()
             return false;
         }
     }
-    for (uint32_t i = 0; i < 18; ++i)
+    for (uint32_t i = 0; i < 19; ++i)
     {
         volatile char* p = Decoded[i];
         for (uint32_t j = 0; j < 40; ++j) p[j] = 0;
     }
+    PostboxResolved = true;
     return true;
 }
 

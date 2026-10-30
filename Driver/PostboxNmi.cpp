@@ -497,7 +497,17 @@ static void PostboxNmiQuiesceAndZero()
 
     PostboxWipe(&PostboxIdt, sizeof(PostboxIdt));
     PostboxWipe(&PostboxOldIdt, sizeof(PostboxOldIdt));
-    PostboxOriginalNmiHandler = 0;
+
+    // Leave PostboxOriginalNmiHandler pointing at nt!KiNmiInterrupt. A stub that
+    // started before the IDTR restore may still execute `jmp *handler`; zeroing it
+    // would turn a rare in-flight NMI into a jump to NULL. The table/old IDTRs are
+    // zeroed, and the counters/last RIP/CS are diagnostic residue.
+    __atomic_store_n(&PostboxNmiTicks, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&PostboxNmiHandled, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&PostboxNmiLastRip, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&PostboxNmiLastCs, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&PostboxNmiLastHandledRip, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&PostboxNmiSelfTestPending, 0, __ATOMIC_RELAXED);
 }
 
 void PostboxNmiUninstall()
