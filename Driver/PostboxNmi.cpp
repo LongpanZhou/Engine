@@ -55,6 +55,7 @@ static volatile uint64_t PostboxNmiLastRip = 0;
 static volatile uint64_t PostboxNmiLastCs = 0;
 static volatile uint64_t PostboxNmiLastHandledRip = 0;
 static volatile long PostboxNmiActive = 0;
+static void PostboxNmiQuiesceAndZero();
 static volatile long PostboxNmiSelfTestPending = 0;
 
 // KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS) returns the system-wide count.
@@ -468,8 +469,9 @@ bool PostboxNmiInstall()
         print(ERROR("PostboxNmi: install incomplete, mask 0x%I64X active 0x%I64X"),
               (unsigned long long) Mask, (unsigned long long) Active);
         PostboxNmiRestore(Mask, Active);
-        // Leave PostboxOriginalNmiHandler intact: a handler that started before the
-        // IDTR restore may still be executing and must have a valid chain target.
+        // Wait out any handler that started before the restore, then wipe the
+        // constructed state; a failed install must not leave a private IDT behind.
+        PostboxNmiQuiesceAndZero();
         return false;
     }
 
@@ -479,6 +481,23 @@ bool PostboxNmiInstall()
                "(grouped or >64-CPU systems refused)"),
           Installed, (void*) (uintptr_t) &PostboxNmiStub);
     return true;
+}
+
+// After every CPU is back on the Windows IDTR, an NMI that started just before the
+// restore may still be executing the stub. The handler is bounded and runs with
+// interrupts disabled, so a short PASSIVE grace period is enough. Then wipe the
+// constructed table, the saved IDTRs and the chain target: the transient gate must
+// not leave a recognizable 4 KiB IDT in .data after the self-test.
+static void PostboxNmiQuiesceAndZero()
+{
+    _LARGE_INTEGER Delay{};
+    Delay.QuadPart = -10000;                 // 1 ms
+    for (uint32_t i = 0; i < 10; ++i)
+        ((FnKeDelayExecutionThread) g_KeDelayExecutionThread)(0, 0, &Delay);
+
+    PostboxWipe(&PostboxIdt, sizeof(PostboxIdt));
+    PostboxWipe(&PostboxOldIdt, sizeof(PostboxOldIdt));
+    PostboxOriginalNmiHandler = 0;
 }
 
 void PostboxNmiUninstall()
@@ -493,8 +512,7 @@ void PostboxNmiUninstall()
 
     const uint64_t Active = ((FnKeQueryActiveProcessors) g_KeQueryActiveProcessors)();
     PostboxNmiRestore(Mask, Active);
-    // The table and PostboxOriginalNmiHandler stay intact: an NMI that started
-    // before the IDTR restore may still be executing on another CPU.
+    PostboxNmiQuiesceAndZero();
     print(INFO("Postbox: NMI gate removed"));
 }
 

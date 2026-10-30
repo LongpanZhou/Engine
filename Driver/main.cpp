@@ -122,6 +122,23 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
     const bool PostboxMode = false;
 #endif
 
+#ifdef POSTBOX_CHANNEL
+    // The image is published as one RWX pool block. Apply the loader-supplied
+    // section map before any channel state is initialized: .text RX, writable
+    // sections RW/NX, everything else R/NX. Failure is fail-closed; the loader
+    // zeroes and frees the image when the entry returns an error.
+    if (PostboxMode)
+    {
+        print(INFO("DriverEntry: step 0.1 ProtectImageSections()"));
+        if (!ProtectImageSections((const PostboxConfig*) RegistryPath))
+        {
+            print(ERROR("DriverEntry: ProtectImageSections failed, returning 0xC0000001"));
+            return static_cast<win::ntstatus>(0xC0000001);
+        }
+        print(INFO("DriverEntry: step 0.1 ProtectImageSections() ok"));
+    }
+#endif
+
 #ifndef MANUAL_MAP_ONLY
     // Step 0: clean the traces of earlier cycles (PiDDB / MmUnloadedDrivers / CI hash bucket / WdFilter
     // list) before the hook, so Hook() works against pristine state. Skip entirely for a manual map.

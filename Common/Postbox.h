@@ -55,6 +55,46 @@ static_assert((offsetof(PostboxHeader, Address) % 8) == 0, "Address must be 8-by
 
 constexpr uint32_t PostboxConfigMagic = 0x50424F58;   // "PBOX"
 
+// The mapped image is headerless and .pdata/.reloc are zeroed, so the driver cannot
+// parse its own PE section table at runtime. The loader builds this compact layout
+// from the file and passes it in the config. The driver applies it to the image PTE
+// block before the channel starts: .text RX, writable sections RW/NX, everything
+// else (header, .rdata, .pdata, .reloc, .pbox, pool padding) R/NX.
+constexpr uint32_t PostboxLayoutMagic = 0x59414C50;   // "PLAY"
+constexpr uint32_t PostboxLayoutVersion = 1;
+constexpr uint32_t PostboxMaxSections = 8;
+
+enum PostboxPageFlags : uint32_t
+{
+    PostboxPageRx = 0,              // executable, read-only
+    PostboxPageRwNx = 1,            // writable, non-executable
+    PostboxPageRNx = 2,             // read-only, non-executable
+};
+
+struct PostboxSectionLayout
+{
+    uint32_t Rva;
+    uint32_t Size;
+    uint32_t Flags;                 // PostboxPageFlags
+    uint32_t Reserved;
+};
+
+struct PostboxImageLayout
+{
+    uint32_t Magic;                 // PostboxLayoutMagic
+    uint32_t Version;               // PostboxLayoutVersion
+    uint32_t ImageSize;             // SizeOfImage
+    uint32_t SectionCount;          // header entry + PE sections, <= PostboxMaxSections
+    uint64_t RawBase;               // pool allocation base (may precede ImageBase)
+    uint64_t ImageBase;             // aligned mapped image base
+    uint64_t AllocSize;             // page-rounded pool allocation size
+    uint64_t Reserved;
+    PostboxSectionLayout Sections[PostboxMaxSections];
+};
+
+static_assert(sizeof(PostboxSectionLayout) == 16, "section layout changed");
+static_assert(sizeof(PostboxImageLayout) == 0xB0, "image layout changed");
+
 // Passed from the loader to DriverEntry in the second argument. Version 3.
 struct PostboxConfig
 {
@@ -67,6 +107,7 @@ struct PostboxConfig
     uint64_t CreateTime;            // required client process creation time
     uint64_t SessionId;             // client-generated session ID
     uint8_t Reserved2[16];          // keeps the config at 0x58
+    PostboxImageLayout Layout;      // loader-built image section map
 };
 
 // Client -> loader handoff, written at the start of the mailbox body before the first ping.
@@ -81,7 +122,8 @@ struct PostboxHandoff
 };
 static_assert(sizeof(PostboxHandoff) == 0x38, "PostboxHandoff layout changed");
 
-static_assert(sizeof(PostboxConfig) == 0x58, "PostboxConfig layout changed");
+static_assert(sizeof(PostboxConfig) == 0x108, "PostboxConfig layout changed");
 static_assert(offsetof(PostboxConfig, CreateTime) == 0x38, "CreateTime offset changed");
 static_assert(offsetof(PostboxConfig, SessionId) == 0x40, "SessionId offset changed");
 static_assert(offsetof(PostboxConfig, Reserved2) == 0x48, "Reserved2 offset changed");
+static_assert(offsetof(PostboxConfig, Layout) == 0x58, "Layout offset changed");

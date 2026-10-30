@@ -77,6 +77,20 @@ using FnPsGetProcessCreateTimeQuadPart = int64_t (*)(void*);
 using FnExAllocatePoolWithTag = void* (*)(uint32_t, size_t, uint32_t);
 using FnExFreePool = void (*)(void*);
 
+// MM_COPY_ADDRESS is a union of PVOID/PHYSICAL_ADDRESS; 8 bytes on x64.
+union PostboxCopyAddress
+{
+    void* VirtualAddress;
+    int64_t PhysicalAddress;
+};
+static_assert(sizeof(PostboxCopyAddress) == 8, "MM_COPY_ADDRESS ABI changed");
+
+using FnMmCopyMemory = int32_t (*)(void* Target, PostboxCopyAddress Source,
+                                   size_t Size, uint32_t Flags, size_t* Done);
+using FnMmCopyVirtualMemory = int32_t (*)(void* SourceProcess, void* SourceAddress,
+                                          void* TargetProcess, void* TargetAddress,
+                                          size_t Size, int32_t PreviousMode, size_t* Done);
+
 static address g_KeInitializeTimerEx = 0;
 static address g_KeInitializeDpc = 0;
 static address g_KeSetCoalescableTimer = 0;
@@ -93,6 +107,8 @@ static address g_PsReleaseProcessExitSynchronization = 0;
 static address g_PsGetProcessCreateTimeQuadPart = 0;
 static address g_ExAllocatePoolWithTag = 0;
 static address g_ExFreePool = 0;
+static address g_MmCopyMemory = 0;
+static address g_MmCopyVirtualMemory = 0;
 
 static PostboxTimer PostboxTimerObject;
 static PostboxDpc PostboxDpcObject;
@@ -123,7 +139,123 @@ bool PostboxNmiSelfTest(uint64_t* Count);
 uint64_t PostboxNmiCount();
 #endif
 
-constexpr uint64_t PostboxUserLimit = 0x0000800000000000ull;
+// MmCopyMemory's documented user path stops below MmUserProbeAddress, not at 2^47.
+// Use the tighter bound for every mailbox/target range check so a request near the
+// old limit fails cleanly in PostboxCopy instead of inside the API.
+constexpr uint64_t PostboxUserLimit = 0x00007FFFFFFF0000ull;
+
+// The linker-defined image base. A RIP-relative reference resolves to the runtime
+// pool base after the loader applies relocations, so this is the mapped image base.
+extern "C" _IMAGE_DOS_HEADER __ImageBase;
+
+// Walk the live tables to the 4 KB PTE for Va. Large-page mappings are refused:
+// the image is a page-granular pool block, so a 2 MB/1 GB entry means the layout
+// cannot be applied safely.
+static bool GetPteForVa(address Va, cr3 Cr3, address& EntryPa, pte& Entry)
+{
+    pml4e PML4E{};
+    if (!AccessPhysicalMemory({(Cr3.pml4_frame_number << 12) + Va.p4_index * 8}, Page_4KB, PML4E) ||
+        !PML4E.present) return false;
+
+    pdpe PDPTE{};
+    if (!AccessPhysicalMemory({(PML4E.page_frame_number << 12) + Va.p3_index * 8}, Page_4KB, PDPTE) ||
+        !PDPTE.present || ((pdpe_1gb) PDPTE).page_size) return false;
+
+    pde PDE{};
+    if (!AccessPhysicalMemory({(PDPTE.page_frame_number << 12) + Va.p2_index * 8}, Page_4KB, PDE) ||
+        !PDE.present || ((pde_2mb) PDE).page_size) return false;
+
+    EntryPa = address((PDE.page_frame_number << 12) + Va.p1_index * 8);
+    return AccessPhysicalMemory(EntryPa, Page_4KB, Entry) && Entry.present;
+}
+
+// Set W and NX on one 4 KB image page. The PTE is written through the physical
+// mapping path, then invlpg flushes the current CPU. The loader pins the
+// map/copy/entry thread to one CPU, so no other CPU has a stale image TLB entry.
+static bool SetPageProtection(address Va, bool Write, bool Execute)
+{
+    address EntryPa{};
+    pte Entry{};
+    if (!GetPteForVa(Va, GetSystemCr3(), EntryPa, Entry)) return false;
+
+    Entry.write = Write ? 1 : 0;
+    Entry.execute_disable = Execute ? 0 : 1;
+    if (!AccessPhysicalMemory(EntryPa, (void*) &Entry, sizeof(Entry), Page_4KB, true))
+        return false;
+
+    invlpg(Va);
+    return true;
+}
+
+// Apply the loader-built section map to the image block. The header and
+// .pdata/.reloc are zeroed in the mapped image, so this map is the only source of
+// section permissions. Every page from ImageBase to the page-rounded end of the
+// pool block is covered: .text RX, writable sections RW/NX, everything else
+// (header, .rdata, .pdata, .reloc, .pbox, padding) R/NX. No page is left RWX.
+bool ProtectImageSections(const PostboxConfig* Config)
+{
+    if (!Config || Config->Layout.Magic != PostboxLayoutMagic ||
+        Config->Layout.Version != PostboxLayoutVersion)
+    {
+        print(ERROR("Postbox: image layout missing or invalid"));
+        return false;
+    }
+
+    const PostboxImageLayout& L = Config->Layout;
+    if (L.ImageSize == 0 || L.AllocSize == 0 || L.SectionCount == 0 ||
+        L.SectionCount > PostboxMaxSections)
+        return false;
+
+    const address ImageBase = address((uint64_t) (uintptr_t) &__ImageBase);
+    if ((uint64_t) ImageBase != L.ImageBase || (L.ImageBase & 0xFFF) != 0)
+    {
+        print(ERROR("Postbox: image base mismatch (runtime %p, layout %p)"),
+              (void*) (uintptr_t) ImageBase, (void*) (uintptr_t) L.ImageBase);
+        return false;
+    }
+
+    const uint64_t End = (L.RawBase + L.AllocSize) & ~0xFFFull;
+    if (L.ImageBase < L.RawBase || L.ImageBase >= End ||
+        L.ImageBase + L.ImageSize > End)
+    {
+        print(ERROR("Postbox: image layout range is invalid"));
+        return false;
+    }
+
+    uint32_t Pages = 0;
+    for (uint64_t Va = L.ImageBase; Va < End; Va += 0x1000)
+    {
+        uint32_t Flags = PostboxPageRNx;
+        for (uint32_t i = 0; i < L.SectionCount; ++i)
+        {
+            const PostboxSectionLayout& S = L.Sections[i];
+            const uint64_t SecStart = L.ImageBase + S.Rva;
+            const uint64_t SecEnd = SecStart + S.Size;
+            const uint64_t PageEnd = Va + 0x1000;
+            if (PageEnd <= (SecStart & ~0xFFFull) ||
+                Va >= ((SecEnd + 0xFFF) & ~0xFFFull))
+                continue;
+
+            if (S.Flags == PostboxPageRx)
+                Flags = PostboxPageRx;
+            else if (S.Flags == PostboxPageRwNx && Flags != PostboxPageRx)
+                Flags = PostboxPageRwNx;
+        }
+
+        const bool Write = (Flags == PostboxPageRwNx);
+        const bool Execute = (Flags == PostboxPageRx);
+        if (!SetPageProtection(address(Va), Write, Execute))
+        {
+            print(ERROR("Postbox: protect page %p failed"), (void*) (uintptr_t) Va);
+            return false;
+        }
+        ++Pages;
+    }
+
+    print(INFO("Postbox: image protections applied (%u pages, %u sections)"),
+          Pages, L.SectionCount);
+    return true;
+}
 
 static void PostboxPoll();
 
@@ -153,14 +285,16 @@ static bool PostboxResolve()
         "QtHfuQspdfttDsfbufUjnfRvbeQbsu",
         "FyBmmpdbufQppmXjuiUbh",          // ExAllocatePoolWithTag
         "FyGsffQppm",                      // ExFreePool
+        "NnDpqzNfnpsz",                    // MmCopyMemory
+        "NnDpqzWjsuvbmNfnpsz",             // MmCopyVirtualMemory
     };
 
     // The resolve table is stored ROT1-encoded so the image does not carry the plaintext
     // export names. This is anti-static-scan, not secrecy: it is decoded in a stack buffer
     // and wiped after the resolve. The resolved pointers remain in .data.
-    char Decoded[16][40] = {};
-    const char* Names[16] = {};
-    for (uint32_t i = 0; i < 16; ++i)
+    char Decoded[18][40] = {};
+    const char* Names[18] = {};
+    for (uint32_t i = 0; i < 18; ++i)
     {
         uint32_t j = 0;
         for (; j < 39 && EncodedNames[i][j]; ++j)
@@ -169,8 +303,8 @@ static bool PostboxResolve()
         Names[i] = Decoded[i];
     }
 
-    address Functions[16] = {};
-    FindFuncExportsBatch(Ntoskrnl, Names, Functions, 16);
+    address Functions[18] = {};
+    FindFuncExportsBatch(Ntoskrnl, Names, Functions, 18);
 
     g_KeInitializeTimerEx = Functions[0];
     g_KeInitializeDpc = Functions[1];
@@ -188,13 +322,15 @@ static bool PostboxResolve()
     g_PsGetProcessCreateTimeQuadPart = Functions[13];
     g_ExAllocatePoolWithTag = Functions[14];
     g_ExFreePool = Functions[15];
+    g_MmCopyMemory = Functions[16];
+    g_MmCopyVirtualMemory = Functions[17];
 
-    for (uint32_t i = 0; i < 16; ++i)
+    for (uint32_t i = 0; i < 18; ++i)
     {
         if (!Functions[i])
         {
             print(ERROR("Postbox: export %s not found"), Names[i]);
-            for (uint32_t k = 0; k < 16; ++k)
+            for (uint32_t k = 0; k < 18; ++k)
             {
                 volatile char* p = Decoded[k];
                 for (uint32_t j = 0; j < 40; ++j) p[j] = 0;
@@ -202,12 +338,44 @@ static bool PostboxResolve()
             return false;
         }
     }
-    for (uint32_t i = 0; i < 16; ++i)
+    for (uint32_t i = 0; i < 18; ++i)
     {
         volatile char* p = Decoded[i];
         for (uint32_t j = 0; j < 40; ++j) p[j] = 0;
     }
     return true;
+}
+
+// The worker is attached to MailboxProcess and holds its exit synchronization, so
+// UserVa is in the current address space. Reads use MmCopyMemory (documented,
+// fault-tolerant, no PTE); writes use MmCopyVirtualMemory (kernel stage -> user
+// target, returns a status instead of raising). Both are PASSIVE/APC-safe; the
+// stage and stack targets are nonpageable. This removes the user-half supervisor
+// PTE that the old AccessVirtualMemory path created on every poll.
+static bool PostboxCopy(void* MailboxProcess, address UserVa, void* Buffer,
+                        size_t Size, bool Write)
+{
+    if (!Size) return true;
+    if ((uint64_t) UserVa >= PostboxUserLimit ||
+        Size > PostboxUserLimit - (uint64_t) UserVa)
+        return false;
+
+    size_t Done = 0;
+    int32_t Status;
+    if (!Write)
+    {
+        PostboxCopyAddress Source{};
+        Source.VirtualAddress = (void*) (uintptr_t) UserVa;
+        Status = ((FnMmCopyMemory) g_MmCopyMemory)(
+            Buffer, Source, Size, 2 /* MM_COPY_MEMORY_VIRTUAL */, &Done);
+    }
+    else
+    {
+        Status = ((FnMmCopyVirtualMemory) g_MmCopyVirtualMemory)(
+            MailboxProcess, Buffer, MailboxProcess, (void*) (uintptr_t) UserVa,
+            Size, 0 /* KernelMode */, &Done);
+    }
+    return Status >= 0 && Done == Size;
 }
 
 // Cancels the timer and waits for queued DPCs. Safe at PASSIVE, including from the work
@@ -248,7 +416,7 @@ static void PostboxIdleTick()
 
 // Authenticated response: seal the body (already staged) first, then the tag, then Status,
 // then Ack. The client treats Ack as the release marker and verifies the tag before use.
-static bool PostboxRespond(uint64_t MailboxVa, cr3 MailboxCr3, uint32_t Seq, uint64_t Nonce,
+static bool PostboxRespond(uint64_t MailboxVa, void* MailboxProcess, uint32_t Seq, uint64_t Nonce,
                            uint32_t RequestOp, int32_t Status, const uint8_t* Body,
                            uint32_t BodyLen)
 {
@@ -257,22 +425,22 @@ static bool PostboxRespond(uint64_t MailboxVa, cr3 MailboxCr3, uint32_t Seq, uin
                        RequestOp, Body, BodyLen);
 
     if (BodyLen != 0 &&
-        !AccessVirtualMemory((address) (MailboxVa + PostboxDataAt), MailboxCr3,
-                             (void*) Body, BodyLen, true))
+        !PostboxCopy(MailboxProcess, (address) (MailboxVa + PostboxDataAt),
+                     (void*) Body, BodyLen, true))
         return false;
 
-    if (!AccessVirtualMemory((address) (MailboxVa + offsetof(PostboxHeader, Mac)), MailboxCr3,
-                             (address) (uintptr_t) Tag, sizeof(Tag), true))
-        return false;
-
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    if (!AccessVirtualMemory((address) (MailboxVa + offsetof(PostboxHeader, Status)), MailboxCr3,
-                             &Status, sizeof(Status), true))
+    if (!PostboxCopy(MailboxProcess, (address) (MailboxVa + offsetof(PostboxHeader, Mac)),
+                     Tag, sizeof(Tag), true))
         return false;
 
     __atomic_thread_fence(__ATOMIC_RELEASE);
-    return AccessVirtualMemory((address) (MailboxVa + offsetof(PostboxHeader, Ack)), MailboxCr3,
-                               &Seq, sizeof(Seq), true);
+    if (!PostboxCopy(MailboxProcess, (address) (MailboxVa + offsetof(PostboxHeader, Status)),
+                     &Status, sizeof(Status), true))
+        return false;
+
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    return PostboxCopy(MailboxProcess, (address) (MailboxVa + offsetof(PostboxHeader, Ack)),
+                       &Seq, sizeof(Seq), true);
 }
 
 // Volatile wipe for stack copies of the header/body. The compiler must not elide it.
@@ -340,10 +508,8 @@ static void PostboxPollAttached(void* MailboxProcess)
     const uint64_t MailboxVa = PostboxCfg.MailboxVa;
     if (!MailboxPid || !MailboxVa) return;
 
-    const cr3 MailboxCr3 = ((_KPROCESS*) MailboxProcess)->DirectoryTableBase;
-
     PostboxHeader Sealed{};
-    if (!AccessVirtualMemory((address) MailboxVa, MailboxCr3, &Sealed, sizeof(Sealed)))
+    if (!PostboxCopy(MailboxProcess, (address) MailboxVa, &Sealed, sizeof(Sealed), false))
     {
         PostboxWipe(&Sealed, sizeof(Sealed));
         PostboxDeadTick();
@@ -416,7 +582,7 @@ static void PostboxPollAttached(void* MailboxProcess)
 
     const address DataVa = (address) (MailboxVa + PostboxDataAt);
     if (BodyLen != 0 &&
-        !AccessVirtualMemory(DataVa, MailboxCr3, (address) (uintptr_t) PostboxStage, BodyLen))
+        !PostboxCopy(MailboxProcess, DataVa, PostboxStage, BodyLen, false))
     {
         PostboxWipe(&Plain, sizeof(Plain));
         PostboxWipe(&Sealed, sizeof(Sealed));
@@ -475,15 +641,15 @@ static void PostboxPollAttached(void* MailboxProcess)
         else if (Op == pb_write)
         {
             pb::OpenRequestBody(PostboxStage, Size, PostboxKeys, PostboxSessionId, Sealed.Nonce);
-            const bool Ok = AccessVirtualMemory((address) Address, MailboxCr3,
-                                                (address) (uintptr_t) PostboxStage, Size, true);
+            const bool Ok = PostboxCopy(MailboxProcess, (address) Address,
+                                        PostboxStage, Size, true);
             Status = Ok ? 0 : (int32_t) 0xC0000005;
             PostboxWipe(PostboxStage, Size);
         }
         else
         {
-            const bool Ok = AccessVirtualMemory((address) Address, MailboxCr3,
-                                                (address) (uintptr_t) PostboxStage, Size);
+            const bool Ok = PostboxCopy(MailboxProcess, (address) Address,
+                                        PostboxStage, Size, false);
             if (Ok)
             {
                 pb::SealResponseBody(PostboxStage, Size, PostboxKeys, PostboxSessionId, Sealed.Nonce);
@@ -542,9 +708,9 @@ static void PostboxPollAttached(void* MailboxProcess)
     // timeout/body-overwrite race; the stage keeps the MAC and the published bytes identical.
     uint32_t CurrentSeq = 0;
     uint64_t CurrentNonce = 0;
-    if (!AccessVirtualMemory((address) MailboxVa, MailboxCr3, &CurrentSeq, sizeof(CurrentSeq)) ||
-        !AccessVirtualMemory((address) (MailboxVa + offsetof(PostboxHeader, Nonce)), MailboxCr3,
-                             &CurrentNonce, sizeof(CurrentNonce)) ||
+    if (!PostboxCopy(MailboxProcess, (address) MailboxVa, &CurrentSeq, sizeof(CurrentSeq), false) ||
+        !PostboxCopy(MailboxProcess, (address) (MailboxVa + offsetof(PostboxHeader, Nonce)),
+                     &CurrentNonce, sizeof(CurrentNonce), false) ||
         CurrentSeq != Seq || CurrentNonce != Sealed.Nonce)
     {
         PostboxWipe(&Plain, sizeof(Plain));
@@ -553,7 +719,7 @@ static void PostboxPollAttached(void* MailboxProcess)
         return;
     }
 
-    PostboxRespond(MailboxVa, MailboxCr3, Seq, Sealed.Nonce, Op, Status, ResponseBody, ResponseLen);
+    PostboxRespond(MailboxVa, MailboxProcess, Seq, Sealed.Nonce, Op, Status, ResponseBody, ResponseLen);
     PostboxWipe(PostboxStage, StageBytes);
 
     if (Op == pb_stop)

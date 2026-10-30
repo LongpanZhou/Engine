@@ -49,7 +49,7 @@ client process (mailbox owner)              kernel
 +-------------------------------+            +-----------------------------------+
 | private page / heap arena     |  CR3       | PostboxWorkRoutine (PASSIVE)      |
 | PostboxHeader + body          |<-----------|   PsLookupProcessByProcessId      |
-| Seq/Ack/Op/Pid/Size/Address   |            |   AccessVirtualMemory / CopyVM    |
+| Seq/Ack/Op/Pid/Size/Address   |            |   MmCopyMemory / MmCopyVirtualMemory |
 +-------------------------------+            |   execute, write Status + Ack     |
         ^                                    +-----------------------------------+
         | client polls Ack (frame loop or Sleep)             ^
@@ -63,14 +63,13 @@ client process (mailbox owner)              kernel
 ### 2.1 Data location
 
 The mailbox is a 64 KiB private committed region owned by the client. The client can allocate it with
-`VirtualAlloc` or inside its existing heap. The driver reads and writes it through the target `CR3`
-with the existing manual page-table walk (`AccessVirtualMemory`, `CopyVirtualMemory` in `Mem.cpp`),
-so there is no `MmCopyVirtualMemory` call. The mapped profile compiles out the dedicated map table
-(`NO_MAP_TABLE`); the walk's map step claims a free PTE in the **current** process, and a system worker
-has no suitable user page table. The work item therefore attaches to the mailbox process
-(`KeStackAttachProcess`) for the duration of the poll, which gives the walk the client's user page
-tables. It is a transient context switch per poll, not a persistent thread; the worker detaches before
-the process reference is dropped. The page's VAD and PTE both describe a normal private page; there is
+`VirtualAlloc` or inside its existing heap. The driver reads it with `MmCopyMemory` and writes it with
+`MmCopyVirtualMemory`; both run in the already-attached worker and return a status instead of raising.
+This removes the user-half supervisor PTE that the old manual page-table walk created on every poll.
+The work item still attaches to the mailbox process (`KeStackAttachProcess`) for the duration of the
+poll, so `MmCopyMemory` sees the client's user address space and `MmCopyVirtualMemory` does not need an
+internal attach. It is a transient context switch per poll, not a persistent thread; the worker detaches
+before the process reference is dropped. The page's VAD and PTE both describe a normal private page; there is
 no section or prototype PTE, and no persistent kernel mapping; each poll claims a transient kernel PTE
 in the client's page tables and releases it with `invlpg` before returning.
 
@@ -278,9 +277,8 @@ item is queued. `DelayedWorkQueue` is used (variable priority), not `CriticalWor
    reused by another process is rejected instead of being attached at the old mailbox VA.
 2. `PsAcquireProcessExitSynchronization(MailboxProcess)`; on `STATUS_PROCESS_IS_TERMINATING` the
    acquire failed, so dereference and idle without attaching or releasing. Otherwise
-   `KeStackAttachProcess(MailboxProcess, &ApcState)`, then `MailboxCr3` from
-   `_KPROCESS::DirectoryTableBase`.
-3. Read the sealed `PostboxHeader` with `AccessVirtualMemory`.
+   `KeStackAttachProcess(MailboxProcess, &ApcState)`.
+3. Read the sealed `PostboxHeader` with `MmCopyMemory` (via `PostboxCopy`).
 4. If `Seq` is not exactly `LastSeq + 1` (wrap-safe), or `SessionId` differs from the configured
    session, or `Nonce <= LastNonce`, count an idle tick; detach; return. A same-`Seq` request is
    considered only for an authenticated `pb_stop` (the client reuses the last `Seq` after a lost
@@ -290,9 +288,9 @@ item is queued. `DelayedWorkQueue` is used (variable priority), not `CriticalWor
 6. For `pb_write`, copy the body ciphertext into the static `PostboxStage`; compute the request tag over
    the original sealed header and staged body and compare it constant-time. A failure does not advance
    `LastSeq`/`LastNonce` and does not write `Ack`.
-7. Only after the tag verifies, trust `Op`/`Size`/`Address`: read/write uses `CopyVirtualMemory` with
-   `MailboxCr3`; write decrypts the staged body and copies from the stage, read copies into the stage
-   and seals the response body there.
+7. Only after the tag verifies, trust `Op`/`Size`/`Address`: read/write uses `PostboxCopy`
+   (`MmCopyMemory` for reads, `MmCopyVirtualMemory` for writes); write decrypts the staged body and
+   copies from the stage, read copies into the stage and seals the response body there.
 8. Re-read `Seq`; if the client has moved on, drop the response. Otherwise write `Mac`, `Status`, `Ack`
    in that order (body first for a read), with release fences.
 9. `KeUnstackDetachProcess`, then release the exit synchronization and dereference the process.
@@ -488,20 +486,19 @@ Expected evidence (AC-25 §8):
   while the gate is installed, `sidt`/IDTR points at the driver image's 4 KiB table and vector 2 is
   `PostboxNmiStub`. The self-test is proven by `nmi: self-test handled=1`, not by the tick delta.
 
-**Live result (2026-10-29, 19041 clone):** the NMI build (27,648 bytes, `entryRva=0x479C`,
-`SizeOfImage=0xB000`, SHA-256 `ab909f65...`) returned entry success with
-`postbox: pid 4592 mailbox 0x1A0000`; the client reported `ping`, `read`, `write`, an invalid read
+**Live result (2026-10-30, 19041 clone):** the NMI build (28,672 bytes, `entryRva=0x434D`,
+`SizeOfImage=0xB000`, SHA-256 `4d70a9c9...`) returned entry success at image
+`0xFFFFA3870DE37000`; client PID 2140 reported `ping`, `read`, `write`, an invalid read
 (`0xC0000005`), `nmi: count=0`, `nmi: self-test handled=1`, `stop`, and a `0x8000`-byte bulk
 write/read all as expected (`read: x=1111 y=1111`, `write: x=4242 y=4242`, `bulk read: match=1`).
-The NMI-off build (25,600 bytes, `entryRva=0x3F31`, SHA-256 `0f0a5caa...`) passed the same six
-operations without the NMI op. A corrupted `PBK1` key produced no ACK and a client auth failure;
-after the watchdog, `!idt 2` was back on `nt!KiNmiInterrupt`; the NMI gate is transient, so `r idtr` is Windows after the self-test. The mapper skips `.pbox`, so the mapped image has no `PBOXABI` marker. The request/response MAC and ChaCha20
-header/body path are live; the client generated the key/session and the loader consumed the `PBK1`
-handoff. An earlier build failed the header read because `AccessVirtualMemory`'s `NO_MAP_TABLE` PTE
-claim ran in the System process; attaching the worker to the mailbox process fixed it. The
-`!timer`/`!thread`/`!vtop` transcript is in `out/vm-test/postbox-l6-20261029/kd-final.txt`; the
-timer/DPC are in the driver image, `KTIMER.Period=4 ms`, and raw `KTIMER.Dpc` is encoded on 19041.
-Evidence: `out/vm-test/postbox-l6-20261029/`.
+The NMI-off build (25,600 bytes, `entryRva=0x3A78`, SHA-256 `1412e4a7...`) passed the same six
+operations without the NMI op. The image PTE split is live: base R/NX, `.text` RX, `.data` RW/NX;
+no page in the block is RWX. The NMI table and saved IDTRs are wiped after the self-test, and
+`r idtr` is Windows. The mapper skips `.pbox`, so the mapped image has no `PBOXABI` marker. The
+request/response MAC and ChaCha20 header/body path are live; the client generated the key/session
+and the loader consumed the `PBK1` handoff. Reads use `MmCopyMemory`; writes use
+`MmCopyVirtualMemory`; the old `AccessVirtualMemory` user-half supervisor PTE is gone. Evidence:
+`out/vm-test/postbox-protect-20261030/`.
 
 ## 8. Current limitations
 
@@ -523,10 +520,11 @@ Evidence: `out/vm-test/postbox-l6-20261029/`.
    `Windows 10 x64-Snapshot1.vmem` is missing; `vmrun start` aborts and the snapshot was not modified.
    The live run in §7 used the running 19041 clone, not that snapshot; the stack-sampling and
    timer-table experiments still need a bootable lab VM.
-5. **Residual artifacts.** The armed `KTIMER`, the transient worker frame, the per-poll
-   `KeStackAttachProcess` context switch, and the transient client PTE claimed by `AccessVirtualMemory`
-   are inherent to this design; AC-25 §6 covers their detection risk. The payload image remains the
-   dominant problem (AC-12/AC-13): an unbacked executable image is caught regardless of the channel.
+5. **Residual artifacts.** The armed `KTIMER`, the transient worker frame, and the per-poll
+   `KeStackAttachProcess` context switch remain. The transient client PTE is gone: reads use
+   `MmCopyMemory` and writes use `MmCopyVirtualMemory`. Those exports are high-signal T2 hooks, and
+   bulk writes may allocate a transient `'MmRw'` bounce pool. The payload image is still an unbacked
+   BigPool/no-KLDR allocation; the RWX half is fixed, but private executable PFN provenance remains.
 6. **No HVCI path.** The design needs executable payload code; on HVCI the channel is moot.
 7. **`--free` is disabled.** `mapload --free` is refused for every payload; the
    `--free-unsafe`/`--free-known-safe` flags are compatibility-only. A default-channel or Postbox
@@ -534,8 +532,9 @@ Evidence: `out/vm-test/postbox-l6-20261029/`.
 8. **`arg2` is still build-selected.** `PostboxConfig` carries a magic and version, so the contents
    are validated, but the pointer itself is trusted and dereferenced before the check. A proper
    versioned `Bootstrap` struct is the next step if the loader ever needs to carry both a provider
-   name and the channel config. The loader's config allocation is small pool (`Ntfs`, 0x58 bytes),
-   wiped and freed after `CallEntry` in the current build; the driver .data copy remains until `pb_stop`.
+   name and the channel config. The loader's config allocation is small pool (`Ntfs`, 0x108 bytes;
+   the added `PostboxImageLayout` carries the section map), wiped and freed after `CallEntry` in the
+   current build; the driver .data copy remains until `pb_stop`.
 
 9. **NMI gate is a transient IDT/IDTR artifact.** During `pb_nmi Address=1`, `sidt` returns the
    constructed 4 KiB table in the driver image and vector 2 is `PostboxNmiStub`; the Windows IDT is
@@ -574,9 +573,9 @@ contains these fixes:
 | Forged future `Seq` / client restart | fixed for replay/desync/forgery: only `LastSeq + 1`, the configured `SessionId`, and a higher `Nonce` are accepted; the MAC rejects a request without the key. A crashed client still needs a remap |
 | Process exit could tear down page tables during the walk | fixed: `PsAcquireProcessExitSynchronization` returns `STATUS_PROCESS_IS_TERMINATING` when rundown is active; on failure the driver dereferences and idles without attaching or releasing |
 | Timer armed before `LinkMapTable`/PE-header cleanup | fixed: `PostboxStart` is step 6, at the end of `DriverEntry` |
-| `arg2` type confusion | mitigated: `PostboxConfig` has a magic + version and is 0x58 bytes; a versioned `Bootstrap` struct is the next step |
+| `arg2` type confusion | mitigated: `PostboxConfig` has a magic + version and is 0x108 bytes; a versioned `Bootstrap` struct is the next step |
 
-Remaining, deliberately: the per-poll attach and transient client PTE are residual artifacts; `User.exe` carries both clients; the NMI build's constructed IDT exists only during `pb_nmi Address=1`; E3/E4 need a bootable lab VM; the tamper-negative test on the pre-marker build is superseded by the current run. The review's P2 items
+Remaining, deliberately: the per-poll attach remains; the transient client PTE is gone (`MmCopyMemory`/`MmCopyVirtualMemory`); `User.exe` carries both clients; the NMI constructed IDT is wiped after `pb_nmi Address=1` (its static storage remains); E3/E4 need a bootable lab VM; the tamper-negative test on the pre-marker build is superseded by the current run. The review's P2 items
 (stack budget, `PostboxStop` dead path, second-stop idempotence, config-page leak on a killed paused
 run) are documented in the relevant sections and are not fixed in the prototype.
 
