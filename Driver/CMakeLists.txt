@@ -30,30 +30,58 @@ else()
     set(VARIANT_DEFINES NDEBUG)
 endif()
 
-# Test builds can skip the SeCiCallbacks hook: trace cleaning does not need it, and PatchGuard eventually
-# bugchecks 0x109. The define is intentionally valueless (main.cpp uses #ifndef NO_HOOK), so never emit
-# NO_HOOK=0
-option(NO_HOOK "Skip the NtCompareSigningLevels hook (avoids PatchGuard 0x109 in test builds)" OFF)
-if(NO_HOOK)
-    list(APPEND VARIANT_DEFINES NO_HOOK)
+# Mapped-payload profile: nothing may be left standing in the kernel that a checker can diff. The
+# dedicated map table is a PTE/PFN audit artifact, so it is compiled out here. MAPPED_SAFE=OFF
+# restores the stock behaviour
+option(MAPPED_SAFE "Compile the mapped-payload profile: no dedicated map table" ON)
+if(MAPPED_SAFE)
+    list(APPEND VARIANT_DEFINES NO_MAP_TABLE)
 endif()
 
-# Mapped-payload profile: nothing may be left standing in the kernel that a checker can diff. The
-# SeCiCallbacks hook is a PatchGuard 0x109 and the dedicated map table is a PTE/PFN audit artifact, so
-# both are compiled out together. MAPPED_SAFE=OFF restores the stock behaviour (NO_HOOK still independent)
-option(MAPPED_SAFE "Compile the mapped-payload profile: no CI hook, no dedicated map table" ON)
-if(MAPPED_SAFE)
-    list(APPEND VARIANT_DEFINES NO_HOOK NO_MAP_TABLE)
+# Channel selection: the default is the named-section/system-thread channel in Channel.cpp.
+# POSTBOX_CHANNEL replaces it with the timer/work-item mailbox (AC-25). The Postbox build is
+# manual-map only: the entry's second argument is a PostboxConfig, not a provider image name.
+option(POSTBOX_CHANNEL "Use the timer/work-item Postbox channel instead of the named section" OFF)
+if(POSTBOX_CHANNEL)
+    list(APPEND VARIANT_DEFINES POSTBOX_CHANNEL)
+endif()
+
+# Manual-map-only profile: the Postbox build is never loaded by SCM. Exclude the
+# loader trace cleaners (Traces.cpp) and the hide/relink code (Hide.cpp), and stub
+# DriverExit to stop the timer and unlink the map table only. This removes dead
+# cleaner/lineage code from the mapped image.
+option(MANUAL_MAP_ONLY "Build a manual-map-only driver (requires POSTBOX_CHANNEL)" OFF)
+if(MANUAL_MAP_ONLY)
+    if(NOT POSTBOX_CHANNEL)
+        message(FATAL_ERROR "MANUAL_MAP_ONLY requires POSTBOX_CHANNEL=ON")
+    endif()
+    list(APPEND VARIANT_DEFINES MANUAL_MAP_ONLY)
+endif()
+
+# NMI gate: an opt-in extension of the Postbox build. It installs a constructed
+# IDT with vector 2 pointing at the assembly trampoline in PostboxNmi.S, and adds
+# the pb_nmi query/self-test op. The default Postbox build keeps the unmodified
+# Windows IDT; see AC-25/AC-26 for the detection tradeoff.
+option(POSTBOX_NMI "Install the constructed-IDT NMI gate (requires POSTBOX_CHANNEL)" OFF)
+set(POSTBOX_NMI_SOURCES)
+if(POSTBOX_NMI)
+    if(NOT POSTBOX_CHANNEL)
+        message(FATAL_ERROR "POSTBOX_NMI requires POSTBOX_CHANNEL=ON")
+    endif()
+    enable_language(ASM)
+    list(APPEND VARIANT_DEFINES POSTBOX_NMI)
+    list(APPEND POSTBOX_NMI_SOURCES PostboxNmi.S)
 endif()
 
 # Driver entry point
 wdk_add_driver(Driver
         main.cpp
+        ${POSTBOX_NMI_SOURCES}
 )
 
 # All defines in one place: the shared seed plus the variant switch. _ITERATOR_DEBUG_LEVEL=0 turns the
-# STL's debug checks off, which -nostdlib (no CRT) cannot satisfy. NO_HOOK can arrive from either option,
-# so collapse duplicates before the list becomes compiler flags
+# STL's debug checks off, which -nostdlib (no CRT) cannot satisfy. VARIANT_DEFINES can arrive from more
+# than one option, so collapse duplicates before the list becomes compiler flags
 list(REMOVE_DUPLICATES VARIANT_DEFINES)
 target_compile_definitions(Driver
         PRIVATE SEED=${SEED_VALUE} ${VARIANT_DEFINES} _ITERATOR_DEBUG_LEVEL=0

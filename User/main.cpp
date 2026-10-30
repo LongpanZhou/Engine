@@ -1,66 +1,186 @@
-// User.exe: the command side of the NtCompareSigningLevels channel. Sends one Command to the
-// hooked driver (ping, read, write) and prints each response
+// User.exe: the user side of the shared-memory channel. Maps
+// Global\EngineCiShared and runs ping / read / write against the mapped driver.
+// No syscall is hooked and no ntdll export is called.
 #include <windows.h>
 #include <cstdint>
+#include <cstring>
+#include <cwchar>
 #include <iostream>
-#include "Strings.h"
 #include "../Common/Command.h"
 
-typedef NTSTATUS(WINAPI* NtCompareSigningLevels)(uint64_t Secret, void* pCommand);
+static ChannelHeader* g_Header = nullptr;
+static uint8_t* g_Data = nullptr;
 
-int main()
+int PostboxClientMain(int argc, char** argv);
+
+static bool Connect()
 {
-    int x, y;
+    const wchar_t* Names[3] = { L"Global\\EngineCiShared", L"EngineCiShared", L"Local\\EngineCiShared" };
+    DWORD LastError = 0;
 
-    // Load ntdll (not import-linked) and resolve the hooked syscall from it
-    HMODULE Dll = LoadLibraryA(Decode(NtdllName).data());
-    if (!Dll) return 1;
+    // Session-independent lookup: ask the object manager directly for the
+    // candidate paths the driver's context may have used.
+    static const wchar_t* NtPaths[3] = {
+        L"\\BaseNamedObjects\\EngineCiShared",
+        L"\\Sessions\\0\\BaseNamedObjects\\EngineCiShared",
+        L"\\Sessions\\1\\BaseNamedObjects\\EngineCiShared",
+    };
 
-    auto Func = (NtCompareSigningLevels)GetProcAddress(Dll, Decode(NtCompareSigningLevelsName).data());
-    if (!Func) return 1;
+    struct US { USHORT Length; USHORT MaximumLength; PWSTR Buffer; };
+    struct OA { ULONG Length; ULONG Pad; HANDLE Root; US* Name; ULONG Attributes;
+                ULONG Pad2; void* Sd; void* Sqos; };
 
-    // Command buffer lives past the syscall return
-    static Command cmd;
-    uint32_t PID = GetCurrentProcessId();
-    std::cout << Decode(PidLabel).data() << PID << std::endl;
+    HMODULE Ntdll = GetModuleHandleW(L"ntdll.dll");
+    auto NtOpenSection = (LONG (NTAPI*)(PHANDLE, ACCESS_MASK, OA*))
+        GetProcAddress(Ntdll, "NtOpenSection");
+    auto NtMapViewOfSection = (LONG (NTAPI*)(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T,
+        PLARGE_INTEGER, PSIZE_T, DWORD, ULONG, ULONG))
+        GetProcAddress(Ntdll, "NtMapViewOfSection");
 
-    uint64_t Response = 0;
-    cmd.SrcAddress = &Response;
-    cmd.DestAddress = nullptr;
-    cmd.SrcPID = PID;
-    cmd.DestPID = PID;      // unused by ping, filled for a uniform command
-    cmd.OpCode = ping;
-    cmd.Size = sizeof(Response);
-    Func(CommandSecret, &cmd);
-    std::cout << ((Response >> 32) == CommandSecret ? "ping: alive, heartbeat " : "ping: NO ANSWER, ")
-              << (Response & 0xFFFFFFFF) << std::endl;
+    for (int attempt = 0; attempt < 40; ++attempt)
+    {
+        for (int i = 0; i < 3; ++i)
+        {
+            SetLastError(0);
+            HANDLE Mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, Names[i]);
+            if (Mapping)
+            {
+                void* View = MapViewOfFile(Mapping, FILE_MAP_ALL_ACCESS, 0, 0, ChannelBytes);
+                CloseHandle(Mapping);
+                if (View)
+                {
+                    ChannelHeader* Header = (ChannelHeader*) View;
+                    for (int spin = 0; spin < 100 && Header->Magic != ChannelMagic; ++spin) Sleep(10);
+                    if (Header->Magic == ChannelMagic)
+                    {
+                        std::cout << "channel: connected (name index " << i << ")" << std::endl;
+                        g_Header = Header;
+                        g_Data = (uint8_t*) View + ChannelDataAt;
+                        return true;
+                    }
+                    UnmapViewOfFile(View);
+                }
+            }
+            LastError = GetLastError();
+        }
 
-    // Read: the driver copies the target (&y -> DestAddress) into our buffer (&x -> SrcAddress)
-    x = 9999, y = 1111;
-    cmd.SrcAddress = &x;
-    cmd.DestAddress = &y;
-    cmd.SrcPID = PID;
-    cmd.DestPID = PID;
-    cmd.OpCode = read;
-    cmd.Size = sizeof(int);
-    Func(CommandSecret,&cmd);
-    std::cout << x << y << std::endl;
-    std::cout << &x << &y << std::endl;
+        if (NtOpenSection && NtMapViewOfSection)
+        {
+            for (int i = 0; i < 3; ++i)
+            {
+                US Name = {};
+                Name.Buffer = (PWSTR) NtPaths[i];
+                Name.Length = (USHORT) (wcslen(NtPaths[i]) * sizeof(wchar_t));
+                Name.MaximumLength = (USHORT) (Name.Length + sizeof(wchar_t));
+                OA Attr = {};
+                Attr.Length = sizeof(Attr);
+                Attr.Name = &Name;
+                Attr.Attributes = 0x40;   // OBJ_CASE_INSENSITIVE
 
-    // Write: the driver copies our buffer (&x -> SrcAddress) into the target (&y -> DestAddress)
-    x = 9999, y = 1111;
-    cmd.SrcAddress = &x;
-    cmd.DestAddress = &y;
-    cmd.SrcPID = PID;
-    cmd.DestPID = PID;
-    cmd.OpCode = write;
-    cmd.Size = sizeof(int);
-    Func(CommandSecret,&cmd);
-    std::cout << x << y << std::endl;
-    std::cout << &x << &y << std::endl;
+                HANDLE Section = NULL;
+                LONG Status = NtOpenSection(&Section, 0x000F001F, &Attr);
+                if (Status >= 0)
+                {
+                    void* Base = nullptr;
+                    SIZE_T Size = 0;
+                    LONG MapStatus = NtMapViewOfSection(Section, GetCurrentProcess(), &Base, 0, 0,
+                                                        nullptr, &Size, 1, 0, PAGE_READWRITE);
+                    std::cout << "channel: nt path " << i << " open=0 map=" << MapStatus << std::endl;
+                    if (MapStatus >= 0 && ((ChannelHeader*) Base)->Magic == ChannelMagic)
+                    {
+                        g_Header = (ChannelHeader*) Base;
+                        g_Data = (uint8_t*) Base + ChannelDataAt;
+                        return true;
+                    }
+                }
+                else if (attempt == 39)
+                {
+                    std::cout << "channel: nt path " << i << " open status 0x"
+                              << std::hex << (ULONG) Status << std::dec << std::endl;
+                }
+            }
+        }
+        Sleep(50);
+    }
 
-    // Keep the console open so the results can be read
-    system("pause");
+    std::cout << "channel: open failed, last error " << LastError << std::endl;
+    return false;
+}
 
-    return NULL;
+// Publishes one request and waits for the driver to acknowledge that sequence
+static bool Submit(uint32_t TimeoutMs)
+{
+    const uint32_t Sequence = g_Header->Sequence + 1;
+    MemoryBarrier();
+    g_Header->Sequence = Sequence;
+    MemoryBarrier();
+
+    for (uint32_t i = 0; i < TimeoutMs; ++i)
+    {
+        if (g_Header->Ack == Sequence)
+        {
+            MemoryBarrier();
+            return true;
+        }
+        Sleep(1);
+    }
+    return false;
+}
+
+static void Request(uint32_t Op, uint32_t Pid, uint64_t Remote, uint32_t Size)
+{
+    g_Header->Op = Op;
+    g_Header->TargetPid = Pid;
+    g_Header->RemoteAddress = Remote;
+    g_Header->Size = Size;
+}
+
+int main(int argc, char** argv)
+{
+    if (argc > 1 && std::strcmp(argv[1], "--postbox") == 0)
+        return PostboxClientMain(argc, argv);
+
+    if (!Connect())
+    {
+        std::cout << "channel: driver not reachable (mapped and running?)" << std::endl;
+        return 1;
+    }
+    std::cout << "channel: connected" << std::endl;
+
+    Request(op_ping, 0, 0, 0);
+    if (!Submit(2000))
+    {
+        std::cout << "ping: timeout" << std::endl;
+        return 1;
+    }
+    std::cout << "ping: status=" << std::hex << g_Header->Status << std::dec
+              << " heartbeat=" << g_Header->Heartbeat << std::endl;
+
+    // read: the driver copies the target VA into the shared data area
+    int x = 9999, y = 1111;
+    Request(op_read, GetCurrentProcessId(), (uint64_t) (uintptr_t) &y, sizeof(int));
+    if (!Submit(2000))
+    {
+        std::cout << "read: timeout" << std::endl;
+        return 1;
+    }
+    memcpy(&x, g_Data, sizeof(int));
+    std::cout << "read: status=" << std::hex << g_Header->Status << std::dec
+              << " x=" << x << " y=" << y << std::endl;
+
+    // write: the driver copies the shared data area into the target VA
+    x = 4242;
+    memcpy(g_Data, &x, sizeof(int));
+    Request(op_write, GetCurrentProcessId(), (uint64_t) (uintptr_t) &y, sizeof(int));
+    if (!Submit(2000))
+    {
+        std::cout << "write: timeout" << std::endl;
+        return 1;
+    }
+    std::cout << "write: status=" << std::hex << g_Header->Status << std::dec
+              << " x=" << x << " y=" << y << std::endl;
+
+    std::cout << "channel: done, press enter to exit" << std::endl;
+    std::cin.get();
+    return 0;
 }

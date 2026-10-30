@@ -1828,7 +1828,7 @@ void VerifyWdFilterDriverList(const _UNICODE_STRING* Target, uint32_t Timestamp)
         if (ReadWdFilterName((uintptr_t) Link, &Name) &&
             HashBucketNameMatches(Name.Buffer, Name.Length / 2, Base, BaseChars))
         {
-            ::print(ERROR("VerifyWdFilter: FAILED, record %p still names this driver (%wZ)"),
+            print(ERROR("VerifyWdFilter: FAILED, record %p still names this driver (%wZ)"),
                   (void*) Link, &Name);
             return;
         }

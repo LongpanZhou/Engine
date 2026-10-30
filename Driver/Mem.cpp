@@ -64,8 +64,10 @@ bool MapInDedicatedTable(address PhysicalAddress, T &&Callback)
         Value.page_frame_number = PhysicalAddress >> 12;
         if (!ClaimEntry(Entry, Value)) continue;
 
-        Callback(address(MapTableBase + (uint64_t) Slot * 0x1000 + PhysicalAddress.offset));
+        const address SlotVa = address(MapTableBase + (uint64_t) Slot * 0x1000 + PhysicalAddress.offset);
+        Callback(SlotVa);
         ReleaseEntry(Entry);
+        invlpg(SlotVa);
         return true;
     }
     return false;
@@ -184,6 +186,13 @@ bool AccessVirtualMemory(address VirtualAddress, cr3 CR3, address pBuffer, size_
     return true;
 }
 
+// Volatile wipe for stack buffers that held plaintext. Kept local so Mem.cpp stays freestanding.
+static void SecureZeroBuffer(void* Data, size_t Size)
+{
+    volatile uint8_t* p = (volatile uint8_t*) Data;
+    while (Size--) *p++ = 0;
+}
+
 // Copies Size bytes between two address spaces through a fixed-size stack buffer, so the kernel stack
 // never depends on the Size the caller sent
 bool CopyVirtualMemory(address SrcAddress, cr3 SrcCR3, address DestAddress, cr3 DestCR3, uint32_t Size)
@@ -194,13 +203,22 @@ bool CopyVirtualMemory(address SrcAddress, cr3 SrcCR3, address DestAddress, cr3 
     while (Size)
     {
         uint32_t Chunk = Size < sizeof(buffer) ? Size : (uint32_t) sizeof(buffer);
-        if (!AccessVirtualMemory(SrcAddress, SrcCR3, (void *) buffer, Chunk, false)) return false;
-        if (!AccessVirtualMemory(DestAddress, DestCR3, (void *) buffer, Chunk, true)) return false;
+        if (!AccessVirtualMemory(SrcAddress, SrcCR3, (void *) buffer, Chunk, false))
+        {
+            SecureZeroBuffer(buffer, sizeof(buffer));
+            return false;
+        }
+        if (!AccessVirtualMemory(DestAddress, DestCR3, (void *) buffer, Chunk, true))
+        {
+            SecureZeroBuffer(buffer, sizeof(buffer));
+            return false;
+        }
 
         SrcAddress = address((uint64_t) SrcAddress + Chunk);
         DestAddress = address((uint64_t) DestAddress + Chunk);
         Size -= Chunk;
     }
+    SecureZeroBuffer(buffer, sizeof(buffer));
     return true;
 }
 
@@ -595,6 +613,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
 
                 Callback(VA);
                 ReleaseEntry((pdpe_1gb *) PDPTE);
+                invlpg(VA);
                 return true;
             }
 
@@ -629,6 +648,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
 
                     Callback(VA);
                     ReleaseEntry((pde_2mb *) PDE);
+                    invlpg(VA);
                     return true;
                 }
 
@@ -639,8 +659,13 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                 // PT
                 address PTTable = GetVirtualAddress({PDE->page_frame_number << 12});
                 if (!PTTable) return false;
-                for (int PT_IDX = 0; PT_IDX < 512; ++PT_IDX)
+                // Rotate the first-free scan so the claimed PTE is not always the
+                // lowest free slot. A detector can still walk the table, but it
+                // cannot learn one deterministic slot and poll it.
+                const uint32_t PteStart = (uint32_t)__rdtsc();
+                for (uint32_t n = 0; n < 512; ++n)
                 {
+                    const int PT_IDX = (int)((PteStart + n) & 511);
                     pte *PTE_4KB = &((pte *) PTTable)[PT_IDX];
                     if (PTE_4KB->present) continue;
 
@@ -660,6 +685,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
 
                     Callback(VA);
                     ReleaseEntry(PTE_4KB);
+                    invlpg(VA);
                     return true;
                 }
             }

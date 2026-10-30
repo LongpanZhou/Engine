@@ -1,17 +1,12 @@
 #pragma once
 
 // Every string the driver uses at runtime, stored encoded so the plain text does not appear in Driver.sys.
-// Decode each one where it is used, for example: EnumerateEProcess(Decode(UserExeName).data())
+// Decode each one where it is used, for example: EnumerateEProcess(Decode(NtoskrnlName).data())
 //
 // Include this after Crypt.cpp and Scan.cpp, which provide Encode/Decode/EncodeBytes and PatternToBytes.
 // Debug messages (print(...)) are not listed here: print() compiles to nothing in release builds.
 
-// The bytes that identify NtCompareSigningLevels in ntoskrnl (? is a wildcard). Stored encoded, like the strings below,
-// so the pattern is decoded with the same SEED it was encoded with
-constexpr auto Signature = EncodeBytes(PatternToBytes("4C 8B 05 ? ? ? ? 33 C0 4D 85 C0 74 ? 49 8B C0 E8 ? ? ? ? F7 D8"));
-
 // Names searched for at runtime
-constexpr auto UserExeName = Encode(L"User.exe");
 constexpr auto NtoskrnlName = Encode("ntoskrnl.exe");
 constexpr auto PageSectionName = Encode("PAGE");
 
