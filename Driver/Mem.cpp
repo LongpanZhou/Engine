@@ -1,3 +1,5 @@
+#include "MemCache.h"
+
 enum pagesize : uint32_t
 {
     Page_4KB,
@@ -338,6 +340,13 @@ constexpr uint64_t MaxScanSteps = 0x4000;
 // pointers are >= 0xFFFF800000000000, so 1 is unambiguous
 constexpr uint64_t Failed = 1;
 
+// Transient cache used before the Postbox state page exists. MemAdoptCaches()
+// moves these values into the state page and zeroes them, so the resident
+// image's .data has no ntoskrnl/PTE-base pointer.
+static uint64_t CachedNtoskrnl = 0;
+static uint64_t CachedPteBase = 0;
+static uint64_t CachedPfnPteAddressBase = 0;
+
 // True when a loader BaseDllName equals Expected (ASCII, case-insensitive). The read is bounded by
 // Name.Length: BaseDllName is a counted string, not necessarily NUL-terminated
 static bool ModuleNameEquals(const _UNICODE_STRING &Name, const char *Expected)
@@ -361,8 +370,9 @@ static bool ModuleNameEquals(const _UNICODE_STRING &Name, const char *Expected)
 address GetNtoskrnl()
 {
     // The base never changes while loaded; the scan costs up to 64 MB of walks, so serve it from cache
-    static uint64_t CachedBase = 0;
-    uint64_t Cached = __atomic_load_n(&CachedBase, __ATOMIC_SEQ_CST);
+    PostboxMemCaches* Caches = PostboxGetMemCaches();
+    uint64_t* Slot = Caches ? &Caches->Ntoskrnl : &CachedNtoskrnl;
+    uint64_t Cached = __atomic_load_n(Slot, __ATOMIC_SEQ_CST);
     if (Cached) return Cached == Failed ? nullptr : (address) Cached;
 
     // Start inside the image (the import slot of PsInitialSystemProcess lands in its data), page-aligned
@@ -397,7 +407,7 @@ address GetNtoskrnl()
                 break;
             }
 
-            __atomic_store_n(&CachedBase, Candidate, __ATOMIC_SEQ_CST);
+            __atomic_store_n(Slot, Candidate, __ATOMIC_SEQ_CST);
             print(INFO("GetNtoskrnl: list walk found ntoskrnl.exe at %p after %llu entries"), (void *) Candidate, Walked);
             return (address) Candidate;
         }
@@ -443,13 +453,13 @@ address GetNtoskrnl()
             continue;
 
         // Match: cache and return
-        __atomic_store_n(&CachedBase, (uint64_t) base, __ATOMIC_SEQ_CST);
+        __atomic_store_n(Slot, (uint64_t) base, __ATOMIC_SEQ_CST);
         print(INFO("GetNtoskrnl: found ntoskrnl.exe at %p after %llu steps"), (void *) base, Steps);
         return base;
     } while (Steps < MaxScanSteps && (base -= 0x1000));
 
     print(ERROR("GetNtoskrnl: NOT FOUND after %llu steps, %llu valid DOS headers"), Steps, MzSeen);
-    __atomic_store_n(&CachedBase, Failed, __ATOMIC_SEQ_CST);
+    __atomic_store_n(Slot, Failed, __ATOMIC_SEQ_CST);
     return nullptr;
 }
 
@@ -491,12 +501,13 @@ static address ExtractImm64(const Pattern<N> &Sig, uint32_t GuardOffset, const c
 // Kernel constant plus a megabytes-scale scan: read once, then cache (same pattern as GetNtoskrnl)
 address GetPteBase()
 {
-    static uint64_t CachedBase = 0;
-    uint64_t Cached = __atomic_load_n(&CachedBase, __ATOMIC_SEQ_CST);
+    PostboxMemCaches* Caches = PostboxGetMemCaches();
+    uint64_t* Slot = Caches ? &Caches->PteBase : &CachedPteBase;
+    uint64_t Cached = __atomic_load_n(Slot, __ATOMIC_SEQ_CST);
     if (Cached) return Cached == Failed ? nullptr : (address) Cached;
 
     address PteBase = ExtractImm64(Decode(PteBaseSignature), 13, "GetPteBase");
-    __atomic_store_n(&CachedBase, PteBase ? (uint64_t) PteBase : Failed, __ATOMIC_SEQ_CST);
+    __atomic_store_n(Slot, PteBase ? (uint64_t) PteBase : Failed, __ATOMIC_SEQ_CST);
     return PteBase;
 }
 
@@ -505,13 +516,28 @@ address GetPteBase()
 // by 8 in the [rax+rdx*8] load). Read once, then cached
 address GetPfnPteAddressBase()
 {
-    static uint64_t CachedBase = 0;
-    uint64_t Cached = __atomic_load_n(&CachedBase, __ATOMIC_SEQ_CST);
+    PostboxMemCaches* Caches = PostboxGetMemCaches();
+    uint64_t* Slot = Caches ? &Caches->PfnPteAddressBase : &CachedPfnPteAddressBase;
+    uint64_t Cached = __atomic_load_n(Slot, __ATOMIC_SEQ_CST);
     if (Cached) return Cached == Failed ? nullptr : (address) Cached;
 
     address PfnPteAddressBase = ExtractImm64(Decode(PfnPteAddressSignature), 17, "GetPfnPteAddressBase");
-    __atomic_store_n(&CachedBase, PfnPteAddressBase ? (uint64_t) PfnPteAddressBase : Failed, __ATOMIC_SEQ_CST);
+    __atomic_store_n(Slot, PfnPteAddressBase ? (uint64_t) PfnPteAddressBase : Failed, __ATOMIC_SEQ_CST);
     return PfnPteAddressBase;
+}
+
+// Called once the Postbox state page exists: copy the transient pre-state cache
+// into the page, then clear the .data slots. Later lookups go through
+// PostboxGetMemCaches() and never touch the statics again.
+void MemAdoptCaches(PostboxMemCaches* Dst)
+{
+    if (!Dst) return;
+    Dst->Ntoskrnl = __atomic_load_n(&CachedNtoskrnl, __ATOMIC_SEQ_CST);
+    Dst->PteBase = __atomic_load_n(&CachedPteBase, __ATOMIC_SEQ_CST);
+    Dst->PfnPteAddressBase = __atomic_load_n(&CachedPfnPteAddressBase, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&CachedNtoskrnl, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&CachedPteBase, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&CachedPfnPteAddressBase, 0, __ATOMIC_SEQ_CST);
 }
 
 // PA -> VA through the self-map: read PfnDatabase[PA >> 12].PteAddress, then the PTE's index in the

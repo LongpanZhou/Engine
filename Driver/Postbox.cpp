@@ -189,6 +189,21 @@ struct PostboxImports
     address MmFreeIndependentPages;
 };
 
+// NMI-gate imports. Kept in the state page so the NMI build's .data does not
+// carry eight ntoskrnl routine pointers. PostboxNmiInstall runs after the state
+// page exists; PostboxNmiUninstall runs before the page is freed.
+struct PostboxNmiImports
+{
+    uint64_t KeQueryActiveProcessors;
+    uint64_t KeQueryActiveProcessorCountEx;
+    uint64_t KeSetSystemAffinityThreadEx;
+    uint64_t KeRevertToUserAffinityThreadEx;
+    uint64_t KeGetCurrentProcessorNumberEx;
+    uint64_t KeStallExecutionProcessor;
+    uint64_t MmMapIoSpace;
+    uint64_t MmUnmapIoSpace;
+};
+
 // The live protocol state (config, keys, timer/DPC/work, client EPROCESS, stage)
 // lives on a separate independent RW/NX page. Only this pointer stays in .data.
 struct PostboxState
@@ -214,8 +229,21 @@ struct PostboxState
     // the whole PostboxConfig can be wiped once start has consumed Pid/CreateTime.
     // Appended after the reaper fields so every existing state offset is stable.
     uint64_t MailboxVa;
+    // C-01: ntoskrnl/PTE-base/PfnDatabase bases live here, not in .data. The
+    // pre-protection path uses Mem.cpp's transient statics; PostboxStart adopts
+    // them into this field and zeroes the statics.
+    PostboxMemCaches Caches;
+    PostboxNmiImports NmiImports;
 };
 static PostboxState* PostboxStatePtr = nullptr;
+
+// Mem.cpp calls this on every lookup. Before the state page exists it returns
+// null, so the transient static cache is used; after PostboxStart it returns the
+// state-page copy and the statics stay zero.
+PostboxMemCaches* PostboxGetMemCaches()
+{
+    return PostboxStatePtr ? &PostboxStatePtr->Caches : nullptr;
+}
 
 #define g_KeInitializeTimerEx (PostboxStatePtr->Imports.KeInitializeTimerEx)
 #define g_KeInitializeDpc (PostboxStatePtr->Imports.KeInitializeDpc)
@@ -1223,6 +1251,9 @@ bool PostboxStart(const PostboxConfig* Config)
         return false;
     }
     PostboxWipe(PostboxStatePtr, 0x1000);
+    // C-01: move the pre-protection ntoskrnl/PTE/Pfn caches into the state page
+    // and clear their .data slots before any later lookup runs.
+    MemAdoptCaches(&PostboxStatePtr->Caches);
 
     // The page owns the three helpers now. Copy them before any failure path can
     // reach PostboxFreeStatePage, then zero the .data slots so a static .data scan

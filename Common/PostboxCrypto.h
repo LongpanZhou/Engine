@@ -7,7 +7,7 @@
 // so nothing here depends on the host byte order or on unaligned loads.
 //
 // This file is wired into Postbox.cpp / PostboxClient.cpp / mapload (Version 3,
-// PBK1 handoff, static stage); the channel is authenticated. See
+// PBX1 section handoff, static stage); the channel is authenticated. See
 // out/research/CRYPTO-PRIMITIVES.md for the call order and caveats.
 //
 // Construction (AC-25 4.7):

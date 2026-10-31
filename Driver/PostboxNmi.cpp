@@ -1,5 +1,11 @@
 // Constructed-IDT NMI gate for the Postbox build.
 //
+// DISABLED / NOT SHIPPED. On Windows 10 19041 the chain path can corrupt the
+// interrupted thread's MXCSR save slot; the next syscall exit executes
+// `ldmxcsr` on a kernel-pointer value and bugchecks 0x3B (0xC0000005). CMake
+// now refuses POSTBOX_NMI=ON; this file is retained only as historical test
+// code. The supported Postbox build keeps the stock IDT.
+//
 // This follows the physmem_remapper reference: save the Windows NMI gate, install
 // a copy of the IDT with vector 2 pointing at an assembly trampoline, and chain
 // every non-self-test NMI back to the original handler with the trap frame intact.
@@ -72,14 +78,17 @@ using FnKeStallExecutionProcessor = void (*)(uint32_t);
 using FnMmMapIoSpace = void* (*)(int64_t, uint64_t, uint32_t);
 using FnMmUnmapIoSpace = void (*)(void*, uint64_t);
 
-static uint64_t g_KeQueryActiveProcessors = 0;
-static uint64_t g_KeQueryActiveProcessorCountEx = 0;
-static uint64_t g_KeSetSystemAffinityThreadEx = 0;
-static uint64_t g_KeRevertToUserAffinityThreadEx = 0;
-static uint64_t g_KeGetCurrentProcessorNumberEx = 0;
-static uint64_t g_KeStallExecutionProcessor = 0;
-static uint64_t g_MmMapIoSpace = 0;
-static uint64_t g_MmUnmapIoSpace = 0;
+// Stored in the independent state page (C-01): .data keeps no ntoskrnl routine
+// pointers for the NMI gate. PostboxNmiInstall runs after PostboxStart created
+// the page; PostboxNmiUninstall runs before PostboxStop frees it.
+#define g_KeQueryActiveProcessors (PostboxStatePtr->NmiImports.KeQueryActiveProcessors)
+#define g_KeQueryActiveProcessorCountEx (PostboxStatePtr->NmiImports.KeQueryActiveProcessorCountEx)
+#define g_KeSetSystemAffinityThreadEx (PostboxStatePtr->NmiImports.KeSetSystemAffinityThreadEx)
+#define g_KeRevertToUserAffinityThreadEx (PostboxStatePtr->NmiImports.KeRevertToUserAffinityThreadEx)
+#define g_KeGetCurrentProcessorNumberEx (PostboxStatePtr->NmiImports.KeGetCurrentProcessorNumberEx)
+#define g_KeStallExecutionProcessor (PostboxStatePtr->NmiImports.KeStallExecutionProcessor)
+#define g_MmMapIoSpace (PostboxStatePtr->NmiImports.MmMapIoSpace)
+#define g_MmUnmapIoSpace (PostboxStatePtr->NmiImports.MmUnmapIoSpace)
 
 struct PostboxProcessorNumber
 {

@@ -121,25 +121,10 @@ struct PostboxConfig
     uint64_t MmFreeIndependentPages;// loader-resolved stage free routine
 };
 
-// Legacy in-page handoff. The current client does NOT write this into the mailbox
-// body: the loader would have to open the client process and ReadProcessMemory it,
-// which is a T3 READVM/ProcessAccess event. Kept only so older evidence and the
-// tamper harness still compile; new code uses PostboxSectionHandoff below.
-constexpr uint32_t PostboxHandoffMagic = 0x314B4250;   // "PBK1"
-struct PostboxHandoff
-{
-    uint32_t Magic;
-    uint32_t Version;               // 1
-    uint64_t SessionId;
-    uint64_t CreateTime;            // client process creation time, diagnostic
-    uint8_t Key[32];                // master key; loader copies, then wipes
-};
-static_assert(sizeof(PostboxHandoff) == 0x38, "PostboxHandoff layout changed");
-
 // Client -> loader bootstrap handoff, carried in a pagefile-backed named section.
 // The client creates the section (random name, explicit DACL), maps it RW, writes
-// this record, and passes the name on the loader command line (or in a file that
-// contains only the name). The loader opens the section read-only, copies the
+// this record, and passes the name on the loader command line. The loader opens
+// the section read-only, copies the
 // record, unmaps/closes, and never touches the client address space. The section
 // is page-granular and is deleted when the last handle closes.
 //
