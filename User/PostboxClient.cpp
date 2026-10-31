@@ -1,9 +1,9 @@
 // Postbox client: the user side of the timer/work-item channel. The mailbox is a normal
 // private page owned by this process; the request loop does not touch the section or any
-// cross-process API. Bootstrap uses one pagefile-backed named section that carries
-// {pid, VA, key, session, create time} to the loader, so the loader needs no process
-// handle and no cross-process read. Run this first, note the printed section name, then
-// run mapload with --postbox-section <name>; the client pings automatically.
+// cross-process API. Bootstrap uses one unnamed pagefile-backed section that carries
+// {pid, VA, key, session, create time} to the loader. The client spawns the loader as a
+// child with only that section handle inherited; there is no named Local\ object and no
+// loader-side OpenFileMapping. The client pings automatically after the handshake.
 #include <windows.h>
 #include <bcrypt.h>
 #include <cstddef>
@@ -38,6 +38,8 @@ struct ClientOptions
     bool Kill;
     uint32_t HoldMs;
     uint32_t HoldPingMs;
+    const char* LoaderPath;
+    const char* LoaderArgs;
 };
 
 static bool RandomBytes(void* Buffer, size_t Size)
@@ -47,16 +49,17 @@ static bool RandomBytes(void* Buffer, size_t Size)
 }
 
 // The master key must stay readable until the loader copies it. It lives in a
-// one-page, pagefile-backed named section: the loader opens the section read-only
-// before any provider work, copies the record, and closes it. There is no process
-// handle and no cross-process read. The name is random per run and is the only
-// thing printed on stdout.
+// one-page, pagefile-backed unnamed section. The client spawns the loader with
+// only this handle inherited; the loader maps the inherited handle before any
+// provider work, copies the record, and unmaps it. There is no name, no DACL
+// to widen, and no process handle to the client.
 //
 // Cap the worst-case exposure at 60 s (the ping timeout): after that the first
 // ping's wait loop wipes the section even if the loader never arrives. The working
 // session keys are already derived, so the client keeps working if the loader was
 // fast.
 static HANDLE g_HandoffSection = nullptr;
+static HANDLE g_LoaderProcess = nullptr;
 static void* g_HandoffView = nullptr;
 static ULONGLONG g_HandoffWipeAt = 0;
 static uint8_t g_HandoffKey[32] = {};
@@ -64,85 +67,23 @@ static bool g_HandoffKeyPending = false;
 static ULONGLONG g_HandoffPublishedAt = 0;
 constexpr ULONGLONG HandoffKeyGraceMs = 60000;
 
-// Explicit DACL: Administrators and SYSTEM only. The client keeps the handle it
-// receives at creation, so it does not need a DACL ACE for itself; the elevated
-// loader opens through Administrators. This removes the same-user (non-admin)
-// read/write capability on the handoff section. The mandatory label stays at the
-// token default; an elevated loader can still read it (NO_WRITE_UP, not
-// NO_READ_UP).
-struct HandoffSectionSecurity
+// The section is intentionally unnamed. The client keeps the creation handle and
+// marks only that handle inheritable; the spawned loader receives it through the
+// inherited handle table. There is no DACL to widen and no Local\ name for a
+// same-user process to enumerate or open.
+static bool CreateHandoffSection(const PostboxSectionHandoff& Handoff)
 {
-    SECURITY_DESCRIPTOR Sd;
-    SECURITY_ATTRIBUTES Sa;
-    ACL* Acl;
-    BYTE AclStorage[512];
-
-    bool Build()
-    {
-        BYTE AdminSid[SECURITY_MAX_SID_SIZE];
-        BYTE SystemSid[SECURITY_MAX_SID_SIZE];
-        DWORD AdminLen = sizeof(AdminSid);
-        DWORD SystemLen = sizeof(SystemSid);
-        if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, AdminSid, &AdminLen) ||
-            !CreateWellKnownSid(WinLocalSystemSid, nullptr, SystemSid, &SystemLen))
-            return false;
-
-        const DWORD AclSize = sizeof(ACL) +
-            2 * (sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD)) +
-            AdminLen + SystemLen;
-        if (AclSize > sizeof(AclStorage))
-            return false;
-
-        Acl = reinterpret_cast<ACL*>(AclStorage);
-        const DWORD SectionAccess = SECTION_MAP_READ | SECTION_MAP_WRITE | READ_CONTROL;
-        if (!InitializeAcl(Acl, AclSize, ACL_REVISION) ||
-            !AddAccessAllowedAce(Acl, ACL_REVISION, SectionAccess, AdminSid) ||
-            !AddAccessAllowedAce(Acl, ACL_REVISION, SectionAccess, SystemSid))
-            return false;
-        if (!InitializeSecurityDescriptor(&Sd, SECURITY_DESCRIPTOR_REVISION) ||
-            !SetSecurityDescriptorDacl(&Sd, TRUE, Acl, FALSE))
-            return false;
-
-        Sa.nLength = sizeof(Sa);
-        Sa.lpSecurityDescriptor = &Sd;
-        Sa.bInheritHandle = FALSE;
-        return true;
-    }
-};
-
-// Local\ + 32 hex chars. No product prefix: there is no static name string for a
-// T0 file/string scan to key on, and the loader receives the whole name.
-static bool CreateHandoffSection(const PostboxSectionHandoff& Handoff, wchar_t* Name,
-                                 size_t NameChars)
-{
-    uint8_t Id[16];
-    if (!RandomBytes(Id, sizeof(Id)))
-        return false;
-
-    static const wchar_t Hex[] = L"0123456789abcdef";
-    static const wchar_t Prefix[] = L"Local\\";
-    const size_t PrefixChars = sizeof(Prefix) / sizeof(Prefix[0]) - 1;
-    if (NameChars < PrefixChars + 2 * sizeof(Id) + 1)
-        return false;
-
-    size_t At = 0;
-    for (size_t i = 0; i < PrefixChars; ++i)
-        Name[At++] = Prefix[i];
-    for (size_t i = 0; i < sizeof(Id); ++i)
-    {
-        Name[At++] = Hex[Id[i] >> 4];
-        Name[At++] = Hex[Id[i] & 0xF];
-    }
-    Name[At] = 0;
-
-    HandoffSectionSecurity Security;
-    if (!Security.Build())
-        return false;
-
-    HANDLE Section = CreateFileMappingW(INVALID_HANDLE_VALUE, &Security.Sa,
-                                        PAGE_READWRITE, 0, PostboxSectionBytes, Name);
+    HANDLE Section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
+                                        PAGE_READWRITE, 0, PostboxSectionBytes, nullptr);
     if (!Section)
         return false;
+
+    if (!SetHandleInformation(Section, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT))
+    {
+        CloseHandle(Section);
+        return false;
+    }
+
     void* View = MapViewOfFile(Section, FILE_MAP_WRITE, 0, 0, PostboxSectionBytes);
     if (!View)
     {
@@ -154,6 +95,47 @@ static bool CreateHandoffSection(const PostboxSectionHandoff& Handoff, wchar_t* 
     g_HandoffSection = Section;
     g_HandoffView = View;
     g_HandoffWipeAt = GetTickCount64() + HandoffKeyGraceMs;
+    return true;
+}
+
+// Spawn the loader with the section handle inherited. The handle value is only
+// meaningful inside the child's inherited handle table; the command line does
+// not carry a name or a capability that another process can use.
+static bool StartLoader(HANDLE Section, const ClientOptions& Options)
+{
+    if (!Section || !Options.LoaderPath || !Options.LoaderArgs)
+        return false;
+
+    char CommandLine[2048] = {};
+    const int Written = std::snprintf(
+        CommandLine, sizeof(CommandLine),
+        "\"%s\" %s --postbox-handle 0x%llX",
+        Options.LoaderPath, Options.LoaderArgs,
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Section)));
+    if (Written < 0 || Written >= static_cast<int>(sizeof(CommandLine)))
+    {
+        std::printf("postbox: loader command line is too long\n");
+        return false;
+    }
+
+    STARTUPINFOA Si{};
+    Si.cb = sizeof(Si);
+    PROCESS_INFORMATION Pi{};
+    const BOOL Created = CreateProcessA(
+        nullptr, CommandLine, nullptr, nullptr, TRUE, 0, nullptr, nullptr,
+        &Si, &Pi);
+    if (!Created)
+    {
+        std::printf("postbox: CreateProcess(%s) failed, error %lu\n",
+                    Options.LoaderPath, GetLastError());
+        return false;
+    }
+
+    std::printf("postbox: loader pid=%lu handle=0x%llX\n",
+                static_cast<unsigned long>(Pi.dwProcessId),
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Section)));
+    CloseHandle(Pi.hThread);
+    g_LoaderProcess = Pi.hProcess;
     return true;
 }
 
@@ -373,6 +355,24 @@ static bool ParseArguments(int argc, char** argv, ClientOptions& Options)
             }
             ++i;
         }
+        else if (std::strcmp(Arg, "--loader") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                std::printf("postbox: --loader requires a path\n");
+                return false;
+            }
+            Options.LoaderPath = argv[++i];
+        }
+        else if (std::strcmp(Arg, "--loader-args") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                std::printf("postbox: --loader-args requires a string\n");
+                return false;
+            }
+            Options.LoaderArgs = argv[++i];
+        }
     }
     return true;
 }
@@ -429,6 +429,8 @@ static bool HoldSession(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
 int PostboxClientMain(int argc, char** argv)
 {
     ClientOptions Options{};
+    Options.LoaderPath = "mapload.exe";
+    Options.LoaderArgs = "--sys DriverPlain.sys --provider pte";
     if (!ParseArguments(argc, argv, Options))
         return 1;
 
@@ -476,9 +478,9 @@ int PostboxClientMain(int argc, char** argv)
     const uint64_t CreateTime64 =
         (static_cast<uint64_t>(CreateTime.dwHighDateTime) << 32) | CreateTime.dwLowDateTime;
 
-    // Publish the bootstrap record in a one-page pagefile-backed section before
-    // printing, so the loader can open it as soon as it starts. The mailbox body
-    // stays zeroed: there is no PBX1 signature or master key in the 64 KiB page.
+    // Publish the bootstrap record in one unnamed pagefile-backed section before
+    // spawning the loader. The mailbox body stays zeroed: there is no PBX1
+    // signature or master key in the 64 KiB page.
     PostboxSectionHandoff Handoff{};
     Handoff.Magic = PostboxSectionHandoffMagic;
     Handoff.Version = PostboxSectionHandoffVersion;
@@ -490,8 +492,7 @@ int PostboxClientMain(int argc, char** argv)
     std::memcpy(g_HandoffKey, Master, sizeof(g_HandoffKey));
     g_HandoffKeyPending = true;
 
-    wchar_t SectionName[64] = {};
-    if (!CreateHandoffSection(Handoff, SectionName, _countof(SectionName)))
+    if (!CreateHandoffSection(Handoff))
     {
         SecureZeroMemory(&Handoff, sizeof(Handoff));
         SecureZeroMemory(g_HandoffKey, sizeof(g_HandoffKey));
@@ -501,6 +502,13 @@ int PostboxClientMain(int argc, char** argv)
         return 1;
     }
     SecureZeroMemory(&Handoff, sizeof(Handoff));
+
+    if (!StartLoader(g_HandoffSection, Options))
+    {
+        SecureZeroMemory(Master, sizeof(Master));
+        CloseHandoffSection();
+        return 1;
+    }
 
     // Derive the working keys from a copy; DerivePostboxKeys wipes its input.
     uint8_t MasterCopy[32];
@@ -513,9 +521,7 @@ int PostboxClientMain(int argc, char** argv)
     std::printf("postbox: pid=%lu va=0x%llX size=0x%X\n",
                 static_cast<unsigned long>(S.Pid),
                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Base)), PostboxBytes);
-    std::printf("postbox: section=%ls\n", SectionName);
-    std::printf("run: mapload.exe --sys Driver.sys --provider pte --postbox-section \"%ls\"\n",
-                SectionName);
+    std::printf("postbox: unnamed handoff section inherited by loader\n");
     std::printf("waiting up to 60 s for the driver...\n");
     std::fflush(stdout);
 
@@ -720,5 +726,14 @@ int PostboxClientMain(int argc, char** argv)
                 static_cast<unsigned>(S.Status));
     if (S.Status == 0)
         SecureZeroMemory(Base, PostboxBytes);
+
+    // The loader owns provider cleanup after the channel stops. Wait for it so a
+    // scripted caller that immediately queries services sees the final state.
+    if (g_LoaderProcess)
+    {
+        WaitForSingleObject(g_LoaderProcess, 30000);
+        CloseHandle(g_LoaderProcess);
+        g_LoaderProcess = nullptr;
+    }
     return S.Status == 0 ? 0 : 1;
 }
