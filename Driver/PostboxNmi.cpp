@@ -634,12 +634,15 @@ void PostboxNmiUninstall()
 
     __atomic_store_n(&PostboxNmiActive, 0, __ATOMIC_RELEASE);
     const uint64_t Mask = PostboxNmiInstalledMask;
-    PostboxNmiInstalledMask = 0;
     if (!Mask) return;
 
     const uint64_t Active = ((FnKeQueryActiveProcessors) g_KeQueryActiveProcessors)();
     if (PostboxNmiRestore(Mask, Active))
     {
+        // Clear the mask only after every gated CPU is back on the Windows IDTR.
+        // A failed restore leaves the mask set so a later uninstall can retry
+        // instead of leaking the constructed IDT.
+        PostboxNmiInstalledMask = 0;
         PostboxNmiQuiesceAndZero();
         print(INFO("Postbox: NMI gate removed"));
     }
