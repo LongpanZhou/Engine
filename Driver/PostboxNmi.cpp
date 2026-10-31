@@ -43,6 +43,7 @@ static_assert(sizeof(PostboxIdtGate) == 16, "IDT gate layout changed");
 
 static PostboxIdtGate* PostboxIdt = nullptr;
 static PostboxIdtr* PostboxOldIdt = nullptr;
+static bool PostboxIdtIndependent = false;
 static uint64_t PostboxNmiInstalledMask = 0;
 
 // Referenced by PostboxNmi.S. used/noinline keep LTO from dropping the entry
@@ -348,23 +349,61 @@ static bool PostboxNmiRestore(const uint64_t Mask, uint64_t Active)
     return Ok;
 }
 
+static void PostboxNmiFreeIdt()
+{
+    if (!PostboxIdt) return;
+    PostboxWipe(PostboxIdt, sizeof(PostboxIdtGate) * 256);
+    if (PostboxIdtIndependent && g_MmFreeIndependentPages)
+        ((FnMmFreeIndependentPages) g_MmFreeIndependentPages)(
+            PostboxIdt, sizeof(PostboxIdtGate) * 256);
+    else
+        ((FnExFreePool) g_ExFreePool)(PostboxIdt);
+    PostboxIdt = nullptr;
+    PostboxIdtIndependent = false;
+}
+
 static bool PostboxNmiAllocState()
 {
     if (PostboxIdt || PostboxOldIdt) return false;
     if (!g_ExAllocatePoolWithTag || !g_ExFreePool) return false;
 
-    PostboxIdt = (PostboxIdtGate*) ((FnExAllocatePoolWithTag) g_ExAllocatePoolWithTag)(
-        0x200 /* NonPagedPoolNx */, sizeof(PostboxIdtGate) * 256, 0x7366744E /* 'Ntfs' */);
+    // The 4 KiB IDT is the only session-visible NMI allocation. Prefer page-granular
+    // independent pages so it is not a 'Ntfs' BigPool entry during the self-test;
+    // fall back to NonPagedPoolNx when the loader did not pass the helpers.
+    PostboxIdt = nullptr;
+    PostboxIdtIndependent = false;
+    if (g_MmAllocateIndependentPages && g_MmSetPageProtection && g_MmFreeIndependentPages)
+    {
+        PostboxIdt = (PostboxIdtGate*) ((FnMmAllocateIndependentPages)
+            g_MmAllocateIndependentPages)(sizeof(PostboxIdtGate) * 256, 0xFFFFFFFF, 0, 0);
+        if (PostboxIdt)
+        {
+            if (((FnMmSetPageProtection) g_MmSetPageProtection)(
+                    PostboxIdt, sizeof(PostboxIdtGate) * 256, 0x04 /* PAGE_READWRITE */))
+            {
+                PostboxIdtIndependent = true;
+            }
+            else
+            {
+                ((FnMmFreeIndependentPages) g_MmFreeIndependentPages)(
+                    PostboxIdt, sizeof(PostboxIdtGate) * 256);
+                PostboxIdt = nullptr;
+            }
+        }
+    }
+    if (!PostboxIdt)
+    {
+        PostboxIdt = (PostboxIdtGate*) ((FnExAllocatePoolWithTag) g_ExAllocatePoolWithTag)(
+            0x200 /* NonPagedPoolNx */, sizeof(PostboxIdtGate) * 256, 0x7366744E /* 'Ntfs' */);
+        PostboxIdtIndependent = false;
+    }
+
     PostboxOldIdt = (PostboxIdtr*) ((FnExAllocatePoolWithTag) g_ExAllocatePoolWithTag)(
         0x200, sizeof(PostboxIdtr) * 64, 0x7366744E);
 
     if (!PostboxIdt || !PostboxOldIdt)
     {
-        if (PostboxIdt)
-        {
-            ((FnExFreePool) g_ExFreePool)(PostboxIdt);
-            PostboxIdt = nullptr;
-        }
+        PostboxNmiFreeIdt();
         if (PostboxOldIdt)
         {
             ((FnExFreePool) g_ExFreePool)(PostboxOldIdt);
@@ -380,12 +419,7 @@ static bool PostboxNmiAllocState()
 
 static void PostboxNmiFreeState()
 {
-    if (PostboxIdt)
-    {
-        PostboxWipe(PostboxIdt, sizeof(PostboxIdtGate) * 256);
-        ((FnExFreePool) g_ExFreePool)(PostboxIdt);
-        PostboxIdt = nullptr;
-    }
+    PostboxNmiFreeIdt();
     if (PostboxOldIdt)
     {
         PostboxWipe(PostboxOldIdt, sizeof(PostboxIdtr) * 64);
