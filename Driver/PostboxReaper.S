@@ -15,6 +15,19 @@
 # teardown owns the page), the stub returns without freeing the image. The image
 # and state page leak rather than being freed under a stalled worker.
 
+# Worker entry wrapper. ExpWorkerThread calls this with RCX = the work item
+# parameter. The C worker returns here; only after its epilogue/ret do we clear
+# PostboxInFlight, leaving just this wrapper's add/ret in image code when the
+# reaper observes InFlight == 0. This closes the pre-epilogue free window.
+    .text
+    .globl PostboxWorkEntry
+PostboxWorkEntry:
+    subq $0x28, %rsp
+    call PostboxWorkRoutine
+    movl $0, PostboxInFlight(%rip)
+    addq $0x28, %rsp
+    ret
+
     .text
     .globl PostboxReaperEntry
 PostboxReaperEntry:

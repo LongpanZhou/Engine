@@ -133,7 +133,9 @@ static address g_PsCreateSystemThread_Raw = 0;
 static address g_ZwClose_Raw = 0;
 
 static volatile long PostboxRunning = 0;
-static volatile long PostboxInFlight = 0;
+// Cleared by the assembly worker wrapper after PostboxWorkRoutine returns, so
+// the reaper cannot free the image while the C worker is still in its epilogue.
+extern "C" volatile long PostboxInFlight = 0;
 static volatile long PostboxTeardown = 0;
 static volatile long PostboxReaperStarted = 0;
 
@@ -151,6 +153,11 @@ struct PostboxReaperPlan
 };
 extern "C" void PostboxReaperEntry();
 extern "C" uint64_t PostboxReaperPrepare(PostboxState* State, PostboxReaperPlan* Plan);
+// Assembly worker wrapper: calls PostboxWorkRoutine, then clears PostboxInFlight
+// after the C worker has returned. Only the wrapper's add/ret remain in image
+// code when the reaper sees InFlight == 0.
+extern "C" void PostboxWorkEntry();
+extern "C" void PostboxWorkRoutine(void*);
 
 // Resolved ntoskrnl routines used after the state page exists. They are copied
 // out of .data into the state page by PostboxStart and zeroed in .data, so a
@@ -834,8 +841,10 @@ static void PostboxDpcRoutine(void*, void*, void*, void*)
         ((FnExQueueWorkItem) g_ExQueueWorkItem)(&PostboxStatePtr->Work, 1);   // DelayedWorkQueue
 }
 
-// Runs at PASSIVE_LEVEL in an existing system worker thread.
-static void PostboxWorkRoutine(void*)
+// Runs at PASSIVE_LEVEL in an existing system worker thread. The assembly
+// PostboxWorkEntry wrapper calls this and clears PostboxInFlight only after it
+// returns; do not clear InFlight here.
+extern "C" void PostboxWorkRoutine(void*)
 {
     PostboxState* State = PostboxStatePtr;
     if (__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE))
@@ -853,8 +862,6 @@ static void PostboxWorkRoutine(void*)
         State->Work.List.Flink = nullptr;
         State->Work.List.Blink = nullptr;
     }
-
-    __atomic_store_n(&PostboxInFlight, 0, __ATOMIC_RELEASE);
 }
 
 // The poll body. The caller has already attached the worker to MailboxProcess and
@@ -1375,7 +1382,7 @@ bool PostboxStart(const PostboxConfig* Config)
     // ExInitializeWorkItem's fields, without pulling in the macro from the vendor headers
     PostboxStatePtr->Work.List.Flink = nullptr;
     PostboxStatePtr->Work.List.Blink = nullptr;
-    PostboxStatePtr->Work.WorkerRoutine = (void*) &PostboxWorkRoutine;
+    PostboxStatePtr->Work.WorkerRoutine = (void*) &PostboxWorkEntry;
     PostboxStatePtr->Work.Parameter = nullptr;
 
     ((FnKeInitializeTimerEx) g_KeInitializeTimerEx)(&PostboxStatePtr->Timer, 0);   // NotificationTimer
