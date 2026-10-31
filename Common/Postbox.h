@@ -21,7 +21,7 @@ constexpr char PostboxMarkerTag[] = POSTBOX_MARKER_TAG;
 //   client: wait for Ack == Seq, verify the response tag, then read Status and the body
 //
 // Version 3 uses ChaCha20 for Op/Pid/Size/Address and the body, and 128-bit SipHash-2-4
-// tags for requests/responses. The client CSPRNG key reaches the loader through a PBK1
+// tags for requests/responses. The client CSPRNG key reaches the loader through the PBX1 section
 // handoff; the driver derives and wipes. This is authenticated transport, not a trust
 // boundary against a kernel AC or an in-process DLL.
 //
