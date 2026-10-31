@@ -74,6 +74,7 @@ using FnKeUnstackDetachProcess = void (*)(void*);           // PKAPC_STATE
 using FnPsAcquireProcessExitSynchronization = int32_t (*)(void*);
 using FnPsReleaseProcessExitSynchronization = void (*)(void*);
 using FnPsGetProcessCreateTimeQuadPart = int64_t (*)(void*);
+using FnPsGetCurrentProcess = void* (*)();
 using FnExAllocatePoolWithTag = void* (*)(uint32_t, size_t, uint32_t);
 using FnExFreePool = void (*)(void*);
 using FnMmAllocateIndependentPages = void* (*)(size_t Size, uint32_t Arg2,
@@ -110,6 +111,7 @@ static address g_KeUnstackDetachProcess = 0;
 static address g_PsAcquireProcessExitSynchronization = 0;
 static address g_PsReleaseProcessExitSynchronization = 0;
 static address g_PsGetProcessCreateTimeQuadPart = 0;
+static address g_PsGetCurrentProcess = 0;
 static address g_ExAllocatePoolWithTag = 0;
 static address g_ExFreePool = 0;
 static address g_MmAllocateIndependentPages = 0;
@@ -346,14 +348,15 @@ static bool PostboxResolve()
         "NnDpqzNfnpsz",                    // MmCopyMemory
         "NnDpqzWjsuvbmNfnpsz",             // MmCopyVirtualMemory
         "LfJqjHfofsjdDbmm",                // KeIpiGenericCall
+        "QtHfuDvssfouQspdftt",             // PsGetCurrentProcess
     };
 
     // The resolve table is stored ROT1-encoded so the image does not carry the plaintext
     // export names. This is anti-static-scan, not secrecy: it is decoded in a stack buffer
     // and wiped after the resolve. The resolved pointers remain in .data.
-    char Decoded[19][40] = {};
-    const char* Names[19] = {};
-    for (uint32_t i = 0; i < 19; ++i)
+    char Decoded[20][40] = {};
+    const char* Names[20] = {};
+    for (uint32_t i = 0; i < 20; ++i)
     {
         uint32_t j = 0;
         for (; j < 39 && EncodedNames[i][j]; ++j)
@@ -362,8 +365,8 @@ static bool PostboxResolve()
         Names[i] = Decoded[i];
     }
 
-    address Functions[19] = {};
-    FindFuncExportsBatch(Ntoskrnl, Names, Functions, 19);
+    address Functions[20] = {};
+    FindFuncExportsBatch(Ntoskrnl, Names, Functions, 20);
 
     g_KeInitializeTimerEx = Functions[0];
     g_KeInitializeDpc = Functions[1];
@@ -384,13 +387,14 @@ static bool PostboxResolve()
     g_MmCopyMemory = Functions[16];
     g_MmCopyVirtualMemory = Functions[17];
     g_KeIpiGenericCall = Functions[18];
+    g_PsGetCurrentProcess = Functions[19];
 
-    for (uint32_t i = 0; i < 19; ++i)
+    for (uint32_t i = 0; i < 20; ++i)
     {
         if (!Functions[i])
         {
             print(ERROR("Postbox: export %s not found"), Names[i]);
-            for (uint32_t k = 0; k < 19; ++k)
+            for (uint32_t k = 0; k < 20; ++k)
             {
                 volatile char* p = Decoded[k];
                 for (uint32_t j = 0; j < 40; ++j) p[j] = 0;
@@ -398,7 +402,7 @@ static bool PostboxResolve()
             return false;
         }
     }
-    for (uint32_t i = 0; i < 22; ++i)
+    for (uint32_t i = 0; i < 20; ++i)
     {
         volatile char* p = Decoded[i];
         for (uint32_t j = 0; j < 40; ++j) p[j] = 0;
@@ -434,7 +438,8 @@ static bool PostboxCopy(void* MailboxProcess, address UserVa, void* Buffer,
         // the cached client EPROCESS. MmCopyVirtualMemory performs the attach
         // internally, so the driver no longer calls KeStackAttachProcess itself.
         Status = ((FnMmCopyVirtualMemory) g_MmCopyVirtualMemory)(
-            MailboxProcess, (void*) (uintptr_t) UserVa, MailboxProcess, Buffer,
+            MailboxProcess, (void*) (uintptr_t) UserVa,
+            ((FnPsGetCurrentProcess) g_PsGetCurrentProcess)(), Buffer,
             Size, 0 /* KernelMode */, &Done);
     }
     else
