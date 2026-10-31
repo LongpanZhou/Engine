@@ -38,9 +38,56 @@ if(MAPPED_SAFE)
     list(APPEND VARIANT_DEFINES NO_MAP_TABLE)
 endif()
 
+# Channel selection: the default is the named-section/system-thread channel in Channel.cpp.
+# POSTBOX_CHANNEL replaces it with the timer/work-item mailbox (AC-25). The Postbox build is
+# manual-map only: the entry's second argument is a PostboxConfig, not a provider image name.
+option(POSTBOX_CHANNEL "Use the timer/work-item Postbox channel instead of the named section" OFF)
+if(POSTBOX_CHANNEL)
+    list(APPEND VARIANT_DEFINES POSTBOX_CHANNEL)
+endif()
+
+# Manual-map-only profile: the Postbox build is never loaded by SCM. Exclude the
+# loader trace cleaners (Traces.cpp) and the hide/relink code (Hide.cpp), and stub
+# DriverExit to stop the timer and unlink the map table only. This removes dead
+# cleaner/lineage code from the mapped image.
+option(MANUAL_MAP_ONLY "Build a manual-map-only driver (requires POSTBOX_CHANNEL)" OFF)
+if(MANUAL_MAP_ONLY)
+    if(NOT POSTBOX_CHANNEL)
+        message(FATAL_ERROR "MANUAL_MAP_ONLY requires POSTBOX_CHANNEL=ON")
+    endif()
+    list(APPEND VARIANT_DEFINES MANUAL_MAP_ONLY)
+endif()
+
+# NMI gate: an opt-in extension of the Postbox build. It installs a constructed
+# IDT with vector 2 pointing at the assembly trampoline in PostboxNmi.S, and adds
+# the pb_nmi query/self-test op. The default Postbox build keeps the unmodified
+# Windows IDT; see AC-25/AC-26 for the detection tradeoff.
+option(POSTBOX_NMI "Install the constructed-IDT NMI gate (requires POSTBOX_CHANNEL)" OFF)
+set(POSTBOX_NMI_SOURCES)
+if(POSTBOX_NMI)
+    if(NOT POSTBOX_CHANNEL)
+        message(FATAL_ERROR "POSTBOX_NMI requires POSTBOX_CHANNEL=ON")
+    endif()
+    enable_language(ASM)
+    list(APPEND VARIANT_DEFINES POSTBOX_NMI)
+    list(APPEND POSTBOX_NMI_SOURCES PostboxNmi.S)
+endif()
+
+# Self-free reaper: the terminal work routine creates a system thread whose entry
+# is an assembly stub in the image. The stub tail-jumps to MmFreeIndependentPages,
+# so the free returns to PspSystemThreadStartup and no image instruction is fetched
+# after the image is released. Only the Postbox build has this lifetime model.
+set(POSTBOX_REAPER_SOURCES)
+if(POSTBOX_CHANNEL)
+    enable_language(ASM)
+    list(APPEND POSTBOX_REAPER_SOURCES PostboxReaper.S)
+endif()
+
 # Driver entry point
 wdk_add_driver(Driver
         main.cpp
+        ${POSTBOX_NMI_SOURCES}
+        ${POSTBOX_REAPER_SOURCES}
 )
 
 # All defines in one place: the shared seed plus the variant switch. _ITERATOR_DEBUG_LEVEL=0 turns the
@@ -70,6 +117,7 @@ target_compile_options(Driver
 
 # Deliberately NOT set here: -nostdlib (vendor link flags), --strip-all covers the rest
 target_link_options(Driver
+        PRIVATE -Wl,--subsystem,native                # a driver is a native image, not a console EXE
         PRIVATE -Wl,--gc-sections                     # drop the unused per-item sections
         PRIVATE -Wl,--icf=all                         # fold identical code bodies (pairs with LTO)
         PRIVATE -Wl,--strip-all                       # strip all symbol info
@@ -78,11 +126,14 @@ target_link_options(Driver
 
 # Code signing (optional): finds signtool in any installed Windows Kit, and takes the PFX password from the
 # environment instead of storing it in this file. Signing is skipped (with a warning) when either is missing.
+# The lab PFX subject names the developer ("WDKTestCert <user>,..."), which is a T7 artifact; a manual-map
+# payload does not need a signature, so deployments can configure -DDRIVER_SIGNING=OFF or replace the PFX.
+option(DRIVER_SIGNING "Sign Driver.sys with TestSign.pfx when the password is set" ON)
 find_program(SIGNTOOL signtool
         PATHS "C:/Program Files (x86)/Windows Kits/10/bin/x86"
               "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x86"
         NO_DEFAULT_PATH)
-if(SIGNTOOL AND DEFINED ENV{TESTSIGN_PFX_PASSWORD})
+if(DRIVER_SIGNING AND SIGNTOOL AND DEFINED ENV{TESTSIGN_PFX_PASSWORD})
         add_custom_command(TARGET Driver POST_BUILD
                 COMMAND "${SIGNTOOL}" sign /v
                 /f "${CMAKE_CURRENT_SOURCE_DIR}/TestSign.pfx"
