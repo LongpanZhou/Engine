@@ -102,32 +102,32 @@ using FnPsCreateSystemThread = int32_t (*)(void** ThreadHandle, uint32_t Desired
                                            void* StartContext);
 using FnZwClose = int32_t (*)(void* Handle);
 
-static address g_KeInitializeTimerEx = 0;
-static address g_KeInitializeDpc = 0;
-static address g_KeSetCoalescableTimer = 0;
-static address g_KeCancelTimer = 0;
-static address g_KeFlushQueuedDpcs = 0;
-static address g_ExQueueWorkItem = 0;
-static address g_PsLookupProcessByProcessId = 0;
-static address g_ObDereferenceObject = 0;
-static address g_KeDelayExecutionThread = 0;
+static address g_KeInitializeTimerEx_Raw = 0;
+static address g_KeInitializeDpc_Raw = 0;
+static address g_KeSetCoalescableTimer_Raw = 0;
+static address g_KeCancelTimer_Raw = 0;
+static address g_KeFlushQueuedDpcs_Raw = 0;
+static address g_ExQueueWorkItem_Raw = 0;
+static address g_PsLookupProcessByProcessId_Raw = 0;
+static address g_ObDereferenceObject_Raw = 0;
+static address g_KeDelayExecutionThread_Raw = 0;
 static address g_KeStackAttachProcess = 0;
 static address g_KeUnstackDetachProcess = 0;
-static address g_PsAcquireProcessExitSynchronization = 0;
-static address g_PsReleaseProcessExitSynchronization = 0;
-static address g_PsGetProcessCreateTimeQuadPart = 0;
-static address g_PsGetCurrentProcess = 0;
-static address g_ExAllocatePoolWithTag = 0;
-static address g_ExFreePool = 0;
+static address g_PsAcquireProcessExitSynchronization_Raw = 0;
+static address g_PsReleaseProcessExitSynchronization_Raw = 0;
+static address g_PsGetProcessCreateTimeQuadPart_Raw = 0;
+static address g_PsGetCurrentProcess_Raw = 0;
+static address g_ExAllocatePoolWithTag_Raw = 0;
+static address g_ExFreePool_Raw = 0;
 static address g_MmAllocateIndependentPages = 0;
 static address g_MmSetPageProtection = 0;
 static address g_MmFreeIndependentPages = 0;
 
 static address g_MmCopyMemory = 0;
-static address g_MmCopyVirtualMemory = 0;
+static address g_MmCopyVirtualMemory_Raw = 0;
 static address g_KeIpiGenericCall = 0;
-static address g_PsCreateSystemThread = 0;
-static address g_ZwClose = 0;
+static address g_PsCreateSystemThread_Raw = 0;
+static address g_ZwClose_Raw = 0;
 
 static volatile long PostboxRunning = 0;
 static volatile long PostboxInFlight = 0;
@@ -142,6 +142,32 @@ extern "C" uint64_t PostboxReaperSize = 0;   // loader allocation size (AllocSiz
 extern "C" uint64_t PostboxReaperFree = 0;   // resolved MmFreeIndependentPages
 extern "C" void PostboxReaperEntry();
 extern "C" void PostboxReaperPrepare();
+
+// Resolved ntoskrnl routines used after the state page exists. They are copied
+// out of .data into the state page by PostboxStart and zeroed in .data, so a
+// static .data scan sees no routine table. KeIpiGenericCall stays in .data: the
+// pre-start ProtectImageSections path needs it before the state page exists.
+struct PostboxImports
+{
+    address KeInitializeTimerEx;
+    address KeInitializeDpc;
+    address KeSetCoalescableTimer;
+    address KeCancelTimer;
+    address KeFlushQueuedDpcs;
+    address ExQueueWorkItem;
+    address PsLookupProcessByProcessId;
+    address ObDereferenceObject;
+    address KeDelayExecutionThread;
+    address PsGetProcessCreateTimeQuadPart;
+    address ExAllocatePoolWithTag;
+    address ExFreePool;
+    address MmCopyVirtualMemory;
+    address PsGetCurrentProcess;
+    address PsAcquireProcessExitSynchronization;
+    address PsReleaseProcessExitSynchronization;
+    address PsCreateSystemThread;
+    address ZwClose;
+};
 
 // The live protocol state (config, keys, timer/DPC/work, client EPROCESS, stage)
 // lives on a separate independent RW/NX page. Only this pointer stays in .data.
@@ -159,8 +185,28 @@ struct PostboxState
     uint32_t LastSeq;
     uint32_t AuthFailures;
     bool StageIndependent;
+    PostboxImports Imports;
 };
 static PostboxState* PostboxStatePtr = nullptr;
+
+#define g_KeInitializeTimerEx (PostboxStatePtr->Imports.KeInitializeTimerEx)
+#define g_KeInitializeDpc (PostboxStatePtr->Imports.KeInitializeDpc)
+#define g_KeSetCoalescableTimer (PostboxStatePtr->Imports.KeSetCoalescableTimer)
+#define g_KeCancelTimer (PostboxStatePtr->Imports.KeCancelTimer)
+#define g_KeFlushQueuedDpcs (PostboxStatePtr->Imports.KeFlushQueuedDpcs)
+#define g_ExQueueWorkItem (PostboxStatePtr->Imports.ExQueueWorkItem)
+#define g_PsLookupProcessByProcessId (PostboxStatePtr->Imports.PsLookupProcessByProcessId)
+#define g_ObDereferenceObject (PostboxStatePtr->Imports.ObDereferenceObject)
+#define g_KeDelayExecutionThread (PostboxStatePtr->Imports.KeDelayExecutionThread)
+#define g_PsGetProcessCreateTimeQuadPart (PostboxStatePtr->Imports.PsGetProcessCreateTimeQuadPart)
+#define g_ExAllocatePoolWithTag (PostboxStatePtr->Imports.ExAllocatePoolWithTag)
+#define g_ExFreePool (PostboxStatePtr->Imports.ExFreePool)
+#define g_MmCopyVirtualMemory (PostboxStatePtr->Imports.MmCopyVirtualMemory)
+#define g_PsGetCurrentProcess (PostboxStatePtr->Imports.PsGetCurrentProcess)
+#define g_PsAcquireProcessExitSynchronization (PostboxStatePtr->Imports.PsAcquireProcessExitSynchronization)
+#define g_PsReleaseProcessExitSynchronization (PostboxStatePtr->Imports.PsReleaseProcessExitSynchronization)
+#define g_PsCreateSystemThread (PostboxStatePtr->Imports.PsCreateSystemThread)
+#define g_ZwClose (PostboxStatePtr->Imports.ZwClose)
 
 constexpr uint32_t StageBytes = PostboxDataMax;
 constexpr uint32_t StageAllocBytes = (StageBytes + 0xFFFu) & ~0xFFFu;
@@ -403,25 +449,25 @@ static bool PostboxResolve()
     address Functions[19] = {};
     FindFuncExportsBatch(Ntoskrnl, Names, Functions, 19);
 
-    g_KeInitializeTimerEx = Functions[0];
-    g_KeInitializeDpc = Functions[1];
-    g_KeSetCoalescableTimer = Functions[2];
-    g_KeCancelTimer = Functions[3];
-    g_KeFlushQueuedDpcs = Functions[4];
-    g_ExQueueWorkItem = Functions[5];
-    g_PsLookupProcessByProcessId = Functions[6];
-    g_ObDereferenceObject = Functions[7];
-    g_KeDelayExecutionThread = Functions[8];
-    g_PsGetProcessCreateTimeQuadPart = Functions[9];
-    g_ExAllocatePoolWithTag = Functions[10];
-    g_ExFreePool = Functions[11];
-    g_MmCopyVirtualMemory = Functions[12];
+    g_KeInitializeTimerEx_Raw = Functions[0];
+    g_KeInitializeDpc_Raw = Functions[1];
+    g_KeSetCoalescableTimer_Raw = Functions[2];
+    g_KeCancelTimer_Raw = Functions[3];
+    g_KeFlushQueuedDpcs_Raw = Functions[4];
+    g_ExQueueWorkItem_Raw = Functions[5];
+    g_PsLookupProcessByProcessId_Raw = Functions[6];
+    g_ObDereferenceObject_Raw = Functions[7];
+    g_KeDelayExecutionThread_Raw = Functions[8];
+    g_PsGetProcessCreateTimeQuadPart_Raw = Functions[9];
+    g_ExAllocatePoolWithTag_Raw = Functions[10];
+    g_ExFreePool_Raw = Functions[11];
+    g_MmCopyVirtualMemory_Raw = Functions[12];
     g_KeIpiGenericCall = Functions[13];
-    g_PsGetCurrentProcess = Functions[14];
-    g_PsAcquireProcessExitSynchronization = Functions[15];
-    g_PsReleaseProcessExitSynchronization = Functions[16];
-    g_PsCreateSystemThread = Functions[17];
-    g_ZwClose = Functions[18];
+    g_PsGetCurrentProcess_Raw = Functions[14];
+    g_PsAcquireProcessExitSynchronization_Raw = Functions[15];
+    g_PsReleaseProcessExitSynchronization_Raw = Functions[16];
+    g_PsCreateSystemThread_Raw = Functions[17];
+    g_ZwClose_Raw = Functions[18];
 
     for (uint32_t i = 0; i < 19; ++i)
     {
@@ -1111,6 +1157,48 @@ bool PostboxStart(const PostboxConfig* Config)
         PostboxFreeStatePage();
         return false;
     }
+
+    // Move the resolved routine table out of .data and zero the raw slots. The
+    // state page already exists, so every later use goes through the macros.
+    PostboxStatePtr->Imports.KeInitializeTimerEx = g_KeInitializeTimerEx_Raw;
+    PostboxStatePtr->Imports.KeInitializeDpc = g_KeInitializeDpc_Raw;
+    PostboxStatePtr->Imports.KeSetCoalescableTimer = g_KeSetCoalescableTimer_Raw;
+    PostboxStatePtr->Imports.KeCancelTimer = g_KeCancelTimer_Raw;
+    PostboxStatePtr->Imports.KeFlushQueuedDpcs = g_KeFlushQueuedDpcs_Raw;
+    PostboxStatePtr->Imports.ExQueueWorkItem = g_ExQueueWorkItem_Raw;
+    PostboxStatePtr->Imports.PsLookupProcessByProcessId = g_PsLookupProcessByProcessId_Raw;
+    PostboxStatePtr->Imports.ObDereferenceObject = g_ObDereferenceObject_Raw;
+    PostboxStatePtr->Imports.KeDelayExecutionThread = g_KeDelayExecutionThread_Raw;
+    PostboxStatePtr->Imports.PsGetProcessCreateTimeQuadPart = g_PsGetProcessCreateTimeQuadPart_Raw;
+    PostboxStatePtr->Imports.ExAllocatePoolWithTag = g_ExAllocatePoolWithTag_Raw;
+    PostboxStatePtr->Imports.ExFreePool = g_ExFreePool_Raw;
+    PostboxStatePtr->Imports.MmCopyVirtualMemory = g_MmCopyVirtualMemory_Raw;
+    PostboxStatePtr->Imports.PsGetCurrentProcess = g_PsGetCurrentProcess_Raw;
+    PostboxStatePtr->Imports.PsAcquireProcessExitSynchronization =
+        g_PsAcquireProcessExitSynchronization_Raw;
+    PostboxStatePtr->Imports.PsReleaseProcessExitSynchronization =
+        g_PsReleaseProcessExitSynchronization_Raw;
+    PostboxStatePtr->Imports.PsCreateSystemThread = g_PsCreateSystemThread_Raw;
+    PostboxStatePtr->Imports.ZwClose = g_ZwClose_Raw;
+
+    g_KeInitializeTimerEx_Raw = 0;
+    g_KeInitializeDpc_Raw = 0;
+    g_KeSetCoalescableTimer_Raw = 0;
+    g_KeCancelTimer_Raw = 0;
+    g_KeFlushQueuedDpcs_Raw = 0;
+    g_ExQueueWorkItem_Raw = 0;
+    g_PsLookupProcessByProcessId_Raw = 0;
+    g_ObDereferenceObject_Raw = 0;
+    g_KeDelayExecutionThread_Raw = 0;
+    g_PsGetProcessCreateTimeQuadPart_Raw = 0;
+    g_ExAllocatePoolWithTag_Raw = 0;
+    g_ExFreePool_Raw = 0;
+    g_MmCopyVirtualMemory_Raw = 0;
+    g_PsGetCurrentProcess_Raw = 0;
+    g_PsAcquireProcessExitSynchronization_Raw = 0;
+    g_PsReleaseProcessExitSynchronization_Raw = 0;
+    g_PsCreateSystemThread_Raw = 0;
+    g_ZwClose_Raw = 0;
 
     // Acquire the client reference and verify its create time once, not per poll.
     void* Process = nullptr;
