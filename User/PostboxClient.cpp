@@ -3,8 +3,7 @@
 // cross-process API. Bootstrap uses one pagefile-backed named section that carries
 // {pid, VA, key, session, create time} to the loader, so the loader needs no process
 // handle and no cross-process read. Run this first, note the printed section name, then
-// run mapload with --postbox-section <name> (or --postbox-file <path> if --handoff was
-// given); the client pings automatically.
+// run mapload with --postbox-section <name>; the client pings automatically.
 #include <windows.h>
 #include <bcrypt.h>
 #include <cstddef>
@@ -39,7 +38,6 @@ struct ClientOptions
     bool Kill;
     uint32_t HoldMs;
     uint32_t HoldPingMs;
-    const char* HandoffPath;
 };
 
 static bool RandomBytes(void* Buffer, size_t Size)
@@ -52,7 +50,7 @@ static bool RandomBytes(void* Buffer, size_t Size)
 // one-page, pagefile-backed named section: the loader opens the section read-only
 // before any provider work, copies the record, and closes it. There is no process
 // handle and no cross-process read. The name is random per run and is the only
-// thing printed or written to the optional --handoff file.
+// thing printed on stdout.
 //
 // Cap the worst-case exposure at 60 s (the ping timeout): after that the first
 // ping's wait loop wipes the section even if the loader never arrives. The working
@@ -61,6 +59,8 @@ static bool RandomBytes(void* Buffer, size_t Size)
 static HANDLE g_HandoffSection = nullptr;
 static void* g_HandoffView = nullptr;
 static ULONGLONG g_HandoffWipeAt = 0;
+static uint8_t g_HandoffKey[32] = {};
+static bool g_HandoffKeyPending = false;
 constexpr ULONGLONG HandoffKeyGraceMs = 60000;
 
 // Explicit DACL: the creating user, Administrators, and SYSTEM. A default DACL
@@ -105,10 +105,14 @@ struct HandoffSectionSecurity
             return false;
 
         Acl = reinterpret_cast<ACL*>(AclStorage);
+        // The loader opens the section RW for the deferred-key handshake; the
+        // creator keeps its RW handle. Same-user readers could already read the
+        // key, so SECTION_MAP_WRITE is not a new confidentiality boundary.
+        const DWORD SectionAccess = SECTION_MAP_READ | SECTION_MAP_WRITE | READ_CONTROL;
         if (!InitializeAcl(Acl, AclSize, ACL_REVISION) ||
-            !AddAccessAllowedAce(Acl, ACL_REVISION, SECTION_MAP_READ | READ_CONTROL, UserSid) ||
-            !AddAccessAllowedAce(Acl, ACL_REVISION, SECTION_MAP_READ | READ_CONTROL, AdminSid) ||
-            !AddAccessAllowedAce(Acl, ACL_REVISION, SECTION_MAP_READ | READ_CONTROL, SystemSid))
+            !AddAccessAllowedAce(Acl, ACL_REVISION, SectionAccess, UserSid) ||
+            !AddAccessAllowedAce(Acl, ACL_REVISION, SectionAccess, AdminSid) ||
+            !AddAccessAllowedAce(Acl, ACL_REVISION, SectionAccess, SystemSid))
             return false;
         if (!InitializeSecurityDescriptor(&Sd, SECURITY_DESCRIPTOR_REVISION) ||
             !SetSecurityDescriptorDacl(&Sd, TRUE, Acl, FALSE))
@@ -170,12 +174,32 @@ static bool CreateHandoffSection(const PostboxSectionHandoff& Handoff, wchar_t* 
 
 static void WipeHandoffSection()
 {
+    SecureZeroMemory(g_HandoffKey, sizeof(g_HandoffKey));
+    g_HandoffKeyPending = false;
     if (g_HandoffView)
         SecureZeroMemory(g_HandoffView, PostboxSectionBytes);
 }
 
+// Publish the master key only after the loader has finished provider/map work
+// and set LOADER_READY. The loader reads the key and sets CONSUMED immediately;
+// the client never leaves the key in the section during bring-up.
+static void PublishHandoffKey()
+{
+    if (!g_HandoffView || !g_HandoffKeyPending) return;
+    auto* Handoff = static_cast<PostboxSectionHandoff*>(g_HandoffView);
+    if (Handoff->Reserved != PostboxSectionStateLoaderReady) return;
+    std::memcpy(Handoff->Key, g_HandoffKey, sizeof(Handoff->Key));
+    MemoryBarrier();
+    Handoff->Reserved = PostboxSectionStateKeyReady;
+    SecureZeroMemory(g_HandoffKey, sizeof(g_HandoffKey));
+    g_HandoffKeyPending = false;
+    std::printf("handoff: key published after loader-ready\n");
+    std::fflush(stdout);
+}
+
 static void ExpireHandoffSection()
 {
+    PublishHandoffKey();
     if (g_HandoffView && GetTickCount64() >= g_HandoffWipeAt)
         WipeHandoffSection();
 }
@@ -332,15 +356,6 @@ static bool ParseArguments(int argc, char** argv, ClientOptions& Options)
             }
             ++i;
         }
-        else if (std::strcmp(Arg, "--handoff") == 0)
-        {
-            if (i + 1 >= argc)
-            {
-                std::printf("postbox: --handoff requires a file path\n");
-                return false;
-            }
-            Options.HandoffPath = argv[++i];
-        }
     }
     return true;
 }
@@ -454,12 +469,16 @@ int PostboxClientMain(int argc, char** argv)
     Handoff.MailboxVa = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Base));
     Handoff.SessionId = SessionId;
     Handoff.CreateTime = CreateTime64;
-    std::memcpy(Handoff.Key, Master, sizeof(Handoff.Key));
+    Handoff.Reserved = PostboxSectionStateWaiting;
+    std::memcpy(g_HandoffKey, Master, sizeof(g_HandoffKey));
+    g_HandoffKeyPending = true;
 
     wchar_t SectionName[64] = {};
     if (!CreateHandoffSection(Handoff, SectionName, _countof(SectionName)))
     {
         SecureZeroMemory(&Handoff, sizeof(Handoff));
+        SecureZeroMemory(g_HandoffKey, sizeof(g_HandoffKey));
+        g_HandoffKeyPending = false;
         SecureZeroMemory(Master, sizeof(Master));
         std::printf("postbox: handoff section creation failed, error %lu\n", GetLastError());
         return 1;
@@ -474,29 +493,12 @@ int PostboxClientMain(int argc, char** argv)
     SecureZeroMemory(MasterCopy, sizeof(MasterCopy));
     S.SessionId = SessionId;
 
-    // Optional out-of-band handoff: the file carries only the random section name
-    // (never PID/VA/key), so the loader command line does not disclose the target.
-    // The loader reads it and deletes it.
-    if (Options.HandoffPath)
-    {
-        FILE* f = nullptr;
-        if (fopen_s(&f, Options.HandoffPath, "w") == 0 && f)
-        {
-            std::fprintf(f, "%ls\n", SectionName);
-            std::fclose(f);
-        }
-    }
-
     std::printf("postbox: pid=%lu va=0x%llX size=0x%X\n",
                 static_cast<unsigned long>(S.Pid),
                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Base)), PostboxBytes);
     std::printf("postbox: section=%ls\n", SectionName);
-    if (Options.HandoffPath)
-        std::printf("run: mapload.exe --sys Driver.sys --provider pte --postbox-file %s\n",
-                    Options.HandoffPath);
-    else
-        std::printf("run: mapload.exe --sys Driver.sys --provider pte --postbox-section \"%ls\"\n",
-                    SectionName);
+    std::printf("run: mapload.exe --sys Driver.sys --provider pte --postbox-section \"%ls\"\n",
+                SectionName);
     std::printf("waiting up to 60 s for the driver...\n");
     std::fflush(stdout);
 
