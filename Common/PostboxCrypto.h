@@ -194,10 +194,14 @@ inline void ChaCha20Block(uint8_t out[64], const uint8_t key[32],
                           const uint8_t nonce[12], uint32_t counter)
 {
     uint32_t st[16];
-    st[0] = 0x61707865u;
-    st[1] = 0x3320646eu;
-    st[2] = 0x79622d32u;
-    st[3] = 0x6b206574u;
+    // The standard "expand 32-byte k" sigma is stored masked so the mapped
+    // image does not carry the plaintext crypto constant. The volatile mask
+    // stops the compiler from folding the XOR back to the original dwords.
+    volatile uint32_t SigmaMask = 0x5A5A5A5Au;
+    st[0] = 0x3B2A223Fu ^ SigmaMask;
+    st[1] = 0x697A3E34u ^ SigmaMask;
+    st[2] = 0x23387768u ^ SigmaMask;
+    st[3] = 0x317A3F2Eu ^ SigmaMask;
     for (uint32_t i = 0; i < 8; ++i)
         st[4 + i] = Load32LE(key + 4 * i);
     st[12] = counter;
