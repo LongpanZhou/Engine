@@ -106,6 +106,7 @@ target_compile_options(Driver
 
 # Deliberately NOT set here: -nostdlib (vendor link flags), --strip-all covers the rest
 target_link_options(Driver
+        PRIVATE -Wl,--subsystem,native                # a driver is a native image, not a console EXE
         PRIVATE -Wl,--gc-sections                     # drop the unused per-item sections
         PRIVATE -Wl,--icf=all                         # fold identical code bodies (pairs with LTO)
         PRIVATE -Wl,--strip-all                       # strip all symbol info

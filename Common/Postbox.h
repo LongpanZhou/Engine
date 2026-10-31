@@ -103,11 +103,12 @@ struct PostboxImageLayout
 static_assert(sizeof(PostboxSectionLayout) == 16, "section layout changed");
 static_assert(sizeof(PostboxImageLayout) == 0xB0, "image layout changed");
 
-// Passed from the loader to DriverEntry in the second argument. Version 3.
+// Passed from the loader to DriverEntry in the second argument. Version 4
+// (0x110 bytes: stage allocator/protect/free metadata).
 struct PostboxConfig
 {
     uint32_t Magic;                 // PostboxConfigMagic
-    uint32_t Version;               // 3
+    uint32_t Version;               // 4
     uint32_t Pid;                   // mailbox owner
     uint32_t Reserved;
     uint64_t MailboxVa;             // user VA of the mailbox

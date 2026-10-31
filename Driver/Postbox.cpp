@@ -13,13 +13,13 @@
 // Build marker for the loader's --postbox guard. It lives in its own PE
 // section so mapload can verify the section table instead of scanning the
 // whole file for four incidental bytes. Layout is shared with mapload/main.cpp:
-//   POSTBOX_MARKER_TAG + NUL + u32 little-endian ABI version (3) + 4 reserved.
+//   POSTBOX_MARKER_TAG + NUL + u32 little-endian ABI version (4) + 4 reserved.
 // The volatile read in PostboxStart keeps the section reachable from
 // DriverEntry, so -Wl,--gc-sections cannot discard it.
 __attribute__((section(POSTBOX_SECTION_NAME), used, aligned(16)))
 static const volatile uint8_t PostboxSectionMarker[16] = {
     'P', 'B', 'X', '7', 'Q', '2', 'A', 0x00,
-    0x03, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00
 };
 
@@ -137,6 +137,7 @@ static uint64_t PostboxLastNonce = 0;
 // 0x1A. The 64 KiB size keeps the protocol's full body; the allocation may be
 // large-page-backed, which is fine while it is never aliased.
 constexpr uint32_t PostboxStageBytes = PostboxDataMax;
+constexpr uint32_t PostboxStageAllocBytes = (PostboxStageBytes + 0xFFFu) & ~0xFFFu;
 static uint8_t* PostboxStage = nullptr;
 static uint32_t PostboxLastSeq = 0;
 static uint32_t PostboxPeriodMs = 4;
@@ -338,25 +339,22 @@ static bool PostboxResolve()
         "QtMpplvqQspdfttCzQspdfttJe",
         "PcEfsfgfsfodfPckfdu",
         "LfEfmbzFyfdvujpoUisfbe",
-        "LfTubdlBuubdiQspdftt",
-        "LfVotubdlEfubdiQspdftt",
-        "QtBdrvjsfQspdfttFyjuTzodispoj{bujpo",
-        "QtSfmfbtfQspdfttFyjuTzodispoj{bujpo",
         "QtHfuQspdfttDsfbufUjnfRvbeQbsu",
         "FyBmmpdbufQppmXjuiUbh",          // ExAllocatePoolWithTag
         "FyGsffQppm",                      // ExFreePool
-        "NnDpqzNfnpsz",                    // MmCopyMemory
         "NnDpqzWjsuvbmNfnpsz",             // MmCopyVirtualMemory
         "LfJqjHfofsjdDbmm",                // KeIpiGenericCall
         "QtHfuDvssfouQspdftt",             // PsGetCurrentProcess
+        "QtBdrvjsfQspdfttFyjuTzodispoj{bujpo",  // PsAcquireProcessExitSynchronization
+        "QtSfmfbtfQspdfttFyjuTzodispoj{bujpo",  // PsReleaseProcessExitSynchronization
     };
 
     // The resolve table is stored ROT1-encoded so the image does not carry the plaintext
     // export names. This is anti-static-scan, not secrecy: it is decoded in a stack buffer
     // and wiped after the resolve. The resolved pointers remain in .data.
-    char Decoded[20][40] = {};
-    const char* Names[20] = {};
-    for (uint32_t i = 0; i < 20; ++i)
+    char Decoded[17][40] = {};
+    const char* Names[17] = {};
+    for (uint32_t i = 0; i < 17; ++i)
     {
         uint32_t j = 0;
         for (; j < 39 && EncodedNames[i][j]; ++j)
@@ -365,8 +363,8 @@ static bool PostboxResolve()
         Names[i] = Decoded[i];
     }
 
-    address Functions[20] = {};
-    FindFuncExportsBatch(Ntoskrnl, Names, Functions, 20);
+    address Functions[17] = {};
+    FindFuncExportsBatch(Ntoskrnl, Names, Functions, 17);
 
     g_KeInitializeTimerEx = Functions[0];
     g_KeInitializeDpc = Functions[1];
@@ -377,24 +375,21 @@ static bool PostboxResolve()
     g_PsLookupProcessByProcessId = Functions[6];
     g_ObDereferenceObject = Functions[7];
     g_KeDelayExecutionThread = Functions[8];
-    g_KeStackAttachProcess = Functions[9];
-    g_KeUnstackDetachProcess = Functions[10];
-    g_PsAcquireProcessExitSynchronization = Functions[11];
-    g_PsReleaseProcessExitSynchronization = Functions[12];
-    g_PsGetProcessCreateTimeQuadPart = Functions[13];
-    g_ExAllocatePoolWithTag = Functions[14];
-    g_ExFreePool = Functions[15];
-    g_MmCopyMemory = Functions[16];
-    g_MmCopyVirtualMemory = Functions[17];
-    g_KeIpiGenericCall = Functions[18];
-    g_PsGetCurrentProcess = Functions[19];
+    g_PsGetProcessCreateTimeQuadPart = Functions[9];
+    g_ExAllocatePoolWithTag = Functions[10];
+    g_ExFreePool = Functions[11];
+    g_MmCopyVirtualMemory = Functions[12];
+    g_KeIpiGenericCall = Functions[13];
+    g_PsGetCurrentProcess = Functions[14];
+    g_PsAcquireProcessExitSynchronization = Functions[15];
+    g_PsReleaseProcessExitSynchronization = Functions[16];
 
-    for (uint32_t i = 0; i < 20; ++i)
+    for (uint32_t i = 0; i < 17; ++i)
     {
         if (!Functions[i])
         {
             print(ERROR("Postbox: export %s not found"), Names[i]);
-            for (uint32_t k = 0; k < 20; ++k)
+            for (uint32_t k = 0; k < 17; ++k)
             {
                 volatile char* p = Decoded[k];
                 for (uint32_t j = 0; j < 40; ++j) p[j] = 0;
@@ -402,7 +397,7 @@ static bool PostboxResolve()
             return false;
         }
     }
-    for (uint32_t i = 0; i < 20; ++i)
+    for (uint32_t i = 0; i < 17; ++i)
     {
         volatile char* p = Decoded[i];
         for (uint32_t j = 0; j < 40; ++j) p[j] = 0;
@@ -445,7 +440,8 @@ static bool PostboxCopy(void* MailboxProcess, address UserVa, void* Buffer,
     else
     {
         Status = ((FnMmCopyVirtualMemory) g_MmCopyVirtualMemory)(
-            MailboxProcess, Buffer, MailboxProcess, (void*) (uintptr_t) UserVa,
+            ((FnPsGetCurrentProcess) g_PsGetCurrentProcess)(), Buffer,
+            MailboxProcess, (void*) (uintptr_t) UserVa,
             Size, 0 /* KernelMode */, &Done);
     }
     return Status >= 0 && Done == Size;
@@ -532,7 +528,7 @@ static void PostboxFreeStage()
     PostboxWipe(PostboxStage, PostboxStageBytes);
     if (PostboxStageIndependent && g_MmFreeIndependentPages)
         ((FnMmFreeIndependentPages) g_MmFreeIndependentPages)(
-            PostboxStage, PostboxStageBytes);
+            PostboxStage, PostboxStageAllocBytes);
     else
         ((FnExFreePool) g_ExFreePool)(PostboxStage);
     PostboxStage = nullptr;
@@ -832,10 +828,9 @@ static void PostboxPollAttached(void* MailboxProcess)
     PostboxWipe(&Sealed, sizeof(Sealed));
 }
 
-// Wrapper: attach the system worker to the mailbox process for the duration of the poll.
-// The old NO_MAP_TABLE PTE path claimed a PTE in the *current* process; in the
-// System process that search walks the kernel half and fails, while in the client's
-// context it finds a free user PTE. The attach reference is dropped only after detach.
+// Poll entry: the worker holds the cached client EPROCESS and the process exit
+// synchronization; PostboxCopy uses MmCopyVirtualMemory with explicit processes,
+// so the poll does not attach or detach itself.
 static void PostboxPoll()
 {
     if (!__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE)) return;
@@ -851,6 +846,7 @@ static void PostboxPoll()
         pb::WipePostboxKeys(&PostboxKeys);
         PostboxSessionId = 0;
         PostboxLastNonce = 0;
+        PostboxMaybeReleaseProcess();
         return;
     }
 
@@ -864,11 +860,21 @@ static void PostboxPoll()
         return;
     }
 
-    // No explicit attach: PostboxCopy uses MmCopyVirtualMemory with the cached
-    // client EPROCESS as both source and target. This removes the driver's
-    // KeStackAttachProcess/detach and PsAcquire/ReleaseExitSynchronization pair
-    // from every poll (the copy API still switches CR3 internally).
+    // No explicit attach: PostboxCopy uses MmCopyVirtualMemory with explicit
+    // processes. Keep the process exit synchronization, though: MmCopyVirtualMemory
+    // does not acquire it, and the cached EPROCESS reference alone does not stop
+    // the address space from being torn down mid-copy.
+    const int32_t ExitStatus =
+        ((FnPsAcquireProcessExitSynchronization) g_PsAcquireProcessExitSynchronization)(Process);
+    if (ExitStatus < 0)
+    {
+        PostboxDeadTick();
+        PostboxIdleTick();
+        PostboxMaybeReleaseProcess();
+        return;
+    }
     PostboxPollAttached(Process);
+    ((FnPsReleaseProcessExitSynchronization) g_PsReleaseProcessExitSynchronization)(Process);
     PostboxMaybeReleaseProcess();
 }
 
@@ -882,7 +888,7 @@ bool PostboxStart(const PostboxConfig* Config)
         return false;
 
     if (__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE)) return true;
-    if (!Config || Config->Magic != PostboxConfigMagic || Config->Version != 3 ||
+    if (!Config || Config->Magic != PostboxConfigMagic || Config->Version != 4 ||
         !Config->Pid || !Config->MailboxVa || !Config->CreateTime || !Config->SessionId) return false;
     if (Config->MailboxVa > PostboxUserLimit - PostboxBytes || (Config->MailboxVa & 7)) return false;
 
@@ -954,18 +960,18 @@ bool PostboxStart(const PostboxConfig* Config)
     if (g_MmAllocateIndependentPages && g_MmSetPageProtection && g_MmFreeIndependentPages)
     {
         PostboxStage = (uint8_t*) ((FnMmAllocateIndependentPages)
-            g_MmAllocateIndependentPages)(PostboxStageBytes, 0xFFFFFFFF, 0, 0);
+            g_MmAllocateIndependentPages)(PostboxStageAllocBytes, 0xFFFFFFFF, 0, 0);
         if (PostboxStage)
         {
             if (((FnMmSetPageProtection) g_MmSetPageProtection)(
-                    PostboxStage, PostboxStageBytes, 0x04 /* PAGE_READWRITE */))
+                    PostboxStage, PostboxStageAllocBytes, 0x04 /* PAGE_READWRITE */))
             {
                 PostboxStageIndependent = true;
             }
             else
             {
                 ((FnMmFreeIndependentPages) g_MmFreeIndependentPages)(
-                    PostboxStage, PostboxStageBytes);
+                    PostboxStage, PostboxStageAllocBytes);
                 PostboxStage = nullptr;
             }
         }
