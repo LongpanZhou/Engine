@@ -61,6 +61,7 @@ static void* g_HandoffView = nullptr;
 static ULONGLONG g_HandoffWipeAt = 0;
 static uint8_t g_HandoffKey[32] = {};
 static bool g_HandoffKeyPending = false;
+static ULONGLONG g_HandoffPublishedAt = 0;
 constexpr ULONGLONG HandoffKeyGraceMs = 60000;
 
 // Explicit DACL: the creating user, Administrators, and SYSTEM. A default DACL
@@ -176,23 +177,40 @@ static void WipeHandoffSection()
 {
     SecureZeroMemory(g_HandoffKey, sizeof(g_HandoffKey));
     g_HandoffKeyPending = false;
+    g_HandoffPublishedAt = 0;
     if (g_HandoffView)
         SecureZeroMemory(g_HandoffView, PostboxSectionBytes);
 }
 
 // Publish the master key only after the loader has finished provider/map work
-// and set LOADER_READY. The loader reads the key and sets CONSUMED immediately;
-// the client never leaves the key in the section during bring-up.
+// and set LOADER_READY. The CAS claims PUBLISHING so the loader's withdrawal
+// (timeout) wins cleanly. If the loader withdraws, the client wipes instead of
+// leaving a key behind.
 static void PublishHandoffKey()
 {
     if (!g_HandoffView || !g_HandoffKeyPending) return;
     auto* Handoff = static_cast<PostboxSectionHandoff*>(g_HandoffView);
+    if (Handoff->Reserved == PostboxSectionStateWithdrawn)
+    {
+        WipeHandoffSection();
+        return;
+    }
     if (Handoff->Reserved != PostboxSectionStateLoaderReady) return;
+    if (InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&Handoff->Reserved),
+                                   PostboxSectionStatePublishing,
+                                   PostboxSectionStateLoaderReady) !=
+        PostboxSectionStateLoaderReady)
+    {
+        if (Handoff->Reserved == PostboxSectionStateWithdrawn)
+            WipeHandoffSection();
+        return;
+    }
     std::memcpy(Handoff->Key, g_HandoffKey, sizeof(Handoff->Key));
     MemoryBarrier();
     Handoff->Reserved = PostboxSectionStateKeyReady;
     SecureZeroMemory(g_HandoffKey, sizeof(g_HandoffKey));
     g_HandoffKeyPending = false;
+    g_HandoffPublishedAt = GetTickCount64();
     std::printf("handoff: key published after loader-ready\n");
     std::fflush(stdout);
 }
@@ -200,6 +218,21 @@ static void PublishHandoffKey()
 static void ExpireHandoffSection()
 {
     PublishHandoffKey();
+    if (g_HandoffView && !g_HandoffKeyPending)
+    {
+        auto* Handoff = static_cast<PostboxSectionHandoff*>(g_HandoffView);
+        if (Handoff->Reserved == PostboxSectionStateWithdrawn)
+        {
+            WipeHandoffSection();
+            return;
+        }
+        // If the loader never consumes the published key (timeout/unmap), do
+        // not leave it resident until the 60 s grace.
+        if (Handoff->Reserved != PostboxSectionStateConsumed &&
+            g_HandoffPublishedAt != 0 &&
+            GetTickCount64() - g_HandoffPublishedAt > 1000)
+            WipeHandoffSection();
+    }
     if (g_HandoffView && GetTickCount64() >= g_HandoffWipeAt)
         WipeHandoffSection();
 }
