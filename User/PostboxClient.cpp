@@ -248,9 +248,17 @@ int PostboxClientMain(int argc, char** argv)
     if (!ParseArguments(argc, argv, Options))
         return 1;
 
-    // MEM_TOP_DOWN puts the mailbox in the high user range instead of the
-    // deterministic 0x1A0000 a fresh process otherwise gets; ASLR still varies
-    // the exact address. The client prints the returned address for the loader.
+    // MEM_TOP_DOWN alone returns the same high address in every fresh process.
+    // Allocate a random-size top-down pad first and keep it: the mailbox is then
+    // placed below the pad at a varying offset. The pad is a private RW VAD with
+    // no protocol data. The client prints the returned address for the loader.
+    uint32_t PadSeed = 0;
+    if (!RandomBytes(&PadSeed, sizeof(PadSeed)))
+        PadSeed = GetTickCount();
+    const SIZE_T PadBytes = (static_cast<SIZE_T>(1) + (PadSeed % 0xFF)) * 0x1000;
+    void* Pad = VirtualAlloc(nullptr, PadBytes,
+                             MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE);
+    (void) Pad;
     void* Base = VirtualAlloc(nullptr, PostboxBytes,
                               MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE);
     if (!Base)
