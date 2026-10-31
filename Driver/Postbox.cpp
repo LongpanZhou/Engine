@@ -128,7 +128,6 @@ static address g_MmFreeIndependentPages_Raw = 0;
 
 static address g_MmCopyMemory = 0;
 static address g_MmCopyVirtualMemory_Raw = 0;
-static address g_KeIpiGenericCall = 0;
 static address g_PsCreateSystemThread_Raw = 0;
 static address g_ZwClose_Raw = 0;
 
@@ -262,7 +261,7 @@ constexpr uint64_t PostboxUserLimit = 0x00007FFFFFFF0000ull;
 // pool base after the loader applies relocations, so this is the mapped image base.
 extern "C" _IMAGE_DOS_HEADER __ImageBase;
 
-static bool PostboxResolve();
+static bool PostboxResolve(address* IpiGenericCallOut = nullptr);
 
 // Self-map entry for a VA. The kernel's PTE_BASE maps the page tables, so this
 // is a direct kernel VA write with no physical alias and no user-half supervisor
@@ -352,7 +351,9 @@ bool ProtectImageSections(const PostboxConfig* Config)
     }
 
     // Resolve KeIpiGenericCall before the PTE walk: the global flush needs it.
-    if (!PostboxResolve())
+    // Keep it in a local, not .data, so the image has no routine pointer there.
+    address IpiGenericCall = 0;
+    if (!PostboxResolve(&IpiGenericCall))
     {
         print(ERROR("Postbox: resolve failed before image protection"));
         if (PostboxStartFailure < 100)
@@ -412,14 +413,14 @@ bool ProtectImageSections(const PostboxConfig* Config)
     // The per-page invlpg only covers the current CPU. A T2 AC can cache the
     // pre-protection RWX entry on the other CPU; flush every CPU so the stale
     // entry cannot write .text or execute .data after the split.
-    if (!g_KeIpiGenericCall)
+    if (!IpiGenericCall)
     {
         print(ERROR("Postbox: KeIpiGenericCall not resolved"));
         PostboxStartFailure = 26;
         return false;
     }
     PostboxTlbRange Range{ L.ImageBase, End };
-    ((FnKeIpiGenericCall) g_KeIpiGenericCall)(
+    ((FnKeIpiGenericCall) IpiGenericCall)(
         &PostboxFlushTlb, (uint64_t) (uintptr_t) &Range);
 
     print(INFO("Postbox: image protections applied (%u pages, %u sections)"),
@@ -431,7 +432,7 @@ static void PostboxPoll();
 
 static bool PostboxResolved = false;
 
-static bool PostboxResolve()
+static bool PostboxResolve(address* IpiGenericCallOut)
 {
     if (PostboxResolved) return true;
     address Ntoskrnl = GetNtoskrnl();
@@ -494,7 +495,7 @@ static bool PostboxResolve()
     g_ExAllocatePoolWithTag_Raw = Functions[10];
     g_ExFreePool_Raw = Functions[11];
     g_MmCopyVirtualMemory_Raw = Functions[12];
-    g_KeIpiGenericCall = Functions[13];
+    if (IpiGenericCallOut) *IpiGenericCallOut = Functions[13];
     g_PsGetCurrentProcess_Raw = Functions[14];
     g_PsAcquireProcessExitSynchronization_Raw = Functions[15];
     g_PsReleaseProcessExitSynchronization_Raw = Functions[16];
