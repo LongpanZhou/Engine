@@ -3,8 +3,7 @@
 // cross-process API. Bootstrap uses one pagefile-backed named section that carries
 // {pid, VA, key, session, create time} to the loader, so the loader needs no process
 // handle and no cross-process read. Run this first, note the printed section name, then
-// run mapload with --postbox-section <name> (or --postbox-file <path> if --handoff was
-// given); the client pings automatically.
+// run mapload with --postbox-section <name>; the client pings automatically.
 #include <windows.h>
 #include <bcrypt.h>
 #include <cstddef>
@@ -39,7 +38,6 @@ struct ClientOptions
     bool Kill;
     uint32_t HoldMs;
     uint32_t HoldPingMs;
-    const char* HandoffPath;
 };
 
 static bool RandomBytes(void* Buffer, size_t Size)
@@ -52,7 +50,7 @@ static bool RandomBytes(void* Buffer, size_t Size)
 // one-page, pagefile-backed named section: the loader opens the section read-only
 // before any provider work, copies the record, and closes it. There is no process
 // handle and no cross-process read. The name is random per run and is the only
-// thing printed or written to the optional --handoff file.
+// thing printed on stdout.
 //
 // Cap the worst-case exposure at 60 s (the ping timeout): after that the first
 // ping's wait loop wipes the section even if the loader never arrives. The working
@@ -358,15 +356,6 @@ static bool ParseArguments(int argc, char** argv, ClientOptions& Options)
             }
             ++i;
         }
-        else if (std::strcmp(Arg, "--handoff") == 0)
-        {
-            if (i + 1 >= argc)
-            {
-                std::printf("postbox: --handoff requires a file path\n");
-                return false;
-            }
-            Options.HandoffPath = argv[++i];
-        }
     }
     return true;
 }
@@ -504,29 +493,12 @@ int PostboxClientMain(int argc, char** argv)
     SecureZeroMemory(MasterCopy, sizeof(MasterCopy));
     S.SessionId = SessionId;
 
-    // Optional out-of-band handoff: the file carries only the random section name
-    // (never PID/VA/key), so the loader command line does not disclose the target.
-    // The loader reads it and deletes it.
-    if (Options.HandoffPath)
-    {
-        FILE* f = nullptr;
-        if (fopen_s(&f, Options.HandoffPath, "w") == 0 && f)
-        {
-            std::fprintf(f, "%ls\n", SectionName);
-            std::fclose(f);
-        }
-    }
-
     std::printf("postbox: pid=%lu va=0x%llX size=0x%X\n",
                 static_cast<unsigned long>(S.Pid),
                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Base)), PostboxBytes);
     std::printf("postbox: section=%ls\n", SectionName);
-    if (Options.HandoffPath)
-        std::printf("run: mapload.exe --sys Driver.sys --provider pte --postbox-file %s\n",
-                    Options.HandoffPath);
-    else
-        std::printf("run: mapload.exe --sys Driver.sys --provider pte --postbox-section \"%ls\"\n",
-                    SectionName);
+    std::printf("run: mapload.exe --sys Driver.sys --provider pte --postbox-section \"%ls\"\n",
+                SectionName);
     std::printf("waiting up to 60 s for the driver...\n");
     std::fflush(stdout);
 
