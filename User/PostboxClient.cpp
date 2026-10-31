@@ -248,20 +248,11 @@ int PostboxClientMain(int argc, char** argv)
     if (!ParseArguments(argc, argv, Options))
         return 1;
 
-    // Let the OS choose the base, then push it away from the deterministic low
-    // address a fresh process otherwise gets (0x1A0000 in every lab run). The
-    // padding is released immediately; only the mailbox VA stays randomized. The
-    // client prints the returned address for the loader.
-    uint32_t PadSeed = 0;
-    if (!RandomBytes(&PadSeed, sizeof(PadSeed)))
-        PadSeed = GetTickCount();
-    // Keep the pad allocated: freeing it lets the allocator hand the same low
-    // address back to the mailbox. The pad is a private RW VAD with no protocol
-    // data; the mailbox lands at a random offset above it.
-    const SIZE_T PadBytes = (static_cast<SIZE_T>(1) + (PadSeed % 0xFF)) * 0x1000;
-    void* Pad = VirtualAlloc(nullptr, PadBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    (void) Pad;
-    void* Base = VirtualAlloc(nullptr, PostboxBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    // MEM_TOP_DOWN puts the mailbox in the high user range instead of the
+    // deterministic 0x1A0000 a fresh process otherwise gets; ASLR still varies
+    // the exact address. The client prints the returned address for the loader.
+    void* Base = VirtualAlloc(nullptr, PostboxBytes,
+                              MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE);
     if (!Base)
     {
         std::printf("postbox: VirtualAlloc failed, error %lu\n", GetLastError());
