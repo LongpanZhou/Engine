@@ -157,8 +157,10 @@ constexpr uint32_t PostboxSectionBytes = 0x1000;              // one page
 // loader's bring-up window.
 constexpr uint32_t PostboxSectionStateWaiting = 0;
 constexpr uint32_t PostboxSectionStateLoaderReady = 1;
+constexpr uint32_t PostboxSectionStatePublishing = 4;
 constexpr uint32_t PostboxSectionStateKeyReady = 2;
 constexpr uint32_t PostboxSectionStateConsumed = 3;
+constexpr uint32_t PostboxSectionStateWithdrawn = 5;
 
 struct alignas(8) PostboxSectionHandoff
 {
