@@ -204,6 +204,10 @@ struct PostboxState
     // so the image base/size do not reappear in the resident image during stop.
     uint64_t ReaperBase;
     uint64_t ReaperSize;
+    // B-01: the only config value the poll needs. Kept outside the Cfg copy so
+    // the whole PostboxConfig can be wiped once start has consumed Pid/CreateTime.
+    // Appended after the reaper fields so every existing state offset is stable.
+    uint64_t MailboxVa;
 };
 static PostboxState* PostboxStatePtr = nullptr;
 
@@ -661,6 +665,7 @@ static void PostboxFreeState()
     // pb_stop, invalid-config) is the only path that drops the cached EPROCESS
     // reference; erasing the pointer first would leak the reference every stop.
     PostboxStatePtr->Stage = nullptr;
+    PostboxStatePtr->MailboxVa = 0;
     PostboxStatePtr->SessionId = 0;
     PostboxStatePtr->LastNonce = 0;
     PostboxStatePtr->LastSeq = 0;
@@ -856,9 +861,8 @@ static void PostboxWorkRoutine(void*)
 // holds its reference; this routine must not dereference it.
 static void PostboxPollAttached(void* MailboxProcess)
 {
-    const uint32_t MailboxPid = PostboxStatePtr->Cfg.Pid;
-    const uint64_t MailboxVa = PostboxStatePtr->Cfg.MailboxVa;
-    if (!MailboxPid || !MailboxVa) return;
+    const uint64_t MailboxVa = PostboxStatePtr->MailboxVa;
+    if (!MailboxVa) return;
 
     PostboxHeader Sealed{};
     if (!PostboxCopy(MailboxProcess, (address) MailboxVa, &Sealed, sizeof(Sealed), false))
@@ -1099,10 +1103,9 @@ static void PostboxPollAttached(void* MailboxProcess)
 static void PostboxPoll()
 {
     if (!__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE)) return;
-    const uint32_t Pid = PostboxStatePtr->Cfg.Pid;
-    if (!Pid || !PostboxStatePtr->Cfg.MailboxVa)
+    if (!PostboxStatePtr->MailboxVa)
     {
-        // A zeroed/corrupted config must not leave the fast timer armed forever:
+        // A zeroed/corrupted state must not leave the fast timer armed forever:
         // the dead-client watchdog is bypassed by this early return, and a manual
         // map has no unload callback. Cancel and wipe here (PASSIVE, work routine).
         PostboxCancel();
@@ -1224,6 +1227,9 @@ bool PostboxStart(const PostboxConfig* Config)
     g_MmFreeIndependentPages_Raw = 0;
 
     PostboxStatePtr->Cfg = *Config;
+    // B-01: the poll needs the mailbox VA; keep it outside the Cfg copy, which is
+    // wiped as soon as start has consumed Pid/CreateTime.
+    PostboxStatePtr->MailboxVa = Config->MailboxVa;
     PostboxStatePtr->Cfg.MmAllocateIndependentPages = 0;
     PostboxStatePtr->Cfg.MmSetPageProtection = 0;
     PostboxStatePtr->Cfg.MmFreeIndependentPages = 0;
@@ -1299,21 +1305,28 @@ bool PostboxStart(const PostboxConfig* Config)
     g_ZwClose_Raw = 0;
 
     // Acquire the client reference and verify its create time once, not per poll.
+    // Pid/CreateTime are the last config fields any path reads; keep Pid for the
+    // start log, then drop the whole copy below.
+    const uint32_t MailboxPid = PostboxStatePtr->Cfg.Pid;
+    const uint64_t CreateTime = PostboxStatePtr->Cfg.CreateTime;
     void* Process = nullptr;
     if (((FnPsLookupProcessByProcessId) g_PsLookupProcessByProcessId)(
-            (void*) (uintptr_t) PostboxStatePtr->Cfg.Pid, &Process) < 0 || !Process)
+            (void*) (uintptr_t) MailboxPid, &Process) < 0 || !Process)
     {
         PostboxFreeStatePage();
         return false;
     }
     if ((uint64_t) ((FnPsGetProcessCreateTimeQuadPart) g_PsGetProcessCreateTimeQuadPart)(Process) !=
-        PostboxStatePtr->Cfg.CreateTime)
+        CreateTime)
     {
         ((FnObDereferenceObject) g_ObDereferenceObject)(Process);
         PostboxFreeStatePage();
         return false;
     }
     PostboxStatePtr->Process = Process;
+    // B-01: Pid/CreateTime were the last config fields any runtime path needs.
+    // Wipe the entire copy; the poll uses MailboxVa, auth uses SessionId/Keys.
+    PostboxWipe(&PostboxStatePtr->Cfg, sizeof(PostboxConfig));
 
     // Separate NX stage. Prefer page-granular independent pages so the channel
     // does not leave a 64 KiB 'Ntfs' NonPagedPoolNx entry for its lifetime; fall
@@ -1388,7 +1401,7 @@ bool PostboxStart(const PostboxConfig* Config)
     }
 
     print(INFO("Postbox: live, pid %u mailbox %p, 4 ms timer"),
-          PostboxStatePtr->Cfg.Pid, (void*) (uintptr_t) PostboxStatePtr->Cfg.MailboxVa);
+          MailboxPid, (void*) (uintptr_t) PostboxStatePtr->MailboxVa);
     return true;
 }
 
