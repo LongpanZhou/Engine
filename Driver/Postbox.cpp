@@ -740,6 +740,9 @@ static void PostboxFreeState()
     PostboxWipe(&PostboxStatePtr->Dpc, sizeof(PostboxDpc));
     pb::WipePostboxKeys(&PostboxStatePtr->Keys);
     PostboxWipe(&PostboxStatePtr->Cfg, sizeof(PostboxConfig));
+    // C-01 cache residue: no worker can use the memory caches after the caller
+    // has quiesced; wipe them now rather than leaving kernel bases resident.
+    PostboxWipe(&PostboxStatePtr->Caches, sizeof(PostboxMemCaches));
     // Do NOT clear Process here. The caller's PostboxMaybeReleaseProcess (watchdog,
     // pb_stop, invalid-config) is the only path that drops the cached EPROCESS
     // reference; erasing the pointer first would leak the reference every stop.
@@ -785,11 +788,14 @@ extern "C" uint64_t PostboxReaperPrepare(PostboxState* State, PostboxReaperPlan*
 {
     if (!State || !Plan) return 0;
 
+    // Save the delay/free helpers before the sensitive residue is wiped.
+    const address DelayThread = State->Imports.KeDelayExecutionThread;
+    if (!DelayThread) return 0;
     for (uint32_t i = 0; i < 1000 && __atomic_load_n(&PostboxInFlight, __ATOMIC_ACQUIRE); ++i)
     {
         _LARGE_INTEGER Interval{};
         Interval.QuadPart = -10000;   // 1 ms
-        ((FnKeDelayExecutionThread) State->Imports.KeDelayExecutionThread)(0, 0, &Interval);
+        ((FnKeDelayExecutionThread) DelayThread)(0, 0, &Interval);
     }
 
     // K-06: the bounded wait expired with the worker still in flight. Do not
@@ -797,15 +803,23 @@ extern "C" uint64_t PostboxReaperPrepare(PostboxState* State, PostboxReaperPlan*
     if (__atomic_load_n(&PostboxInFlight, __ATOMIC_ACQUIRE) != 0)
         return 0;
 
-    _LARGE_INTEGER Delay{};
-    Delay.QuadPart = -5000000;        // 500 ms
-    ((FnKeDelayExecutionThread) State->Imports.KeDelayExecutionThread)(0, 0, &Delay);
-
     const uint64_t Base = State->ReaperBase;
     const uint64_t Size = State->ReaperSize;
     const address Free = State->Imports.MmFreeIndependentPages;
     if (!Base || !Size || !Free)
         return 0;
+
+    // T2: the worker is quiescent and the reaper only needs the locals above.
+    // Wipe the import/cache/reaper residue before the 500 ms grace period, so
+    // the state page does not expose 21 ntoskrnl pointers or the image range.
+    PostboxWipe(&State->Imports, sizeof(PostboxImports));
+    PostboxWipe(&State->Caches, sizeof(PostboxMemCaches));
+    State->ReaperBase = 0;
+    State->ReaperSize = 0;
+
+    _LARGE_INTEGER Delay{};
+    Delay.QuadPart = -5000000;        // 500 ms
+    ((FnKeDelayExecutionThread) DelayThread)(0, 0, &Delay);
 
     // Exchange first so a concurrent stop cannot free the same page twice. If a
     // new state page replaced this one, leave the old page alone.

@@ -64,11 +64,12 @@ static bool g_HandoffKeyPending = false;
 static ULONGLONG g_HandoffPublishedAt = 0;
 constexpr ULONGLONG HandoffKeyGraceMs = 60000;
 
-// Explicit DACL: the creating user, Administrators, and SYSTEM. A default DACL
-// would also work for a same-user loader, but this is deterministic and does not
-// depend on the parent process's inherited ACEs. The mandatory label is left at
-// the token default (medium for a normal client), so an elevated loader can still
-// read it: the default policy is NO_WRITE_UP, not NO_READ_UP.
+// Explicit DACL: Administrators and SYSTEM only. The client keeps the handle it
+// receives at creation, so it does not need a DACL ACE for itself; the elevated
+// loader opens through Administrators. This removes the same-user (non-admin)
+// read/write capability on the handoff section. The mandatory label stays at the
+// token default; an elevated loader can still read it (NO_WRITE_UP, not
+// NO_READ_UP).
 struct HandoffSectionSecurity
 {
     SECURITY_DESCRIPTOR Sd;
@@ -78,18 +79,6 @@ struct HandoffSectionSecurity
 
     bool Build()
     {
-        BYTE TokenUserBuf[256];
-        DWORD TokenUserLen = 0;
-        HANDLE Token = nullptr;
-        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &Token))
-            return false;
-        const BOOL GotUser = GetTokenInformation(Token, TokenUser, TokenUserBuf,
-                                                 sizeof(TokenUserBuf), &TokenUserLen);
-        CloseHandle(Token);
-        if (!GotUser)
-            return false;
-
-        PSID UserSid = reinterpret_cast<TOKEN_USER*>(TokenUserBuf)->User.Sid;
         BYTE AdminSid[SECURITY_MAX_SID_SIZE];
         BYTE SystemSid[SECURITY_MAX_SID_SIZE];
         DWORD AdminLen = sizeof(AdminSid);
@@ -98,20 +87,15 @@ struct HandoffSectionSecurity
             !CreateWellKnownSid(WinLocalSystemSid, nullptr, SystemSid, &SystemLen))
             return false;
 
-        const DWORD UserLen = GetLengthSid(UserSid);
         const DWORD AclSize = sizeof(ACL) +
-            3 * (sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD)) +
-            UserLen + AdminLen + SystemLen;
+            2 * (sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD)) +
+            AdminLen + SystemLen;
         if (AclSize > sizeof(AclStorage))
             return false;
 
         Acl = reinterpret_cast<ACL*>(AclStorage);
-        // The loader opens the section RW for the deferred-key handshake; the
-        // creator keeps its RW handle. Same-user readers could already read the
-        // key, so SECTION_MAP_WRITE is not a new confidentiality boundary.
         const DWORD SectionAccess = SECTION_MAP_READ | SECTION_MAP_WRITE | READ_CONTROL;
         if (!InitializeAcl(Acl, AclSize, ACL_REVISION) ||
-            !AddAccessAllowedAce(Acl, ACL_REVISION, SectionAccess, UserSid) ||
             !AddAccessAllowedAce(Acl, ACL_REVISION, SectionAccess, AdminSid) ||
             !AddAccessAllowedAce(Acl, ACL_REVISION, SectionAccess, SystemSid))
             return false;
