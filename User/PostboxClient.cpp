@@ -409,6 +409,31 @@ int PostboxClientMain(int argc, char** argv)
         return 1;
     }
 
+    // Write to a read-only user page: MmCopyVirtualMemory must return an access
+    // violation instead of raising or silently modifying the page.
+    void* RoPage = VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (RoPage)
+    {
+        DWORD OldProtect = 0;
+        VirtualProtect(RoPage, 0x1000, PAGE_READONLY, &OldProtect);
+        x = 0xDEAD;
+        std::memcpy(Data, &x, sizeof(x));
+        if (!Submit(Header, Data, S, pb_write,
+                    reinterpret_cast<uint64_t>(RoPage), sizeof(x), 3000))
+        {
+            std::printf("bad write: timeout or auth failure\n");
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+        std::printf("bad write: status=0x%X\n", static_cast<unsigned>(S.Status));
+        if (S.Status != static_cast<int32_t>(0xC0000005))
+        {
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+        VirtualFree(RoPage, 0, MEM_RELEASE);
+    }
+
     // Bulk path: exercises ~9 pages of the 16-page mailbox and a multi-page CopyVirtualMemory.
     static uint8_t Pattern[0x8000];
     static uint8_t Bulk[0x8000];
