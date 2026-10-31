@@ -121,7 +121,10 @@ struct PostboxConfig
     uint64_t MmFreeIndependentPages;// loader-resolved stage free routine
 };
 
-// Client -> loader handoff, written at the start of the mailbox body before the first ping.
+// Legacy in-page handoff. The current client does NOT write this into the mailbox
+// body: the loader would have to open the client process and ReadProcessMemory it,
+// which is a T3 READVM/ProcessAccess event. Kept only so older evidence and the
+// tamper harness still compile; new code uses PostboxSectionHandoff below.
 constexpr uint32_t PostboxHandoffMagic = 0x314B4250;   // "PBK1"
 struct PostboxHandoff
 {
@@ -132,6 +135,38 @@ struct PostboxHandoff
     uint8_t Key[32];                // master key; loader copies, then wipes
 };
 static_assert(sizeof(PostboxHandoff) == 0x38, "PostboxHandoff layout changed");
+
+// Client -> loader bootstrap handoff, carried in a pagefile-backed named section.
+// The client creates the section (random name, explicit DACL), maps it RW, writes
+// this record, and passes the name on the loader command line (or in a file that
+// contains only the name). The loader opens the section read-only, copies the
+// record, unmaps/closes, and never touches the client address space. The section
+// is page-granular and is deleted when the last handle closes.
+//
+// CreateTime is not independently verified by the loader any more (that needed a
+// process handle + GetProcessTimes). The driver re-checks it with
+// PsGetProcessCreateTimeQuadPart before it touches the mailbox (Postbox.cpp), so
+// a forged record only fails PostboxStart.
+constexpr uint32_t PostboxSectionHandoffMagic = 0x31584250;   // "PBX1"
+constexpr uint32_t PostboxSectionHandoffVersion = 2;
+constexpr uint32_t PostboxSectionBytes = 0x1000;              // one page
+
+struct alignas(8) PostboxSectionHandoff
+{
+    uint32_t Magic;
+    uint32_t Version;               // PostboxSectionHandoffVersion
+    uint32_t Pid;                   // mailbox owner
+    uint32_t Reserved;
+    uint64_t MailboxVa;             // user VA of the mailbox (8-byte aligned)
+    uint64_t SessionId;             // per-session random ID
+    uint64_t CreateTime;            // client process creation time, diagnostic
+    uint8_t Key[32];                // master key; loader copies, then wipes
+};
+static_assert(sizeof(PostboxSectionHandoff) == 0x48, "PostboxSectionHandoff layout changed");
+static_assert(offsetof(PostboxSectionHandoff, MailboxVa) == 0x10,
+              "PostboxSectionHandoff MailboxVa offset changed");
+static_assert(offsetof(PostboxSectionHandoff, Key) == 0x28,
+              "PostboxSectionHandoff Key offset changed");
 
 static_assert(sizeof(PostboxConfig) == 0x110, "PostboxConfig layout changed");
 static_assert(offsetof(PostboxConfig, CreateTime) == 0x38, "CreateTime offset changed");

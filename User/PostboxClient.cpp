@@ -1,7 +1,10 @@
 // Postbox client: the user side of the timer/work-item channel. The mailbox is a normal
-// private page owned by this process; there is no section, no handle, and no syscall in
-// the request loop. Run this first, note the printed pid/VA, then run mapload with
-// --postbox <pid> <va>; the client pings automatically.
+// private page owned by this process; the request loop does not touch the section or any
+// cross-process API. Bootstrap uses one pagefile-backed named section that carries
+// {pid, VA, key, session, create time} to the loader, so the loader needs no process
+// handle and no cross-process read. Run this first, note the printed section name, then
+// run mapload with --postbox-section <name> (or --postbox-file <path> if --handoff was
+// given); the client pings automatically.
 #include <windows.h>
 #include <bcrypt.h>
 #include <cstddef>
@@ -45,29 +48,151 @@ static bool RandomBytes(void* Buffer, size_t Size)
                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0;
 }
 
-// The PBK1 master key must stay readable until the loader copies it. The loader
-// reads it after provider bring-up and before the entry call; normal runs take a
-// few seconds. Cap the worst-case exposure at 60 s (the ping timeout): after that the first ping's
-// wait loop wipes the key even if the loader never arrives. The working session
-// keys are already derived, so the client keeps working if the loader was fast.
-static volatile uint8_t* g_HandoffKey = nullptr;
+// The master key must stay readable until the loader copies it. It lives in a
+// one-page, pagefile-backed named section: the loader opens the section read-only
+// before any provider work, copies the record, and closes it. There is no process
+// handle and no cross-process read. The name is random per run and is the only
+// thing printed or written to the optional --handoff file.
+//
+// Cap the worst-case exposure at 60 s (the ping timeout): after that the first
+// ping's wait loop wipes the section even if the loader never arrives. The working
+// session keys are already derived, so the client keeps working if the loader was
+// fast.
+static HANDLE g_HandoffSection = nullptr;
+static void* g_HandoffView = nullptr;
 static ULONGLONG g_HandoffWipeAt = 0;
 constexpr ULONGLONG HandoffKeyGraceMs = 60000;
 
-static void ExpireHandoffKey()
+// Explicit DACL: the creating user, Administrators, and SYSTEM. A default DACL
+// would also work for a same-user loader, but this is deterministic and does not
+// depend on the parent process's inherited ACEs. The mandatory label is left at
+// the token default (medium for a normal client), so an elevated loader can still
+// read it: the default policy is NO_WRITE_UP, not NO_READ_UP.
+struct HandoffSectionSecurity
 {
-    if (g_HandoffKey && GetTickCount64() >= g_HandoffWipeAt)
+    SECURITY_DESCRIPTOR Sd;
+    SECURITY_ATTRIBUTES Sa;
+    ACL* Acl;
+    BYTE AclStorage[512];
+
+    bool Build()
     {
-        uint8_t* Base = const_cast<uint8_t*>(g_HandoffKey) - offsetof(PostboxHandoff, Key);
-        SecureZeroMemory(Base, sizeof(PostboxHandoff));
-        g_HandoffKey = nullptr;
+        BYTE TokenUserBuf[256];
+        DWORD TokenUserLen = 0;
+        HANDLE Token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &Token))
+            return false;
+        const BOOL GotUser = GetTokenInformation(Token, TokenUser, TokenUserBuf,
+                                                 sizeof(TokenUserBuf), &TokenUserLen);
+        CloseHandle(Token);
+        if (!GotUser)
+            return false;
+
+        PSID UserSid = reinterpret_cast<TOKEN_USER*>(TokenUserBuf)->User.Sid;
+        BYTE AdminSid[SECURITY_MAX_SID_SIZE];
+        BYTE SystemSid[SECURITY_MAX_SID_SIZE];
+        DWORD AdminLen = sizeof(AdminSid);
+        DWORD SystemLen = sizeof(SystemSid);
+        if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, AdminSid, &AdminLen) ||
+            !CreateWellKnownSid(WinLocalSystemSid, nullptr, SystemSid, &SystemLen))
+            return false;
+
+        const DWORD UserLen = GetLengthSid(UserSid);
+        const DWORD AclSize = sizeof(ACL) +
+            3 * (sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD)) +
+            UserLen + AdminLen + SystemLen;
+        if (AclSize > sizeof(AclStorage))
+            return false;
+
+        Acl = reinterpret_cast<ACL*>(AclStorage);
+        if (!InitializeAcl(Acl, AclSize, ACL_REVISION) ||
+            !AddAccessAllowedAce(Acl, ACL_REVISION, SECTION_MAP_READ | READ_CONTROL, UserSid) ||
+            !AddAccessAllowedAce(Acl, ACL_REVISION, SECTION_MAP_READ | READ_CONTROL, AdminSid) ||
+            !AddAccessAllowedAce(Acl, ACL_REVISION, SECTION_MAP_READ | READ_CONTROL, SystemSid))
+            return false;
+        if (!InitializeSecurityDescriptor(&Sd, SECURITY_DESCRIPTOR_REVISION) ||
+            !SetSecurityDescriptorDacl(&Sd, TRUE, Acl, FALSE))
+            return false;
+
+        Sa.nLength = sizeof(Sa);
+        Sa.lpSecurityDescriptor = &Sd;
+        Sa.bInheritHandle = FALSE;
+        return true;
     }
+};
+
+// Local\ + 32 hex chars. No product prefix: there is no static name string for a
+// T0 file/string scan to key on, and the loader receives the whole name.
+static bool CreateHandoffSection(const PostboxSectionHandoff& Handoff, wchar_t* Name,
+                                 size_t NameChars)
+{
+    uint8_t Id[16];
+    if (!RandomBytes(Id, sizeof(Id)))
+        return false;
+
+    static const wchar_t Hex[] = L"0123456789abcdef";
+    static const wchar_t Prefix[] = L"Local\\";
+    const size_t PrefixChars = sizeof(Prefix) / sizeof(Prefix[0]) - 1;
+    if (NameChars < PrefixChars + 2 * sizeof(Id) + 1)
+        return false;
+
+    size_t At = 0;
+    for (size_t i = 0; i < PrefixChars; ++i)
+        Name[At++] = Prefix[i];
+    for (size_t i = 0; i < sizeof(Id); ++i)
+    {
+        Name[At++] = Hex[Id[i] >> 4];
+        Name[At++] = Hex[Id[i] & 0xF];
+    }
+    Name[At] = 0;
+
+    HandoffSectionSecurity Security;
+    if (!Security.Build())
+        return false;
+
+    HANDLE Section = CreateFileMappingW(INVALID_HANDLE_VALUE, &Security.Sa,
+                                        PAGE_READWRITE, 0, PostboxSectionBytes, Name);
+    if (!Section)
+        return false;
+    void* View = MapViewOfFile(Section, FILE_MAP_WRITE, 0, 0, PostboxSectionBytes);
+    if (!View)
+    {
+        CloseHandle(Section);
+        return false;
+    }
+
+    std::memcpy(View, &Handoff, sizeof(Handoff));
+    g_HandoffSection = Section;
+    g_HandoffView = View;
+    g_HandoffWipeAt = GetTickCount64() + HandoffKeyGraceMs;
+    return true;
 }
 
-static void WipeHandoff(uint8_t* Data)
+static void WipeHandoffSection()
 {
-    SecureZeroMemory(Data, sizeof(PostboxHandoff));
-    g_HandoffKey = nullptr;
+    if (g_HandoffView)
+        SecureZeroMemory(g_HandoffView, PostboxSectionBytes);
+}
+
+static void ExpireHandoffSection()
+{
+    if (g_HandoffView && GetTickCount64() >= g_HandoffWipeAt)
+        WipeHandoffSection();
+}
+
+static void CloseHandoffSection()
+{
+    WipeHandoffSection();
+    if (g_HandoffView)
+    {
+        UnmapViewOfFile(g_HandoffView);
+        g_HandoffView = nullptr;
+    }
+    if (g_HandoffSection)
+    {
+        CloseHandle(g_HandoffSection);
+        g_HandoffSection = nullptr;
+    }
 }
 
 static bool Submit(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
@@ -108,7 +233,7 @@ static bool Submit(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
     const ULONGLONG Deadline = GetTickCount64() + TimeoutMs;
     while (GetTickCount64() < Deadline)
     {
-        ExpireHandoffKey();
+        ExpireHandoffSection();
         if (Header->Ack == Seq) break;
         Sleep(1);
     }
@@ -319,16 +444,27 @@ int PostboxClientMain(int argc, char** argv)
     const uint64_t CreateTime64 =
         (static_cast<uint64_t>(CreateTime.dwHighDateTime) << 32) | CreateTime.dwLowDateTime;
 
-    // Write the handoff before printing the pid/VA, so the loader can read it as soon as
-    // it starts. The ping has Size = 0 and does not disturb these bytes.
-    PostboxHandoff* Handoff = reinterpret_cast<PostboxHandoff*>(Data);
-    Handoff->Magic = PostboxHandoffMagic;
-    Handoff->Version = 1;
-    Handoff->SessionId = SessionId;
-    Handoff->CreateTime = CreateTime64;
-    std::memcpy(Handoff->Key, Master, sizeof(Handoff->Key));
-    g_HandoffKey = Handoff->Key;
-    g_HandoffWipeAt = GetTickCount64() + HandoffKeyGraceMs;
+    // Publish the bootstrap record in a one-page pagefile-backed section before
+    // printing, so the loader can open it as soon as it starts. The mailbox body
+    // stays zeroed: there is no PBK1 signature or master key in the 64 KiB page.
+    PostboxSectionHandoff Handoff{};
+    Handoff.Magic = PostboxSectionHandoffMagic;
+    Handoff.Version = PostboxSectionHandoffVersion;
+    Handoff.Pid = S.Pid;
+    Handoff.MailboxVa = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Base));
+    Handoff.SessionId = SessionId;
+    Handoff.CreateTime = CreateTime64;
+    std::memcpy(Handoff.Key, Master, sizeof(Handoff.Key));
+
+    wchar_t SectionName[64] = {};
+    if (!CreateHandoffSection(Handoff, SectionName, _countof(SectionName)))
+    {
+        SecureZeroMemory(&Handoff, sizeof(Handoff));
+        SecureZeroMemory(Master, sizeof(Master));
+        std::printf("postbox: handoff section creation failed, error %lu\n", GetLastError());
+        return 1;
+    }
+    SecureZeroMemory(&Handoff, sizeof(Handoff));
 
     // Derive the working keys from a copy; DerivePostboxKeys wipes its input.
     uint8_t MasterCopy[32];
@@ -338,16 +474,15 @@ int PostboxClientMain(int argc, char** argv)
     SecureZeroMemory(MasterCopy, sizeof(MasterCopy));
     S.SessionId = SessionId;
 
-    // Optional out-of-band handoff: the loader reads the PID/VA from this file
-    // instead of argv, so the loader command line does not disclose the target.
-    // The file carries only PID/VA (not the key) and the loader deletes it.
+    // Optional out-of-band handoff: the file carries only the random section name
+    // (never PID/VA/key), so the loader command line does not disclose the target.
+    // The loader reads it and deletes it.
     if (Options.HandoffPath)
     {
         FILE* f = nullptr;
         if (fopen_s(&f, Options.HandoffPath, "w") == 0 && f)
         {
-            std::fprintf(f, "%lu 0x%llX\n", static_cast<unsigned long>(S.Pid),
-                         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Base)));
+            std::fprintf(f, "%ls\n", SectionName);
             std::fclose(f);
         }
     }
@@ -355,13 +490,13 @@ int PostboxClientMain(int argc, char** argv)
     std::printf("postbox: pid=%lu va=0x%llX size=0x%X\n",
                 static_cast<unsigned long>(S.Pid),
                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Base)), PostboxBytes);
+    std::printf("postbox: section=%ls\n", SectionName);
     if (Options.HandoffPath)
         std::printf("run: mapload.exe --sys Driver.sys --provider pte --postbox-file %s\n",
                     Options.HandoffPath);
     else
-        std::printf("run: mapload.exe --sys Driver.sys --provider pte --postbox %lu 0x%llX\n",
-                    static_cast<unsigned long>(S.Pid),
-                    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Base)));
+        std::printf("run: mapload.exe --sys Driver.sys --provider pte --postbox-section \"%ls\"\n",
+                    SectionName);
     std::printf("waiting up to 60 s for the driver...\n");
     std::fflush(stdout);
 
@@ -371,19 +506,19 @@ int PostboxClientMain(int argc, char** argv)
     {
         std::printf("ping: timeout or auth failure (driver not mapped, wrong pid/VA/CreateTime, "
                     "or key/session mismatch)\n");
-        WipeHandoff(Data);
+        CloseHandoffSection();
         return 1;
     }
     std::printf("ping: status=0x%X\n", static_cast<unsigned>(S.Status));
     if (S.Status != 0)
     {
-        WipeHandoff(Data);
+        CloseHandoffSection();
         StopBestEffort(Header, Data, S);
         return 1;
     }
 
-    // The driver has consumed the handoff; do not leave the master key in the mailbox.
-    WipeHandoff(Data);
+    // The loader has copied the handoff; do not leave the master key in the section.
+    CloseHandoffSection();
 
     // Deterministic dead-client test: exit abruptly after a successful ping and the wipe,
     // with no pb_stop, so the driver must notice the client is gone on its own.

@@ -119,9 +119,12 @@ static address g_PsGetProcessCreateTimeQuadPart_Raw = 0;
 static address g_PsGetCurrentProcess_Raw = 0;
 static address g_ExAllocatePoolWithTag_Raw = 0;
 static address g_ExFreePool_Raw = 0;
-static address g_MmAllocateIndependentPages = 0;
-static address g_MmSetPageProtection = 0;
-static address g_MmFreeIndependentPages = 0;
+// Staging slots for the three independent-page helpers. PostboxStart fills them
+// from the loader config, moves them into PostboxState.Imports as soon as the
+// state page exists, and zeroes them. No later path reads these.
+static address g_MmAllocateIndependentPages_Raw = 0;
+static address g_MmSetPageProtection_Raw = 0;
+static address g_MmFreeIndependentPages_Raw = 0;
 
 static address g_MmCopyMemory = 0;
 static address g_MmCopyVirtualMemory_Raw = 0;
@@ -136,17 +139,25 @@ static volatile long PostboxReaperStarted = 0;
 
 // The reaper stub is assembly in PostboxReaper.S. It runs as a system thread,
 // waits for the work routine to return, frees the state page, then tail-jumps to
-// MmFreeIndependentPages so the free returns to PspSystemThreadStartup.
-extern "C" uint64_t PostboxReaperBase = 0;   // loader allocation base (RawBase)
-extern "C" uint64_t PostboxReaperSize = 0;   // loader allocation size (AllocSize)
-extern "C" uint64_t PostboxReaperFree = 0;   // resolved MmFreeIndependentPages
+// MmFreeIndependentPages so the free returns to PspSystemThreadStartup. The
+// thread's StartContext is the state page; the image range and free routine are
+// read from it before the page is wiped, so no reaper context lives in .data.
+struct PostboxState;
+struct PostboxReaperPlan
+{
+    uint64_t Base;
+    uint64_t Size;
+    uint64_t Free;
+};
 extern "C" void PostboxReaperEntry();
-extern "C" void PostboxReaperPrepare();
+extern "C" uint64_t PostboxReaperPrepare(PostboxState* State, PostboxReaperPlan* Plan);
 
 // Resolved ntoskrnl routines used after the state page exists. They are copied
 // out of .data into the state page by PostboxStart and zeroed in .data, so a
 // static .data scan sees no routine table. KeIpiGenericCall stays in .data: the
-// pre-start ProtectImageSections path needs it before the state page exists.
+// pre-start ProtectImageSections path needs it before the state page exists. The
+// three independent-page helpers are staged in .data only long enough to create
+// and protect the state page, then they move here too.
 struct PostboxImports
 {
     address KeInitializeTimerEx;
@@ -167,6 +178,9 @@ struct PostboxImports
     address PsReleaseProcessExitSynchronization;
     address PsCreateSystemThread;
     address ZwClose;
+    address MmAllocateIndependentPages;
+    address MmSetPageProtection;
+    address MmFreeIndependentPages;
 };
 
 // The live protocol state (config, keys, timer/DPC/work, client EPROCESS, stage)
@@ -186,6 +200,10 @@ struct PostboxState
     uint32_t AuthFailures;
     bool StageIndependent;
     PostboxImports Imports;
+    // Loader allocation passed to the reaper. Kept in the state page, not .data,
+    // so the image base/size do not reappear in the resident image during stop.
+    uint64_t ReaperBase;
+    uint64_t ReaperSize;
 };
 static PostboxState* PostboxStatePtr = nullptr;
 
@@ -207,6 +225,9 @@ static PostboxState* PostboxStatePtr = nullptr;
 #define g_PsReleaseProcessExitSynchronization (PostboxStatePtr->Imports.PsReleaseProcessExitSynchronization)
 #define g_PsCreateSystemThread (PostboxStatePtr->Imports.PsCreateSystemThread)
 #define g_ZwClose (PostboxStatePtr->Imports.ZwClose)
+#define g_MmAllocateIndependentPages (PostboxStatePtr->Imports.MmAllocateIndependentPages)
+#define g_MmSetPageProtection (PostboxStatePtr->Imports.MmSetPageProtection)
+#define g_MmFreeIndependentPages (PostboxStatePtr->Imports.MmFreeIndependentPages)
 
 constexpr uint32_t StageBytes = PostboxDataMax;
 constexpr uint32_t StageAllocBytes = (StageBytes + 0xFFFu) & ~0xFFFu;
@@ -657,30 +678,66 @@ static void PostboxFreeStatePage()
     PostboxState* State = (PostboxState*) __atomic_exchange_n(
         (void**) &PostboxStatePtr, nullptr, __ATOMIC_ACQ_REL);
     if (!State) return;
+    // The free helper now lives inside the page this call is about to wipe. Read
+    // it out first; the g_Mm* macros must not be used after the exchange because
+    // PostboxStatePtr is already null.
+    const address Free = State->Imports.MmFreeIndependentPages;
     PostboxWipe(State, 0x1000);
-    if (g_MmFreeIndependentPages)
-        ((FnMmFreeIndependentPages) g_MmFreeIndependentPages)(State, 0x1000);
+    if (Free)
+        ((FnMmFreeIndependentPages) Free)(State, 0x1000);
 }
 
-// Reaper thread body. The assembly entry calls this at PASSIVE, then tail-jumps
-// to MmFreeIndependentPages. Wait for the worker to clear InFlight (which happens
-// after it clears the work item and the caller releases the EPROCESS), then give
-// the worker's ret and the loader's post-entry ROT1 wipe time to finish.
-extern "C" void PostboxReaperPrepare()
+// Reaper thread body. The assembly entry calls this at PASSIVE with the state
+// page as its argument, then tail-jumps to MmFreeIndependentPages. Wait for the
+// worker to clear InFlight (which happens after it clears the work item and the
+// caller releases the EPROCESS), then give the worker's ret and the loader's
+// post-entry ROT1 wipe time to finish.
+//
+// Returns 1 with Plan filled when the caller may free the image. Returns 0 when
+// the worker is still in flight or the page is no longer ours; the stub then
+// returns without freeing anything. Leaking is deliberate: freeing the state page
+// or image under a stalled worker is a use-after-free/bugcheck.
+extern "C" uint64_t PostboxReaperPrepare(PostboxState* State, PostboxReaperPlan* Plan)
 {
+    if (!State || !Plan) return 0;
+
     for (uint32_t i = 0; i < 1000 && __atomic_load_n(&PostboxInFlight, __ATOMIC_ACQUIRE); ++i)
     {
         _LARGE_INTEGER Interval{};
         Interval.QuadPart = -10000;   // 1 ms
-        ((FnKeDelayExecutionThread) g_KeDelayExecutionThread)(0, 0, &Interval);
+        ((FnKeDelayExecutionThread) State->Imports.KeDelayExecutionThread)(0, 0, &Interval);
     }
+
+    // K-06: the bounded wait expired with the worker still in flight. Do not
+    // free the state page or the image; leave both resident.
+    if (__atomic_load_n(&PostboxInFlight, __ATOMIC_ACQUIRE) != 0)
+        return 0;
+
     _LARGE_INTEGER Delay{};
     Delay.QuadPart = -5000000;        // 500 ms
-    ((FnKeDelayExecutionThread) g_KeDelayExecutionThread)(0, 0, &Delay);
+    ((FnKeDelayExecutionThread) State->Imports.KeDelayExecutionThread)(0, 0, &Delay);
 
-    // The worker has returned; the WORK_QUEUE_ITEM is no longer in use. Free the
-    // state page before the image that holds this stub and its globals is released.
-    PostboxFreeStatePage();
+    const uint64_t Base = State->ReaperBase;
+    const uint64_t Size = State->ReaperSize;
+    const address Free = State->Imports.MmFreeIndependentPages;
+    if (!Base || !Size || !Free)
+        return 0;
+
+    // Exchange first so a concurrent stop cannot free the same page twice. If a
+    // new state page replaced this one, leave the old page alone.
+    PostboxState* Expected = State;
+    if (!__atomic_compare_exchange_n((PostboxState**) &PostboxStatePtr, &Expected,
+                                     nullptr, false, __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE))
+        return 0;
+
+    PostboxWipe(State, 0x1000);
+    ((FnMmFreeIndependentPages) Free)(State, 0x1000);
+
+    Plan->Base = Base;
+    Plan->Size = Size;
+    Plan->Free = (uint64_t) Free;
+    return 1;
 }
 
 // Creates the system thread whose entry is the assembly tail-jump stub. The
@@ -690,26 +747,36 @@ static bool PostboxStartReaper()
 {
     if (__atomic_exchange_n(&PostboxReaperStarted, 1, __ATOMIC_ACQ_REL) != 0)
         return true;
-    if (!g_PsCreateSystemThread || !g_ZwClose || !g_MmFreeIndependentPages ||
-        !PostboxReaperBase || !PostboxReaperSize)
+    // The import macros dereference PostboxStatePtr. A second stop after a failed
+    // reaper can arrive with the page already freed; refuse instead of faulting.
+    if (!PostboxStatePtr)
+    {
+        __atomic_store_n(&PostboxReaperStarted, 0, __ATOMIC_RELEASE);
+        return false;
+    }
+    PostboxState* State = PostboxStatePtr;
+    const address CreateThread = State->Imports.PsCreateSystemThread;
+    const address CloseThread = State->Imports.ZwClose;
+    if (!CreateThread || !CloseThread || !State->Imports.MmFreeIndependentPages ||
+        !State->ReaperBase || !State->ReaperSize)
     {
         __atomic_store_n(&PostboxReaperStarted, 0, __ATOMIC_RELEASE);
         return false;
     }
 
-    PostboxReaperFree = (uint64_t) g_MmFreeIndependentPages;
-
+    // The reaper frees the state page, so read the close routine into a local
+    // before the thread can run. The StartContext is the state page itself.
     void* ThreadHandle = nullptr;
-    const int32_t Status = ((FnPsCreateSystemThread) g_PsCreateSystemThread)(
+    const int32_t Status = ((FnPsCreateSystemThread) CreateThread)(
         &ThreadHandle, 0x1FFFFF /* THREAD_ALL_ACCESS */, nullptr, nullptr, nullptr,
-        (void*) &PostboxReaperEntry, nullptr);
+        (void*) &PostboxReaperEntry, State);
     if (Status < 0 || !ThreadHandle)
     {
         __atomic_store_n(&PostboxReaperStarted, 0, __ATOMIC_RELEASE);
         print(ERROR("Postbox: reaper thread creation failed"));
         return false;
     }
-    ((FnZwClose) g_ZwClose)(ThreadHandle);
+    ((FnZwClose) CloseThread)(ThreadHandle);
     print(INFO("Postbox: reaper armed"));
     return true;
 }
@@ -746,9 +813,10 @@ static void PostboxDeadTick()
     PostboxCancel();
     PostboxFreeStage();
     PostboxFreeState();
-    PostboxStartReaper();
+    // Finish every state-page write before the reaper can free the page.
     PostboxStatePtr->SessionId = 0;
     PostboxStatePtr->LastNonce = 0;
+    PostboxStartReaper();
 }
 
 // Runs at DISPATCH_LEVEL on the per-CPU DPC stack. It does no memory access: only the
@@ -1015,9 +1083,10 @@ static void PostboxPollAttached(void* MailboxProcess)
         PostboxCancel();
         PostboxFreeStage();
         PostboxFreeState();
-        PostboxStartReaper();
+        // Finish every state-page write before the reaper can free the page.
         PostboxStatePtr->SessionId = 0;
         PostboxStatePtr->LastNonce = 0;
+        PostboxStartReaper();
     }
 
     PostboxWipe(&Plain, sizeof(Plain));
@@ -1039,10 +1108,11 @@ static void PostboxPoll()
         PostboxCancel();
         PostboxFreeStage();
         PostboxFreeState();
-        PostboxStartReaper();
+        // Finish every state-page write before the reaper can free the page.
         PostboxStatePtr->SessionId = 0;
         PostboxStatePtr->LastNonce = 0;
         PostboxMaybeReleaseProcess();
+        PostboxStartReaper();
         return;
     }
 
@@ -1087,6 +1157,10 @@ bool PostboxStart(const PostboxConfig* Config)
     if (__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE)) return true;
     if (!Config || Config->Magic != PostboxConfigMagic || Config->Version != 4 ||
         !Config->Pid || !Config->MailboxVa || !Config->CreateTime || !Config->SessionId) return false;
+    // The self-free reaper may only call MmFreeIndependentPages on an independent
+    // allocation. The loader sets Reserved bit 0 for that layout; fail closed for
+    // a pool image instead of arming a wrong free.
+    if (!(Config->Reserved & 1u)) return false;
     if (Config->MailboxVa > PostboxUserLimit - PostboxBytes || (Config->MailboxVa & 7)) return false;
 
     bool KeyNonZero = false;
@@ -1095,14 +1169,17 @@ bool PostboxStart(const PostboxConfig* Config)
     if (!KeyNonZero) return false;
 
     // The state page needs the independent-page helpers before it can be allocated.
-    g_MmAllocateIndependentPages = (address) Config->MmAllocateIndependentPages;
-    g_MmSetPageProtection = (address) Config->MmSetPageProtection;
-    g_MmFreeIndependentPages = (address) Config->MmFreeIndependentPages;
-    if (!g_MmAllocateIndependentPages || !g_MmSetPageProtection || !g_MmFreeIndependentPages)
+    // Validate them from the loader config here; they are staged in .data only for
+    // the two calls that create and protect the page, then the page owns them
+    // (Imports below).
+    if (!Config->MmAllocateIndependentPages || !Config->MmSetPageProtection ||
+        !Config->MmFreeIndependentPages)
         return false;
 
     // A previous start may have left the page resident (watchdog/stop). Never
-    // overwrite the only pointer: free it first when no worker is in flight.
+    // overwrite the only pointer: free it first when no worker is in flight. The
+    // old page carries its own free helper, so this works after the raw slots were
+    // zeroed at the end of the previous start.
     if (PostboxStatePtr)
     {
         if (__atomic_load_n(&PostboxInFlight, __ATOMIC_ACQUIRE) != 0)
@@ -1111,17 +1188,40 @@ bool PostboxStart(const PostboxConfig* Config)
         PostboxFreeStatePage();
     }
 
+    g_MmAllocateIndependentPages_Raw = (address) Config->MmAllocateIndependentPages;
+    g_MmSetPageProtection_Raw = (address) Config->MmSetPageProtection;
+    g_MmFreeIndependentPages_Raw = (address) Config->MmFreeIndependentPages;
+
     PostboxStatePtr = (PostboxState*) ((FnMmAllocateIndependentPages)
-        g_MmAllocateIndependentPages)(0x1000, 0xFFFFFFFF, 0, 0);
-    if (!PostboxStatePtr) return false;
-    if (!((FnMmSetPageProtection) g_MmSetPageProtection)(
+        g_MmAllocateIndependentPages_Raw)(0x1000, 0xFFFFFFFF, 0, 0);
+    if (!PostboxStatePtr)
+    {
+        g_MmAllocateIndependentPages_Raw = 0;
+        g_MmSetPageProtection_Raw = 0;
+        g_MmFreeIndependentPages_Raw = 0;
+        return false;
+    }
+    if (!((FnMmSetPageProtection) g_MmSetPageProtection_Raw)(
             PostboxStatePtr, 0x1000, 0x04 /* PAGE_READWRITE */))
     {
-        ((FnMmFreeIndependentPages) g_MmFreeIndependentPages)(PostboxStatePtr, 0x1000);
+        ((FnMmFreeIndependentPages) g_MmFreeIndependentPages_Raw)(PostboxStatePtr, 0x1000);
         PostboxStatePtr = nullptr;
+        g_MmAllocateIndependentPages_Raw = 0;
+        g_MmSetPageProtection_Raw = 0;
+        g_MmFreeIndependentPages_Raw = 0;
         return false;
     }
     PostboxWipe(PostboxStatePtr, 0x1000);
+
+    // The page owns the three helpers now. Copy them before any failure path can
+    // reach PostboxFreeStatePage, then zero the .data slots so a static .data scan
+    // finds no page-allocator pointer after start.
+    PostboxStatePtr->Imports.MmAllocateIndependentPages = g_MmAllocateIndependentPages_Raw;
+    PostboxStatePtr->Imports.MmSetPageProtection = g_MmSetPageProtection_Raw;
+    PostboxStatePtr->Imports.MmFreeIndependentPages = g_MmFreeIndependentPages_Raw;
+    g_MmAllocateIndependentPages_Raw = 0;
+    g_MmSetPageProtection_Raw = 0;
+    g_MmFreeIndependentPages_Raw = 0;
 
     PostboxStatePtr->Cfg = *Config;
     PostboxStatePtr->Cfg.MmAllocateIndependentPages = 0;
@@ -1133,12 +1233,10 @@ bool PostboxStart(const PostboxConfig* Config)
     PostboxStatePtr->Cfg.Magic = 0;
     PostboxStatePtr->Cfg.Version = 0;
     // The reaper frees the loader allocation, not the aligned image base. Save
-    // RawBase/AllocSize before the layout copy is wiped. Lab build: the Postbox
-    // manual-map layout is always independent pages, and the known-good
-    // de9f061c loader predates Config.Reserved, so trust the layout here. The
-    // Reserved-bit gate returns for the production loader.
-    PostboxReaperBase = Config->Layout.RawBase;
-    PostboxReaperSize = Config->Layout.AllocSize;
+    // RawBase/AllocSize in the state page (not .data) before the layout copy is
+    // wiped. The Config.Reserved gate above guarantees the independent layout.
+    PostboxStatePtr->ReaperBase = Config->Layout.RawBase;
+    PostboxStatePtr->ReaperSize = Config->Layout.AllocSize;
     // The section map is only needed by ProtectImageSections(), which ran before
     // this copy. Do not leave the RVAs/sizes in the resident .data image.
     PostboxWipe(&PostboxStatePtr->Cfg.Layout, sizeof(PostboxStatePtr->Cfg.Layout));

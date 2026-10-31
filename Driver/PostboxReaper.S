@@ -2,24 +2,39 @@
 #
 # PsCreateSystemThread starts this stub as the thread entry. PspSystemThreadStartup
 # called it with the Windows x64 ABI, so the return address on the stack is in
-# ntoskrnl, not in the image.
+# ntoskrnl, not in the image. RCX is the StartContext: the PostboxState page.
 #
 # PostboxReaperPrepare (C, PASSIVE) waits for the work routine to return, then
-# frees the resident state page. The stub then loads the image range and the
-# resolved MmFreeIndependentPages address and tail-jumps into it. The tail jump
-# is the point: no instruction is fetched from the image after the free.
+# fills a three-qword plan (RawBase, AllocSize, MmFreeIndependentPages) and frees
+# the state page. The stub then tail-jumps to MmFreeIndependentPages. The tail
+# jump is the point: no instruction is fetched from the image after the free.
 # MmFreeIndependentPages returns to PspSystemThreadStartup, which terminates the
 # thread.
+#
+# If PostboxReaperPrepare returns 0 (the worker is still in flight, or another
+# teardown owns the page), the stub returns without freeing the image. The image
+# and state page leak rather than being freed under a stalled worker.
 
     .text
     .globl PostboxReaperEntry
 PostboxReaperEntry:
     pushq %rbx
-    subq $0x20, %rsp
+    subq $0x40, %rsp
+    movq %rcx, %rbx                 # StartContext = PostboxState*
+    leaq 0x20(%rsp), %rdx           # PostboxReaperPlan on this thread's stack
+    movq %rbx, %rcx
     call PostboxReaperPrepare
-    movq PostboxReaperBase(%rip), %rcx
-    movq PostboxReaperSize(%rip), %rdx
-    movq PostboxReaperFree(%rip), %rax
-    addq $0x20, %rsp
+    testq %rax, %rax
+    jz 1f
+
+    movq 0x20(%rsp), %rcx           # RawBase
+    movq 0x28(%rsp), %rdx           # AllocSize
+    movq 0x30(%rsp), %rax           # MmFreeIndependentPages
+    addq $0x40, %rsp
     popq %rbx
     jmp *%rax
+
+1:
+    addq $0x40, %rsp
+    popq %rbx
+    ret
