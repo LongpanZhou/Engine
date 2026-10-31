@@ -1,5 +1,17 @@
 # Command channel: design choice and implementation
 
+> **Current implementation (2026-10-31).** The loader no longer opens the client
+> process or reads an in-page `PBK1` record. The client creates a pagefile-backed
+> `PBX1` named section and passes only its name; the loader maps it read-only,
+> validates it, publishes `LOADER_READY`, and the client publishes the key. Use
+> `mapload --postbox-section <name> [--postbox <pid> <va>]`.
+>
+> The constructed-IDT NMI gate is **disabled**. On Windows 10 19041 its chain
+> path corrupted the interrupted thread's MXCSR save slot and bugchecked `0x3B`
+> (`0xC0000005`) in `KiSystemServiceExit`; `POSTBOX_NMI=ON` is now a configure
+> error. Sections 3.3, 3.4, 4.8 and the NMI build commands below are historical
+> and superseded by the plain Postbox build.
+
 **Status:** implemented as an opt-in build (`POSTBOX_CHANNEL`); the default build and its
 shared-memory channel are unchanged. The final build (KDPC 0x40, per-poll attach, full-range/self-only
 address policy, ordered response) compiles, signs, and has passed a live ping/read/write/stop plus a
@@ -36,7 +48,7 @@ the least-audited option:
 | Shared location | named section + VAD | client's own private page (normal VAD/PTE, no object) |
 | Trigger | dedicated system thread | timer DPC -> `ExQueueWorkItem` |
 | Execution context | payload thread stack | existing system worker at `PASSIVE`, transient |
-| Content | plaintext header/body (`ECI1`) | ChaCha20 header/body + 128-bit SipHash-2-4 tag; client CSPRNG key + PBK1 handoff |
+| Content | plaintext header/body (`ECI1`) | ChaCha20 header/body + 128-bit SipHash-2-4 tag; client CSPRNG key + PBX1 section handoff |
 
 **Consequences:** no named object, no handle, no section, no dedicated thread, no callback-list entry,
 no hook. Residual artifacts are one armed `KTIMER` in the per-PRCB timer table, a transient worker-stack
@@ -167,26 +179,26 @@ address policy.
 | `0x40` | 8 | `SessionId` (client-generated) |
 | `0x48` | 16 | `Reserved2` |
 
-`sizeof(PostboxConfig) == 0x58`. The client writes a `PostboxHandoff` at `MailboxVa + 0x40` before
-printing its PID/VA: magic `PBK1` (`0x314B4250`), version 1, `SessionId`, `CreateTime`, and `Key[32]`.
-The loader reads it with `ReadProcessMemory` (after `GetProcessTimes`), copies the key/session/create
-time into the config, and wipes its local copy. The driver derives the ChaCha20/SipHash keys and wipes
-the master; the client zeroes the handoff after the first authenticated ping. The loader allocates the
-config in kernel pool (`KfHeapAllocData`), passes its VA as `arg2`, and wipes/frees it after `CallEntry`
-returns. `DriverEntry` copies it into `PostboxCfg`; it never retains the loader's pointer. The magic is
-a type check for the bootstrap argument only; the mailbox carries a temporary PBK1 handoff during bootstrap, then the client zeroes it, so there is no persistent magic. This is
-a one-time bootstrap with no runtime discovery object. `CreateTime` is filled from `GetProcessTimes`
-and compared with `PsGetProcessCreateTimeQuadPart` on every poll, so a recycled PID is rejected.
+`sizeof(PostboxConfig) == 0x58`. Bootstrap now uses a pagefile-backed named section, not an in-page
+record: the client creates a random `Local\<32 hex>` section with an explicit DACL, maps it RW, and
+writes `PostboxSectionHandoff` (`PBX1`, magic `0x31584250`, version 2) with `{pid, mailbox VA,
+session, create time, key}`. It prints only the section name. The loader opens the section read-only,
+maps it, validates the record, copies it, unmaps/closes, and publishes `LOADER_READY` back into the
+same section. The client then CAS-publishes the key; the loader reads it immediately before entry and
+sets `CONSUMED`; a timeout sets `WITHDRAWN` and the client wipes its copy. There is no
+`OpenProcess`, `GetProcessTimes`, or `ReadProcessMemory` in the loader. The driver re-checks
+`CreateTime` with `PsGetProcessCreateTimeQuadPart`, so a forged record only fails `PostboxStart`.
 
-`mapload --postbox <pid> <va>` is the lab front end for this. The `POSTBOX_CHANNEL` build is
-manual-map only: on the SCM path the second argument is a `UNICODE_STRING` and `PostboxStart` is not
-called.
+`mapload --postbox-section <name> [--postbox <pid> <va>]` is the lab front end. `--postbox` is an
+optional assertion that must match the section record; it is not a second handoff. The
+`POSTBOX_CHANNEL` build is manual-map only: on the SCM path the second argument is a
+`UNICODE_STRING` and `PostboxStart` is not called.
 
 ### 3.4 Content protection
 
 `PostboxCrypto.h` implements ChaCha20 (RFC 8439) and SipHash-2-4. The client derives
 `ChaChaKey[32] | SipKey0[16] | SipKey1[16]` from the 32-byte master with one ChaCha20 block
-(counter 0, zero nonce), writes the `PBK1` handoff, and wipes the master. The driver repeats the KDF,
+(counter 0, zero nonce), publishes the key into the `PBX1` section after `LOADER_READY`, and wipes the master. The driver repeats the KDF,
 wipes the master, and keeps only the derived keys.
 
 - Header block: `Op/Pid/Size/Address` (20 bytes at `0x0C`) are ChaCha20-encrypted under
@@ -349,49 +361,14 @@ syscall path; the price is a transient context switch per poll.
 - The client's `Ack` timeout is the only user-visible failure; the driver never bugchecks on a missing
   mailbox page. A timeout leaves the protocol state unknown; the client should stop, not blindly retry.
 
-### 4.8 NMI gate (`POSTBOX_NMI`)
+### 4.8 NMI gate (`POSTBOX_NMI`) - disabled
 
-`POSTBOX_NMI=ON` adds `PostboxNmi.cpp` and `PostboxNmi.S`. It copies the live IDT (up to 256
-gates) into a 4 KiB table in the driver image, saves the Windows NMI gate, and replaces vector 2
-with an interrupt gate to `PostboxNmiStub` (selector/IST copied from Windows; DPL 0; present).
-The table is loaded on every active CPU with `KeSetSystemAffinityThreadEx` + `lidt` **only while a
-`pb_nmi Address=1` self-test runs**; the original IDTR is saved per CPU and restored in the same
-work item. The install first queries
-`KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS)` and refuses on more than 64 active
-CPUs or any CPU outside group 0; it never partially gates a larger/grouped system.
-`KeRevertToUserAffinityThreadEx` clears `SystemAffinityActive` before the system worker exits.
-
-The assembly stub saves all general registers, clears DF for the C ABI, calls
-`PostboxNmiDispatch`, then either `iretq`s (self-test consumed) or jumps to the saved
-`nt!KiNmiInterrupt` with the original trap frame. The dispatcher only touches RIP-relative globals
-and lock-free atomics: it increments the tick count, records the interrupted RIP/CS, and consumes
-the NMI only when `PostboxNmiSelfTestPending` is set; every other NMI is chained, except an
-external NMI that lands in the pending window (consumed; the self-test checks the handled RIP is in
-the driver).
-
-`pb_nmi` (`Address=0`) returns the total tick count (0 when the transient gate is not installed).
-`pb_nmi` (`Address=1`) installs the gate, checks the current CPU is gated, sets the pending flag, and
-sends an NMI to the current CPU: x2APIC writes ICR MSR `0x830`; xAPIC maps the APIC page with
-`MmMapIoSpace`, writes ICR `0x300`, waits for the handled count to change, then unmaps and restores
-the Windows IDTR. The response is the handled count; the self-test requires the handled RIP to be
-inside the driver, so an idle-loop external NMI does not satisfy it. An external NMI that hits the
-driver inside the pending window can still be consumed; the test is functional, not a source tag.
-
-Removal is idempotent: `PostboxNmiUninstall` clears the active flag and restores each saved IDTR.
-The gate is removed at the end of the `pb_nmi Address=1` work item, so no private IDTR survives the
-request. After a 10 ms PASSIVE grace period (covering an NMI that started just before the restore),
-`PostboxNmiQuiesceAndZero` wipes the 4 KiB table, the 640-byte old-IDTR array and the
-counters/last-RIP/CS. `PostboxOriginalNmiHandler` is deliberately preserved so an in-flight stub can
-still chain to `nt!KiNmiInterrupt`. `pb_stop`, `PostboxStop`, and the failed-poll watchdog still call
-it as defence in depth.
-
-Artifacts: during the transient `pb_nmi Address=1` self-test, `sidt`/IDTR points at the driver image
-and vector 2 is the stub; the 4 KiB table is a static copy of the Windows IDT. The gate is removed
-in the same work item, so it is not a long-lived PatchGuard risk; the feature is opt-in and the
-default Postbox build keeps the unmodified Windows IDT. The xAPIC self-test also creates a brief
-`MmMapIoSpace` system mapping; the x2APIC path does not. A kernel AC with R/W can read the
-table/stub/counters; the gate is not a stealth boundary. See `AC-26` and
-`out/vm-test/postbox-l6-20261029/`.
+**Not a supported build.** `POSTBOX_NMI=ON` now fails configuration. On Windows 10 19041 the
+constructed-IDT chain path corrupted the interrupted thread's MXCSR save slot; the next
+`KiSystemServiceExit` executed `ldmxcsr` on a kernel-pointer value and bugchecked
+`0x3B (0xC0000005)`. The source (`PostboxNmi.cpp` / `PostboxNmi.S`) is retained only as
+historical test code. The supported Postbox build keeps the stock Windows IDT and has no
+`pb_nmi` install path. `pb_nmi` queries on the plain build return unsupported/zero.
 
 ## 5. Client implementation
 
@@ -400,10 +377,11 @@ Files: `Engine-ci/User/PostboxClient.cpp`, `Engine-ci/User/PostboxOnly.cpp` (cli
 
 - Allocates 64 KiB with an OS-chosen `VirtualAlloc` base and prints the actual VA; the loader takes the
   printed value. There is no fixed `0x5A000000` in the current client.
-- Generates a 32-byte master key and a 64-bit `SessionId` with `BCryptGenRandom`, writes the `PBK1`
-  handoff at `Base+0x40`, derives ChaCha20/SipHash keys, and prints `pid`/`VA`; sends `pb_ping` and
-  waits up to 60 s so the loader can start after the client. It zeroes the handoff after the first
-  authenticated ping.
+- Generates a 32-byte master key and a 64-bit `SessionId` with `BCryptGenRandom`, creates the
+  pagefile-backed `PBX1` section, derives ChaCha20/SipHash keys, and prints only the section name;
+  sends `pb_ping` and waits up to 60 s so the loader can start after the client. The key stays zero
+  until the loader publishes `LOADER_READY`; the client CAS-publishes it, the loader sets
+  `CONSUMED`, and the client wipes its copy after the handshake (or on withdrawal/timeout).
 - Runs `ping`, `read` (a local `int`), `write` (the same `int`), a 0x8000-byte bulk write/read, then
   `pb_stop`. Every request is header/body sealed and MACed; every response tag is verified before
   `Status` or the body is trusted.
@@ -429,24 +407,11 @@ cmake -S Engine-ci\Driver -B Engine-ci\Driver\build-postbox-release -G Ninja `
 cmake --build Engine-ci\Driver\build-postbox-release
 ```
 
-Postbox + NMI gate:
+Postbox + NMI gate: **removed.** `-DPOSTBOX_NMI=ON` stops at configure with the
+`0x3B (0xC0000005)` reason. Use the plain `build-postbox-release` target above.
 
-```powershell
-cmake -S Engine-ci\Driver -B Engine-ci\Driver\build-postbox-nmi-release -G Ninja `
-      -DCMAKE_BUILD_TYPE=Release `
-      -DCMAKE_CXX_COMPILER=C:/msys64/clang64/bin/clang++.exe `
-      -DCMAKE_ASM_COMPILER=C:/msys64/clang64/bin/clang.exe `
-      -DPOSTBOX_CHANNEL=ON -DPOSTBOX_NMI=ON -DMAPPED_SAFE=ON -DDEBUG_BUILD=OFF
-cmake --build Engine-ci\Driver\build-postbox-nmi-release
-```
-
-`POSTBOX_NMI=ON` calls `enable_language(ASM)` and adds `PostboxNmi.S`; the assembly is assembled
-by clang's integrated assembler. `POSTBOX_NMI=ON` without `POSTBOX_CHANNEL=ON` is a configure error.
-The NMI build is `POSTBOX_CHANNEL=ON` + `POSTBOX_NMI=ON`; the default named-section build is not
-affected by either option.
-
-In CLion, add a CMake profile with `POSTBOX_CHANNEL=ON`, `POSTBOX_NMI=ON`, and `MAPPED_SAFE=ON`
-instead of using the CLI.
+In CLion, use a CMake profile with `POSTBOX_CHANNEL=ON` and `MAPPED_SAFE=ON`; do not set
+`POSTBOX_NMI`.
 
 `POSTBOX_CHANNEL=ON` excludes `Channel.cpp` from the unity build entirely, so the section code and the
 `EngineCiShared` string are not in the image. A static byte scan of the built driver confirms:
@@ -498,7 +463,7 @@ operations without the NMI op. The image PTE split is live: base R/NX, `.text` R
 no page in the block is RWX. The NMI table and saved IDTRs are wiped after the self-test, and
 `r idtr` is Windows. The mapper skips `.pbox`, so the mapped image has no `PBOXABI` marker. The
 request/response MAC and ChaCha20 header/body path are live; the client generated the key/session
-and the loader consumed the `PBK1` handoff. Reads use `MmCopyMemory`; writes use
+and the loader consumed the `PBX1` section handoff. Reads use `MmCopyMemory`; writes use
 `MmCopyVirtualMemory`; the old `AccessVirtualMemory` user-half supervisor PTE is gone. Evidence:
 `out/vm-test/postbox-protect-20261030/`.
 
@@ -506,7 +471,7 @@ and the loader consumed the `PBK1` handoff. Reads use `MmCopyMemory`; writes use
 
 1. **Authenticated transport, not a trust boundary.** The request header fields and body are
    ChaCha20-encrypted; every request/response carries a 128-bit SipHash-2-4 tag; the master is a
-   client `BCryptGenRandom` value handed to the loader as `PBK1`, derived in the driver, and wiped.
+   client `BCryptGenRandom` value handed to the loader through the `PBX1` section, derived in the driver, and wiped.
    A kernel AC or an in-process AC DLL can read the key, the stage, and the plaintext. A same-user
    writer can still corrupt the mailbox and cause timeouts/MAC-failure loops (DoS). The stage and
    header buffers are wiped before return; the mailbox remains until the client zeroes it.
@@ -538,20 +503,11 @@ and the loader consumed the `PBK1` handoff. Reads use `MmCopyMemory`; writes use
    the added `PostboxImageLayout` carries the section map), wiped and freed after `CallEntry` in the
    current build; the driver .data copy remains until `pb_stop`.
 
-9. **NMI gate is a transient IDT/IDTR artifact.** During `pb_nmi Address=1`, `sidt` returns the
-   constructed 4 KiB table in the driver image and vector 2 is `PostboxNmiStub`; the Windows IDT is
-   restored in the same work item. The gate is opt-in and is not present at rest, so it is not a
-   long-lived PatchGuard risk. The default Postbox build never changes the IDT. A kernel AC with R/W
-   can read the table/stub/counters; the gate is not a stealth boundary.
-10. **NMI self-test is xAPIC/x2APIC-specific and group-0-only.** The xAPIC path briefly maps the
-    APIC page with `MmMapIoSpace`; x2APIC writes ICR MSR `0x830`. The install uses
-    `KeSetSystemAffinityThreadEx`, so only group-0 active CPUs are covered; install refuses >64 CPUs
-    or any group >0, and CPU hot-add after install is not handled. The lab has 2 vCPUs.
-11. **NMI tick count includes external NMIs.** The lab/KD delivered periodic NMIs at
-    `nt!HalProcessorIdle+0xf`; these are chained to Windows (except one that lands in the self-test
-    pending window). `pb_nmi` self-test returns the handled count and requires the handled RIP to be
-    inside the driver (`in-driver 1`), so it rejects the idle-loop case; do not use the tick delta as
-    a source proof.
+9. **NMI gate removed.** The constructed-IDT gate is disabled and `POSTBOX_NMI=ON` is a
+   configure error. On Windows 10 19041 its chain path corrupted the interrupted thread's
+   MXCSR save slot and bugchecked `0x3B (0xC0000005)` in `KiSystemServiceExit`. The supported
+   Postbox build keeps the stock Windows IDT and has no `pb_nmi` install path. The source is
+   retained only as historical test code; do not use the old NMI evidence as a product claim.
 
 ## 9. Review outcomes
 
@@ -564,7 +520,7 @@ contains these fixes:
 | Address check only tested the start; a copy could cross `0x800000000000` into the PML4[256] alias | fixed: whole-range check below the user limit, self-process only; mailbox base range checked at start. A canonicality guard inside `Mem.cpp::GetPhysicalAddress` is still a good defense-in-depth change |
 | Writes could overlap the mailbox's 0x40 header and clobber `Seq/Ack/Status` | fixed: `pb_write` ranges that overlap the header are rejected with `0xC000000D` |
 | Header/4 KiB body remained on the worker stack | fixed: volatile wipe before return; pointer/frame residue remains |
-| Fixed key ramp / fixed test VA | fixed: OS-chosen mailbox VA; client CSPRNG master + `PBK1` handoff; ChaCha20/SipHash derived and wiped |
+| Fixed key ramp / fixed test VA | fixed: OS-chosen mailbox VA; client CSPRNG master + `PBX1` section handoff; ChaCha20/SipHash derived and wiped |
 | `invlpg` only before the claimed access, not after release | fixed: `invlpg` after `ReleaseEntry` in the dedicated and search paths |
 | `mapload --free` freed the image under the default channel's system thread | fixed: `--free` is refused for every payload; the old flags are compatibility-only; README/usage updated |
 | Response wrote the whole header and `Ack` could precede `Status` | fixed: `Mac` then `Status` then `Ack` with release fences; request fields are never written back |
