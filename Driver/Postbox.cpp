@@ -353,6 +353,33 @@ static uint64_t PostboxFlushTlb(uint64_t Context)
     return 0;
 }
 
+#ifdef T2_PROBE
+// Test-only E3 probe. Runs from KeIpiGenericCall on every CPU; only CPU 1
+// performs the write. The .text page is RX after the PTE loop; a stale RW TLB
+// entry lets the write succeed, otherwise the raw kernel write bugchecks 0xBE.
+static uint64_t g_T2GetProcessorNumberEx = 0;
+
+static uint64_t T2ProbeCallback(uint64_t Context)
+{
+    if (!Context || !g_T2GetProcessorNumberEx) return 0;
+    struct { uint16_t Group; uint8_t Number; uint8_t Reserved; } Pn{};
+    ((void (*)(void*)) g_T2GetProcessorNumberEx)(&Pn);
+    if (Pn.Number != 1) return 0;
+
+    volatile uint8_t* P = (volatile uint8_t*) (uintptr_t) (Context + 0x4FF0);
+    const uint8_t Old = *P;
+    *P = 0xAA;
+    *P = Old;
+    return 0;
+}
+
+static void T2Probe(uint64_t Base, uint64_t Ipi, uint32_t Phase)
+{
+    print(INFO("[T2] P%u probe start base=%p"), Phase, (void*) (uintptr_t) Base);
+    ((FnKeIpiGenericCall) Ipi)(&T2ProbeCallback, Base);
+}
+#endif
+
 // Apply the loader-built section map to the image block. The header and
 // .pdata/.reloc are zeroed in the mapped image, so this map is the only source of
 // section permissions. Every page from ImageBase to the page-rounded end of the
@@ -447,9 +474,15 @@ bool ProtectImageSections(const PostboxConfig* Config)
         PostboxStartFailure = 26;
         return false;
     }
+#ifdef T2_PROBE
+    T2Probe(L.ImageBase, (uint64_t) (uintptr_t) IpiGenericCall, 1);
+#endif
     PostboxTlbRange Range{ L.ImageBase, End };
     ((FnKeIpiGenericCall) IpiGenericCall)(
         &PostboxFlushTlb, (uint64_t) (uintptr_t) &Range);
+#ifdef T2_PROBE
+    T2Probe(L.ImageBase, (uint64_t) (uintptr_t) IpiGenericCall, 2);
+#endif
 
     print(INFO("Postbox: image protections applied (%u pages, %u sections)"),
           Pages, L.SectionCount);
@@ -509,6 +542,16 @@ static bool PostboxResolve(address* IpiGenericCallOut)
 
     address Functions[19] = {};
     FindFuncExportsBatch(Ntoskrnl, Names, Functions, 19);
+#ifdef T2_PROBE
+    {
+        const char* ProbeName = "KeGetCurrentProcessorNumberEx";
+        address ProbeFn = 0;
+        FindFuncExportsBatch(Ntoskrnl, &ProbeName, &ProbeFn, 1);
+        g_T2GetProcessorNumberEx = (uint64_t) (uintptr_t) ProbeFn;
+        if (!g_T2GetProcessorNumberEx)
+            print(ERROR("T2_PROBE: KeGetCurrentProcessorNumberEx not resolved"));
+    }
+#endif
 
     g_KeInitializeTimerEx_Raw = Functions[0];
     g_KeInitializeDpc_Raw = Functions[1];
