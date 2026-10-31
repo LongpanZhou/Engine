@@ -494,7 +494,7 @@ int PostboxClientMain(int argc, char** argv)
 
     // Publish the bootstrap record in a one-page pagefile-backed section before
     // printing, so the loader can open it as soon as it starts. The mailbox body
-    // stays zeroed: there is no PBK1 signature or master key in the 64 KiB page.
+    // stays zeroed: there is no PBX1 signature or master key in the 64 KiB page.
     PostboxSectionHandoff Handoff{};
     Handoff.Magic = PostboxSectionHandoffMagic;
     Handoff.Version = PostboxSectionHandoffVersion;

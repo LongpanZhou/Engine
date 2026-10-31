@@ -73,7 +73,7 @@
 //
 // Caveats are in CRYPTO-PRIMITIVES.md. In particular: this does not stop a
 // kernel AC or an in-process AC DLL, and Nonce64 must never repeat under one
-// key. The channel is authenticated in the current driver (Version 3, PBK1).
+// key. The channel is authenticated in the current driver (Version 3, PBX1 section).
 
 #include <stddef.h>
 #include <stdint.h>
