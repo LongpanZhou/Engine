@@ -71,6 +71,17 @@ if(POSTBOX_NMI)
 endif()
 set(POSTBOX_NMI_SOURCES)
 
+# Test-only E3 probe: around the product KeIpiGenericCall, write to the .text
+# probe page from CPU 1 and record whether the stale RW TLB entry survived.
+# Never part of the shipped build.
+option(T2_PROBE "Test-only CPU-1 stale-TLB probe around KeIpiGenericCall" OFF)
+if(T2_PROBE)
+    if(NOT POSTBOX_CHANNEL)
+        message(FATAL_ERROR "T2_PROBE requires POSTBOX_CHANNEL=ON")
+    endif()
+    list(APPEND VARIANT_DEFINES T2_PROBE)
+endif()
+
 # Self-free reaper: the terminal work routine creates a system thread whose entry
 # is an assembly stub in the image. The stub tail-jumps to MmFreeIndependentPages,
 # so the free returns to PspSystemThreadStartup and no image instruction is fetched
