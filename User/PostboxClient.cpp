@@ -35,6 +35,7 @@ struct ClientOptions
     bool Kill;
     uint32_t HoldMs;
     uint32_t HoldPingMs;
+    const char* HandoffPath;
 };
 
 static bool RandomBytes(void* Buffer, size_t Size)
@@ -179,6 +180,15 @@ static bool ParseArguments(int argc, char** argv, ClientOptions& Options)
             }
             ++i;
         }
+        else if (std::strcmp(Arg, "--handoff") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                std::printf("postbox: --handoff requires a file path\n");
+                return false;
+            }
+            Options.HandoffPath = argv[++i];
+        }
     }
     return true;
 }
@@ -300,12 +310,30 @@ int PostboxClientMain(int argc, char** argv)
     SecureZeroMemory(MasterCopy, sizeof(MasterCopy));
     S.SessionId = SessionId;
 
+    // Optional out-of-band handoff: the loader reads the PID/VA from this file
+    // instead of argv, so the loader command line does not disclose the target.
+    // The file carries only PID/VA (not the key) and the loader deletes it.
+    if (Options.HandoffPath)
+    {
+        FILE* f = nullptr;
+        if (fopen_s(&f, Options.HandoffPath, "w") == 0 && f)
+        {
+            std::fprintf(f, "%lu 0x%llX\n", static_cast<unsigned long>(S.Pid),
+                         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Base)));
+            std::fclose(f);
+        }
+    }
+
     std::printf("postbox: pid=%lu va=0x%llX size=0x%X\n",
                 static_cast<unsigned long>(S.Pid),
                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Base)), PostboxBytes);
-    std::printf("run: mapload.exe --sys Driver.sys --provider pte --postbox %lu 0x%llX\n",
-                static_cast<unsigned long>(S.Pid),
-                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Base)));
+    if (Options.HandoffPath)
+        std::printf("run: mapload.exe --sys Driver.sys --provider pte --postbox-file %s\n",
+                    Options.HandoffPath);
+    else
+        std::printf("run: mapload.exe --sys Driver.sys --provider pte --postbox %lu 0x%llX\n",
+                    static_cast<unsigned long>(S.Pid),
+                    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Base)));
     std::printf("waiting up to 60 s for the driver...\n");
     std::fflush(stdout);
 

@@ -114,11 +114,14 @@ target_link_options(Driver
 
 # Code signing (optional): finds signtool in any installed Windows Kit, and takes the PFX password from the
 # environment instead of storing it in this file. Signing is skipped (with a warning) when either is missing.
+# The lab PFX subject names the developer ("WDKTestCert <user>,..."), which is a T7 artifact; a manual-map
+# payload does not need a signature, so deployments can configure -DDRIVER_SIGNING=OFF or replace the PFX.
+option(DRIVER_SIGNING "Sign Driver.sys with TestSign.pfx when the password is set" ON)
 find_program(SIGNTOOL signtool
         PATHS "C:/Program Files (x86)/Windows Kits/10/bin/x86"
               "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x86"
         NO_DEFAULT_PATH)
-if(SIGNTOOL AND DEFINED ENV{TESTSIGN_PFX_PASSWORD})
+if(DRIVER_SIGNING AND SIGNTOOL AND DEFINED ENV{TESTSIGN_PFX_PASSWORD})
         add_custom_command(TARGET Driver POST_BUILD
                 COMMAND "${SIGNTOOL}" sign /v
                 /f "${CMAKE_CURRENT_SOURCE_DIR}/TestSign.pfx"

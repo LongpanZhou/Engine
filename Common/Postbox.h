@@ -114,8 +114,10 @@ struct PostboxConfig
     uint8_t Key[32];                // client-generated master key (wiped after KDF)
     uint64_t CreateTime;            // required client process creation time
     uint64_t SessionId;             // client-generated session ID
-    uint8_t Reserved2[16];          // keeps the config at 0x58
+    uint64_t MmAllocateIndependentPages; // loader-resolved stage allocator
+    uint64_t MmSetPageProtection;        // loader-resolved stage protection
     PostboxImageLayout Layout;      // loader-built image section map
+    uint64_t MmFreeIndependentPages;// loader-resolved stage free routine
 };
 
 // Client -> loader handoff, written at the start of the mailbox body before the first ping.
@@ -130,8 +132,13 @@ struct PostboxHandoff
 };
 static_assert(sizeof(PostboxHandoff) == 0x38, "PostboxHandoff layout changed");
 
-static_assert(sizeof(PostboxConfig) == 0x108, "PostboxConfig layout changed");
+static_assert(sizeof(PostboxConfig) == 0x110, "PostboxConfig layout changed");
 static_assert(offsetof(PostboxConfig, CreateTime) == 0x38, "CreateTime offset changed");
 static_assert(offsetof(PostboxConfig, SessionId) == 0x40, "SessionId offset changed");
-static_assert(offsetof(PostboxConfig, Reserved2) == 0x48, "Reserved2 offset changed");
+static_assert(offsetof(PostboxConfig, MmAllocateIndependentPages) == 0x48,
+              "MmAllocateIndependentPages offset changed");
+static_assert(offsetof(PostboxConfig, MmSetPageProtection) == 0x50,
+              "MmSetPageProtection offset changed");
 static_assert(offsetof(PostboxConfig, Layout) == 0x58, "Layout offset changed");
+static_assert(offsetof(PostboxConfig, MmFreeIndependentPages) == 0x108,
+              "MmFreeIndependentPages offset changed");

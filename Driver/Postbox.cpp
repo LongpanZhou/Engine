@@ -76,6 +76,10 @@ using FnPsReleaseProcessExitSynchronization = void (*)(void*);
 using FnPsGetProcessCreateTimeQuadPart = int64_t (*)(void*);
 using FnExAllocatePoolWithTag = void* (*)(uint32_t, size_t, uint32_t);
 using FnExFreePool = void (*)(void*);
+using FnMmAllocateIndependentPages = void* (*)(size_t Size, uint32_t Arg2,
+                                               uint32_t Arg3, uint32_t Arg4);
+using FnMmSetPageProtection = uint8_t (*)(void* Addr, size_t Size, uint32_t Protect);
+using FnMmFreeIndependentPages = void (*)(void* Addr, size_t Size);
 
 // MM_COPY_ADDRESS is a union of PVOID/PHYSICAL_ADDRESS; 8 bytes on x64.
 union PostboxCopyAddress
@@ -108,6 +112,10 @@ static address g_PsReleaseProcessExitSynchronization = 0;
 static address g_PsGetProcessCreateTimeQuadPart = 0;
 static address g_ExAllocatePoolWithTag = 0;
 static address g_ExFreePool = 0;
+static address g_MmAllocateIndependentPages = 0;
+static address g_MmSetPageProtection = 0;
+static address g_MmFreeIndependentPages = 0;
+static bool PostboxStageIndependent = false;
 static address g_MmCopyMemory = 0;
 static address g_MmCopyVirtualMemory = 0;
 static address g_KeIpiGenericCall = 0;
@@ -405,12 +413,11 @@ static bool PostboxResolve()
     return true;
 }
 
-// The worker is attached to MailboxProcess and holds its exit synchronization, so
-// UserVa is in the current address space. Reads use MmCopyMemory (documented,
-// fault-tolerant, no PTE); writes use MmCopyVirtualMemory (kernel stage -> user
-// target, returns a status instead of raising). Both are PASSIVE/APC-safe; the
-// stage and stack targets are nonpageable. This removes the user-half supervisor
-// PTE that the old AccessVirtualMemory path created on every poll.
+// Both directions use MmCopyVirtualMemory against the cached client EPROCESS:
+// read = client user VA -> kernel stage, write = kernel stage -> client user VA.
+// The API performs its own attach/exit synchronization, so the poll no longer
+// calls KeStackAttachProcess or PsAcquireProcessExitSynchronization. This keeps
+// the user-half supervisor PTE removed and cuts the driver's explicit CR3 churn.
 static bool PostboxCopy(void* MailboxProcess, address UserVa, void* Buffer,
                         size_t Size, bool Write)
 {
@@ -423,10 +430,12 @@ static bool PostboxCopy(void* MailboxProcess, address UserVa, void* Buffer,
     int32_t Status;
     if (!Write)
     {
-        PostboxCopyAddress Source{};
-        Source.VirtualAddress = (void*) (uintptr_t) UserVa;
-        Status = ((FnMmCopyMemory) g_MmCopyMemory)(
-            Buffer, Source, Size, 2 /* MM_COPY_MEMORY_VIRTUAL */, &Done);
+        // Source = client user VA, target = kernel stage, both expressed against
+        // the cached client EPROCESS. MmCopyVirtualMemory performs the attach
+        // internally, so the driver no longer calls KeStackAttachProcess itself.
+        Status = ((FnMmCopyVirtualMemory) g_MmCopyVirtualMemory)(
+            MailboxProcess, (void*) (uintptr_t) UserVa, MailboxProcess, Buffer,
+            Size, 0 /* KernelMode */, &Done);
     }
     else
     {
@@ -516,8 +525,13 @@ static void PostboxFreeStage()
 {
     if (!PostboxStage) return;
     PostboxWipe(PostboxStage, PostboxStageBytes);
-    ((FnExFreePool) g_ExFreePool)(PostboxStage);
+    if (PostboxStageIndependent && g_MmFreeIndependentPages)
+        ((FnMmFreeIndependentPages) g_MmFreeIndependentPages)(
+            PostboxStage, PostboxStageBytes);
+    else
+        ((FnExFreePool) g_ExFreePool)(PostboxStage);
     PostboxStage = nullptr;
+    PostboxStageIndependent = false;
 }
 
 // The client EPROCESS reference is acquired once at start, not per poll. Release it
@@ -845,24 +859,11 @@ static void PostboxPoll()
         return;
     }
 
-    _KAPC_STATE ApcState{};
-    const int32_t ExitStatus =
-        ((FnPsAcquireProcessExitSynchronization) g_PsAcquireProcessExitSynchronization)(Process);
-    if (ExitStatus < 0)
-    {
-        // Rundown is already active: the acquire failed and no reference was taken.
-        // Do not attach and do not release the exit synchronization.
-        PostboxDeadTick();
-        PostboxIdleTick();
-        PostboxMaybeReleaseProcess();
-        return;
-    }
-
-    ((FnKeStackAttachProcess) g_KeStackAttachProcess)(Process, &ApcState);
+    // No explicit attach: PostboxCopy uses MmCopyVirtualMemory with the cached
+    // client EPROCESS as both source and target. This removes the driver's
+    // KeStackAttachProcess/detach and PsAcquire/ReleaseExitSynchronization pair
+    // from every poll (the copy API still switches CR3 internally).
     PostboxPollAttached(Process);
-    ((FnKeUnstackDetachProcess) g_KeUnstackDetachProcess)(&ApcState);
-    ((FnPsReleaseProcessExitSynchronization) g_PsReleaseProcessExitSynchronization)(Process);
-
     PostboxMaybeReleaseProcess();
 }
 
@@ -886,6 +887,13 @@ bool PostboxStart(const PostboxConfig* Config)
     if (!KeyNonZero) return false;
 
     PostboxCfg = *Config;
+    // Keep the independent-page stage helpers outside the config wipe.
+    g_MmAllocateIndependentPages = (address) Config->MmAllocateIndependentPages;
+    g_MmSetPageProtection = (address) Config->MmSetPageProtection;
+    g_MmFreeIndependentPages = (address) Config->MmFreeIndependentPages;
+    PostboxCfg.MmAllocateIndependentPages = 0;
+    PostboxCfg.MmSetPageProtection = 0;
+    PostboxCfg.MmFreeIndependentPages = 0;
     // The magic/version are validation-only. Leaving the 8-byte "PBOX"+version
     // prefix in .data makes the resident control block trivially findable by a
     // magic scan; wipe it after the check.
@@ -933,11 +941,36 @@ bool PostboxStart(const PostboxConfig* Config)
     }
     PostboxProcess = Process;
 
-    // Separate NX stage. It is used only as a plain kernel buffer: the request
-    // paths translate the client VA with PostboxCopy, never the stage, so
-    // a large-page-backed pool block is safe here.
-    PostboxStage = (uint8_t*) ((FnExAllocatePoolWithTag) g_ExAllocatePoolWithTag)(
-        0x200 /* NonPagedPoolNx */, PostboxStageBytes, 0x7366744E /* 'Ntfs' */);
+    // Separate NX stage. Prefer page-granular independent pages so the channel
+    // does not leave a 64 KiB 'Ntfs' NonPagedPoolNx entry for its lifetime; fall
+    // back to the pool when an older loader did not pass the helpers.
+    PostboxStage = nullptr;
+    PostboxStageIndependent = false;
+    if (g_MmAllocateIndependentPages && g_MmSetPageProtection && g_MmFreeIndependentPages)
+    {
+        PostboxStage = (uint8_t*) ((FnMmAllocateIndependentPages)
+            g_MmAllocateIndependentPages)(PostboxStageBytes, 0xFFFFFFFF, 0, 0);
+        if (PostboxStage)
+        {
+            if (((FnMmSetPageProtection) g_MmSetPageProtection)(
+                    PostboxStage, PostboxStageBytes, 0x04 /* PAGE_READWRITE */))
+            {
+                PostboxStageIndependent = true;
+            }
+            else
+            {
+                ((FnMmFreeIndependentPages) g_MmFreeIndependentPages)(
+                    PostboxStage, PostboxStageBytes);
+                PostboxStage = nullptr;
+            }
+        }
+    }
+    if (!PostboxStage)
+    {
+        PostboxStage = (uint8_t*) ((FnExAllocatePoolWithTag) g_ExAllocatePoolWithTag)(
+            0x200 /* NonPagedPoolNx */, PostboxStageBytes, 0x7366744E /* 'Ntfs' */);
+        PostboxStageIndependent = false;
+    }
     if (!PostboxStage)
     {
         print(ERROR("Postbox: NX stage allocation failed"));
