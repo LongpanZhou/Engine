@@ -58,20 +58,18 @@ if(MANUAL_MAP_ONLY)
     list(APPEND VARIANT_DEFINES MANUAL_MAP_ONLY)
 endif()
 
-# NMI gate: an opt-in extension of the Postbox build. It installs a constructed
-# IDT with vector 2 pointing at the assembly trampoline in PostboxNmi.S, and adds
-# the pb_nmi query/self-test op. The default Postbox build keeps the unmodified
-# Windows IDT; see AC-25/AC-26 for the detection tradeoff.
-option(POSTBOX_NMI "Install the constructed-IDT NMI gate (requires POSTBOX_CHANNEL)" OFF)
-set(POSTBOX_NMI_SOURCES)
+# NMI gate: disabled. The constructed-IDT gate (PostboxNmi.S) is retained as
+# historical test code, but it is not a supported build: on Windows 10 19041 its
+# chain path can corrupt the interrupted thread's MXCSR save slot and bugcheck
+# 0x3B (0xC0000005) in KiSystemServiceExit. The default Postbox build keeps the
+# stock Windows IDT and has no NMI/IDT-hook artifact.
+option(POSTBOX_NMI "Unsupported: constructed-IDT NMI gate (disabled)" OFF)
 if(POSTBOX_NMI)
-    if(NOT POSTBOX_CHANNEL)
-        message(FATAL_ERROR "POSTBOX_NMI requires POSTBOX_CHANNEL=ON")
-    endif()
-    enable_language(ASM)
-    list(APPEND VARIANT_DEFINES POSTBOX_NMI)
-    list(APPEND POSTBOX_NMI_SOURCES PostboxNmi.S)
+    message(FATAL_ERROR "POSTBOX_NMI is disabled: the constructed-IDT gate caused "
+                        "0x3B (0xC0000005) stack corruption on 19041; use the plain "
+                        "Postbox build")
 endif()
+set(POSTBOX_NMI_SOURCES)
 
 # Self-free reaper: the terminal work routine creates a system thread whose entry
 # is an assembly stub in the image. The stub tail-jumps to MmFreeIndependentPages,

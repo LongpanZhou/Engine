@@ -12,6 +12,7 @@ using namespace intrin;
 #include "Strings.h"   // encoded runtime names + byte signatures (needs EncodeBytes + PatternToBytes above)
 #include "Locate.cpp"  // locate-by-signature helpers: ScanModuleImage + ResolveRipRelative (needs Strings.h's section names, and every memory/process/hook/trace file below)
 
+#include "MemCache.h"  // cache handoff contract between Mem.cpp and the Postbox state page
 #include "Mem.cpp"     // kernel memory: CR3, page-table walk, mapping table, Access*/CopyVirtualMemory, GetNtoskrnl, GetPteBase, GetVirtualAddress
 #include "Process.cpp" // process & module enumeration: EnumerateEProcess, EnumerateKProcess, EnumerateModuleBaseAddress
 #ifndef MANUAL_MAP_ONLY
