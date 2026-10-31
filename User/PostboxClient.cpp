@@ -4,6 +4,7 @@
 // --postbox <pid> <va>; the client pings automatically.
 #include <windows.h>
 #include <bcrypt.h>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -44,6 +45,31 @@ static bool RandomBytes(void* Buffer, size_t Size)
                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0;
 }
 
+// The PBK1 master key must stay readable until the loader copies it. The loader
+// reads it after provider bring-up and before the entry call; normal runs take a
+// few seconds. Cap the worst-case exposure at 60 s (the ping timeout): after that the first ping's
+// wait loop wipes the key even if the loader never arrives. The working session
+// keys are already derived, so the client keeps working if the loader was fast.
+static volatile uint8_t* g_HandoffKey = nullptr;
+static ULONGLONG g_HandoffWipeAt = 0;
+constexpr ULONGLONG HandoffKeyGraceMs = 60000;
+
+static void ExpireHandoffKey()
+{
+    if (g_HandoffKey && GetTickCount64() >= g_HandoffWipeAt)
+    {
+        uint8_t* Base = const_cast<uint8_t*>(g_HandoffKey) - offsetof(PostboxHandoff, Key);
+        SecureZeroMemory(Base, sizeof(PostboxHandoff));
+        g_HandoffKey = nullptr;
+    }
+}
+
+static void WipeHandoff(uint8_t* Data)
+{
+    SecureZeroMemory(Data, sizeof(PostboxHandoff));
+    g_HandoffKey = nullptr;
+}
+
 static bool Submit(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
                    uint32_t Op, uint64_t Address, uint32_t Size, uint32_t TimeoutMs,
                    uint32_t SeqOverride = 0)
@@ -82,6 +108,7 @@ static bool Submit(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
     const ULONGLONG Deadline = GetTickCount64() + TimeoutMs;
     while (GetTickCount64() < Deadline)
     {
+        ExpireHandoffKey();
         if (Header->Ack == Seq) break;
         Sleep(1);
     }
@@ -300,6 +327,8 @@ int PostboxClientMain(int argc, char** argv)
     Handoff->SessionId = SessionId;
     Handoff->CreateTime = CreateTime64;
     std::memcpy(Handoff->Key, Master, sizeof(Handoff->Key));
+    g_HandoffKey = Handoff->Key;
+    g_HandoffWipeAt = GetTickCount64() + HandoffKeyGraceMs;
 
     // Derive the working keys from a copy; DerivePostboxKeys wipes its input.
     uint8_t MasterCopy[32];
@@ -342,19 +371,19 @@ int PostboxClientMain(int argc, char** argv)
     {
         std::printf("ping: timeout or auth failure (driver not mapped, wrong pid/VA/CreateTime, "
                     "or key/session mismatch)\n");
-        SecureZeroMemory(Data, sizeof(PostboxHandoff));
+        WipeHandoff(Data);
         return 1;
     }
     std::printf("ping: status=0x%X\n", static_cast<unsigned>(S.Status));
     if (S.Status != 0)
     {
-        SecureZeroMemory(Data, sizeof(PostboxHandoff));
+        WipeHandoff(Data);
         StopBestEffort(Header, Data, S);
         return 1;
     }
 
     // The driver has consumed the handoff; do not leave the master key in the mailbox.
-    SecureZeroMemory(Data, sizeof(PostboxHandoff));
+    WipeHandoff(Data);
 
     // Deterministic dead-client test: exit abruptly after a successful ping and the wipe,
     // with no pb_stop, so the driver must notice the client is gone on its own.

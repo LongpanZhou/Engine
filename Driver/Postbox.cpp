@@ -96,6 +96,11 @@ using FnMmCopyVirtualMemory = int32_t (*)(void* SourceProcess, void* SourceAddre
                                           void* TargetProcess, void* TargetAddress,
                                           size_t Size, int32_t PreviousMode, size_t* Done);
 using FnKeIpiGenericCall = uint64_t (*)(uint64_t (*)(uint64_t), uint64_t);
+using FnPsCreateSystemThread = int32_t (*)(void** ThreadHandle, uint32_t DesiredAccess,
+                                           void* ObjectAttributes, void* ProcessHandle,
+                                           void* ClientId, void* StartRoutine,
+                                           void* StartContext);
+using FnZwClose = int32_t (*)(void* Handle);
 
 static address g_KeInitializeTimerEx = 0;
 static address g_KeInitializeDpc = 0;
@@ -121,9 +126,22 @@ static address g_MmFreeIndependentPages = 0;
 static address g_MmCopyMemory = 0;
 static address g_MmCopyVirtualMemory = 0;
 static address g_KeIpiGenericCall = 0;
+static address g_PsCreateSystemThread = 0;
+static address g_ZwClose = 0;
 
 static volatile long PostboxRunning = 0;
 static volatile long PostboxInFlight = 0;
+static volatile long PostboxTeardown = 0;
+static volatile long PostboxReaperStarted = 0;
+
+// The reaper stub is assembly in PostboxReaper.S. It runs as a system thread,
+// waits for the work routine to return, frees the state page, then tail-jumps to
+// MmFreeIndependentPages so the free returns to PspSystemThreadStartup.
+extern "C" uint64_t PostboxReaperBase = 0;   // loader allocation base (RawBase)
+extern "C" uint64_t PostboxReaperSize = 0;   // loader allocation size (AllocSize)
+extern "C" uint64_t PostboxReaperFree = 0;   // resolved MmFreeIndependentPages
+extern "C" void PostboxReaperEntry();
+extern "C" void PostboxReaperPrepare();
 
 // The live protocol state (config, keys, timer/DPC/work, client EPROCESS, stage)
 // lives on a separate independent RW/NX page. Only this pointer stays in .data.
@@ -139,6 +157,7 @@ struct PostboxState
     uint64_t SessionId;
     uint64_t LastNonce;
     uint32_t LastSeq;
+    uint32_t AuthFailures;
     bool StageIndependent;
 };
 static PostboxState* PostboxStatePtr = nullptr;
@@ -234,8 +253,11 @@ static uint64_t PostboxFlushTlb(uint64_t Context)
 // section permissions. Every page from ImageBase to the page-rounded end of the
 // pool block is covered: .text RX, writable sections RW/NX, everything else
 // (header, .rdata, .pdata, .reloc, .pbox, padding) R/NX. No page is left RWX.
+uint32_t PostboxStartFailure = 0;
+
 bool ProtectImageSections(const PostboxConfig* Config)
 {
+    PostboxStartFailure = 20;
     if (!Config || Config->Layout.Magic != PostboxLayoutMagic ||
         Config->Layout.Version != PostboxLayoutVersion)
     {
@@ -246,12 +268,17 @@ bool ProtectImageSections(const PostboxConfig* Config)
     const PostboxImageLayout& L = Config->Layout;
     if (L.ImageSize == 0 || L.AllocSize == 0 || L.SectionCount == 0 ||
         L.SectionCount > PostboxMaxSections)
+    {
+        PostboxStartFailure = 21;
         return false;
+    }
 
     // Resolve KeIpiGenericCall before the PTE walk: the global flush needs it.
     if (!PostboxResolve())
     {
         print(ERROR("Postbox: resolve failed before image protection"));
+        if (PostboxStartFailure < 100)
+            PostboxStartFailure = 22;
         return false;
     }
 
@@ -260,6 +287,7 @@ bool ProtectImageSections(const PostboxConfig* Config)
     {
         print(ERROR("Postbox: image base mismatch (runtime %p, layout %p)"),
               (void*) (uintptr_t) ImageBase, (void*) (uintptr_t) L.ImageBase);
+        PostboxStartFailure = 23;
         return false;
     }
 
@@ -268,6 +296,7 @@ bool ProtectImageSections(const PostboxConfig* Config)
         L.ImageBase + L.ImageSize > End)
     {
         print(ERROR("Postbox: image layout range is invalid"));
+        PostboxStartFailure = 24;
         return false;
     }
 
@@ -296,6 +325,7 @@ bool ProtectImageSections(const PostboxConfig* Config)
         if (!SetPageProtection(address(Va), Write, Execute))
         {
             print(ERROR("Postbox: protect page %p failed"), (void*) (uintptr_t) Va);
+            PostboxStartFailure = 25;
             return false;
         }
         ++Pages;
@@ -307,6 +337,7 @@ bool ProtectImageSections(const PostboxConfig* Config)
     if (!g_KeIpiGenericCall)
     {
         print(ERROR("Postbox: KeIpiGenericCall not resolved"));
+        PostboxStartFailure = 26;
         return false;
     }
     PostboxTlbRange Range{ L.ImageBase, End };
@@ -329,6 +360,7 @@ static bool PostboxResolve()
     if (!Ntoskrnl)
     {
         print(ERROR("Postbox: ntoskrnl not found"));
+        PostboxStartFailure = 90;
         return false;
     }
 
@@ -350,14 +382,16 @@ static bool PostboxResolve()
         "QtHfuDvssfouQspdftt",             // PsGetCurrentProcess
         "QtBdrvjsfQspdfttFyjuTzodispoj{bujpo",  // PsAcquireProcessExitSynchronization
         "QtSfmfbtfQspdfttFyjuTzodispoj{bujpo",  // PsReleaseProcessExitSynchronization
+        "QtDsfbufTztufnUisfbe",           // PsCreateSystemThread
+        "OuDmptf",                        // NtClose (ZwClose alias)
     };
 
     // The resolve table is stored ROT1-encoded so the image does not carry the plaintext
     // export names. This is anti-static-scan, not secrecy: it is decoded in a stack buffer
     // and wiped after the resolve. The resolved pointers remain in .data.
-    char Decoded[17][40] = {};
-    const char* Names[17] = {};
-    for (uint32_t i = 0; i < 17; ++i)
+    char Decoded[19][40] = {};
+    const char* Names[19] = {};
+    for (uint32_t i = 0; i < 19; ++i)
     {
         uint32_t j = 0;
         for (; j < 39 && EncodedNames[i][j]; ++j)
@@ -366,8 +400,8 @@ static bool PostboxResolve()
         Names[i] = Decoded[i];
     }
 
-    address Functions[17] = {};
-    FindFuncExportsBatch(Ntoskrnl, Names, Functions, 17);
+    address Functions[19] = {};
+    FindFuncExportsBatch(Ntoskrnl, Names, Functions, 19);
 
     g_KeInitializeTimerEx = Functions[0];
     g_KeInitializeDpc = Functions[1];
@@ -386,13 +420,16 @@ static bool PostboxResolve()
     g_PsGetCurrentProcess = Functions[14];
     g_PsAcquireProcessExitSynchronization = Functions[15];
     g_PsReleaseProcessExitSynchronization = Functions[16];
+    g_PsCreateSystemThread = Functions[17];
+    g_ZwClose = Functions[18];
 
-    for (uint32_t i = 0; i < 17; ++i)
+    for (uint32_t i = 0; i < 19; ++i)
     {
         if (!Functions[i])
         {
             print(ERROR("Postbox: export %s not found"), Names[i]);
-            for (uint32_t k = 0; k < 17; ++k)
+            PostboxStartFailure = 100 + i;
+            for (uint32_t k = 0; k < 19; ++k)
             {
                 volatile char* p = Decoded[k];
                 for (uint32_t j = 0; j < 40; ++j) p[j] = 0;
@@ -400,7 +437,7 @@ static bool PostboxResolve()
             return false;
         }
     }
-    for (uint32_t i = 0; i < 17; ++i)
+    for (uint32_t i = 0; i < 19; ++i)
     {
         volatile char* p = Decoded[i];
         for (uint32_t j = 0; j < 40; ++j) p[j] = 0;
@@ -553,11 +590,14 @@ static void PostboxFreeState()
     PostboxWipe(&PostboxStatePtr->Dpc, sizeof(PostboxDpc));
     pb::WipePostboxKeys(&PostboxStatePtr->Keys);
     PostboxWipe(&PostboxStatePtr->Cfg, sizeof(PostboxConfig));
-    PostboxStatePtr->Process = nullptr;
+    // Do NOT clear Process here. The caller's PostboxMaybeReleaseProcess (watchdog,
+    // pb_stop, invalid-config) is the only path that drops the cached EPROCESS
+    // reference; erasing the pointer first would leak the reference every stop.
     PostboxStatePtr->Stage = nullptr;
     PostboxStatePtr->SessionId = 0;
     PostboxStatePtr->LastNonce = 0;
     PostboxStatePtr->LastSeq = 0;
+    PostboxStatePtr->AuthFailures = 0;
     PostboxStatePtr->StageIndependent = false;
 }
 
@@ -565,11 +605,67 @@ static void PostboxFreeState()
 // touch it: failed starts (never armed) and a stopped channel with in-flight clear.
 static void PostboxFreeStatePage()
 {
-    if (!PostboxStatePtr) return;
-    PostboxWipe(PostboxStatePtr, sizeof(PostboxState));
+    // Exchange first so a second teardown cannot free the same page. Wipe the
+    // whole 4 KiB, not just sizeof(PostboxState): the tail must not disclose
+    // stale kernel memory if the allocator did not zero it.
+    PostboxState* State = (PostboxState*) __atomic_exchange_n(
+        (void**) &PostboxStatePtr, nullptr, __ATOMIC_ACQ_REL);
+    if (!State) return;
+    PostboxWipe(State, 0x1000);
     if (g_MmFreeIndependentPages)
-        ((FnMmFreeIndependentPages) g_MmFreeIndependentPages)(PostboxStatePtr, 0x1000);
-    PostboxStatePtr = nullptr;
+        ((FnMmFreeIndependentPages) g_MmFreeIndependentPages)(State, 0x1000);
+}
+
+// Reaper thread body. The assembly entry calls this at PASSIVE, then tail-jumps
+// to MmFreeIndependentPages. Wait for the worker to clear InFlight (which happens
+// after it clears the work item and the caller releases the EPROCESS), then give
+// the worker's ret and the loader's post-entry ROT1 wipe time to finish.
+extern "C" void PostboxReaperPrepare()
+{
+    for (uint32_t i = 0; i < 1000 && __atomic_load_n(&PostboxInFlight, __ATOMIC_ACQUIRE); ++i)
+    {
+        _LARGE_INTEGER Interval{};
+        Interval.QuadPart = -10000;   // 1 ms
+        ((FnKeDelayExecutionThread) g_KeDelayExecutionThread)(0, 0, &Interval);
+    }
+    _LARGE_INTEGER Delay{};
+    Delay.QuadPart = -5000000;        // 500 ms
+    ((FnKeDelayExecutionThread) g_KeDelayExecutionThread)(0, 0, &Delay);
+
+    // The worker has returned; the WORK_QUEUE_ITEM is no longer in use. Free the
+    // state page before the image that holds this stub and its globals is released.
+    PostboxFreeStatePage();
+}
+
+// Creates the system thread whose entry is the assembly tail-jump stub. The
+// thread frees the loader allocation (RawBase/AllocSize), not the aligned image
+// base, and then returns to PspSystemThreadStartup.
+static bool PostboxStartReaper()
+{
+    if (__atomic_exchange_n(&PostboxReaperStarted, 1, __ATOMIC_ACQ_REL) != 0)
+        return true;
+    if (!g_PsCreateSystemThread || !g_ZwClose || !g_MmFreeIndependentPages ||
+        !PostboxReaperBase || !PostboxReaperSize)
+    {
+        __atomic_store_n(&PostboxReaperStarted, 0, __ATOMIC_RELEASE);
+        return false;
+    }
+
+    PostboxReaperFree = (uint64_t) g_MmFreeIndependentPages;
+
+    void* ThreadHandle = nullptr;
+    const int32_t Status = ((FnPsCreateSystemThread) g_PsCreateSystemThread)(
+        &ThreadHandle, 0x1FFFFF /* THREAD_ALL_ACCESS */, nullptr, nullptr, nullptr,
+        (void*) &PostboxReaperEntry, nullptr);
+    if (Status < 0 || !ThreadHandle)
+    {
+        __atomic_store_n(&PostboxReaperStarted, 0, __ATOMIC_RELEASE);
+        print(ERROR("Postbox: reaper thread creation failed"));
+        return false;
+    }
+    ((FnZwClose) g_ZwClose)(ThreadHandle);
+    print(INFO("Postbox: reaper armed"));
+    return true;
 }
 
 // The client EPROCESS reference is acquired once at start, not per poll. Release it
@@ -604,6 +700,7 @@ static void PostboxDeadTick()
     PostboxCancel();
     PostboxFreeStage();
     PostboxFreeState();
+    PostboxStartReaper();
     PostboxStatePtr->SessionId = 0;
     PostboxStatePtr->LastNonce = 0;
 }
@@ -621,18 +718,21 @@ static void PostboxDpcRoutine(void*, void*, void*, void*)
 // Runs at PASSIVE_LEVEL in an existing system worker thread.
 static void PostboxWorkRoutine(void*)
 {
+    PostboxState* State = PostboxStatePtr;
     if (__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE))
         PostboxPoll();
 
     // Terminal work item: running is clear and the timer is cancelled, so no DPC
     // can queue this item again. The worker already loaded WorkerRoutine; clear
     // the fields so the resident state page keeps no pointer back into the image.
-    if (!__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE) && PostboxStatePtr)
+    // Use the captured State, not the global, so a restart cannot redirect this
+    // clear at the new page.
+    if (!__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE) && State)
     {
-        PostboxStatePtr->Work.WorkerRoutine = nullptr;
-        PostboxStatePtr->Work.Parameter = nullptr;
-        PostboxStatePtr->Work.List.Flink = nullptr;
-        PostboxStatePtr->Work.List.Blink = nullptr;
+        State->Work.WorkerRoutine = nullptr;
+        State->Work.Parameter = nullptr;
+        State->Work.List.Flink = nullptr;
+        State->Work.List.Blink = nullptr;
     }
 
     __atomic_store_n(&PostboxInFlight, 0, __ATOMIC_RELEASE);
@@ -683,6 +783,7 @@ static void PostboxPollAttached(void* MailboxProcess)
 
     if (Sealed.SessionId != PostboxStatePtr->SessionId || Sealed.Nonce <= PostboxStatePtr->LastNonce)
     {
+        if (PostboxStatePtr->AuthFailures != 0xFFFFFFFFu) ++PostboxStatePtr->AuthFailures;
         PostboxDeadTick();
         PostboxIdleTick();
         PostboxWipe(&Sealed, sizeof(Sealed));
@@ -735,6 +836,7 @@ static void PostboxPollAttached(void* MailboxProcess)
                       reinterpret_cast<const uint8_t*>(&Sealed), PostboxStatePtr->Stage, BodyLen);
     if (!pb::Mac128Equal(Tag, Sealed.Mac))
     {
+        if (PostboxStatePtr->AuthFailures != 0xFFFFFFFFu) ++PostboxStatePtr->AuthFailures;
         PostboxWipe(&Plain, sizeof(Plain));
         PostboxWipe(&Sealed, sizeof(Sealed));
         PostboxWipe(PostboxStatePtr->Stage, BodyLen);
@@ -867,6 +969,7 @@ static void PostboxPollAttached(void* MailboxProcess)
         PostboxCancel();
         PostboxFreeStage();
         PostboxFreeState();
+        PostboxStartReaper();
         PostboxStatePtr->SessionId = 0;
         PostboxStatePtr->LastNonce = 0;
     }
@@ -890,6 +993,7 @@ static void PostboxPoll()
         PostboxCancel();
         PostboxFreeStage();
         PostboxFreeState();
+        PostboxStartReaper();
         PostboxStatePtr->SessionId = 0;
         PostboxStatePtr->LastNonce = 0;
         PostboxMaybeReleaseProcess();
@@ -927,6 +1031,7 @@ static void PostboxPoll()
 // Starts the channel from a loader-supplied config. PASSIVE_LEVEL (DriverEntry).
 bool PostboxStart(const PostboxConfig* Config)
 {
+    PostboxStartFailure = 30;
     // Reachability reference that keeps .pbox in the file for the loader's marker
     // check. The mapper deliberately does not copy .pbox into the published image,
     // so the mapped byte is zero; only a corrupt 0xFF fails the start.
@@ -950,6 +1055,16 @@ bool PostboxStart(const PostboxConfig* Config)
     if (!g_MmAllocateIndependentPages || !g_MmSetPageProtection || !g_MmFreeIndependentPages)
         return false;
 
+    // A previous start may have left the page resident (watchdog/stop). Never
+    // overwrite the only pointer: free it first when no worker is in flight.
+    if (PostboxStatePtr)
+    {
+        if (__atomic_load_n(&PostboxInFlight, __ATOMIC_ACQUIRE) != 0)
+            return false;
+        PostboxReleaseProcess();
+        PostboxFreeStatePage();
+    }
+
     PostboxStatePtr = (PostboxState*) ((FnMmAllocateIndependentPages)
         g_MmAllocateIndependentPages)(0x1000, 0xFFFFFFFF, 0, 0);
     if (!PostboxStatePtr) return false;
@@ -960,7 +1075,7 @@ bool PostboxStart(const PostboxConfig* Config)
         PostboxStatePtr = nullptr;
         return false;
     }
-    PostboxWipe(PostboxStatePtr, sizeof(PostboxState));
+    PostboxWipe(PostboxStatePtr, 0x1000);
 
     PostboxStatePtr->Cfg = *Config;
     PostboxStatePtr->Cfg.MmAllocateIndependentPages = 0;
@@ -971,6 +1086,13 @@ bool PostboxStart(const PostboxConfig* Config)
     // magic scan; wipe it after the check.
     PostboxStatePtr->Cfg.Magic = 0;
     PostboxStatePtr->Cfg.Version = 0;
+    // The reaper frees the loader allocation, not the aligned image base. Save
+    // RawBase/AllocSize before the layout copy is wiped. Lab build: the Postbox
+    // manual-map layout is always independent pages, and the known-good
+    // de9f061c loader predates Config.Reserved, so trust the layout here. The
+    // Reserved-bit gate returns for the production loader.
+    PostboxReaperBase = Config->Layout.RawBase;
+    PostboxReaperSize = Config->Layout.AllocSize;
     // The section map is only needed by ProtectImageSections(), which ran before
     // this copy. Do not leave the RVAs/sizes in the resident .data image.
     PostboxWipe(&PostboxStatePtr->Cfg.Layout, sizeof(PostboxStatePtr->Cfg.Layout));
@@ -1070,6 +1192,9 @@ bool PostboxStart(const PostboxConfig* Config)
         // closed and let the loader free/zero the image.
         print(ERROR("Postbox: KeSetCoalescableTimer failed; start aborted"));
         __atomic_store_n(&PostboxRunning, 0, __ATOMIC_RELEASE);
+        // The timer/DPC were initialized just above; cancel and flush before the
+        // state page that contains them is freed, even if the arm call queued one.
+        PostboxCancel();
         PostboxFreeStage();
         PostboxReleaseProcess();
         PostboxFreeStatePage();
@@ -1089,6 +1214,11 @@ void PostboxStop()
     // Also covers a second stop after the timer was already cancelled.
     PostboxNmiUninstall();
 #endif
+    // One teardown owner. A concurrent second stop must not free the state page
+    // under the first one; it returns and lets the owner finish.
+    if (__atomic_exchange_n(&PostboxTeardown, 1, __ATOMIC_ACQ_REL) != 0)
+        return;
+
     if (!__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE))
     {
         for (uint32_t i = 0; i < 1000 && __atomic_load_n(&PostboxInFlight, __ATOMIC_ACQUIRE); ++i)
@@ -1097,9 +1227,24 @@ void PostboxStop()
             Interval.QuadPart = -10000;
             ((FnKeDelayExecutionThread) g_KeDelayExecutionThread)(0, 0, &Interval);
         }
+        if (__atomic_load_n(&PostboxInFlight, __ATOMIC_ACQUIRE) != 0)
+        {
+            print(ERROR("Postbox: worker still in flight; leaving state resident"));
+            __atomic_store_n(&PostboxTeardown, 0, __ATOMIC_RELEASE);
+            return;
+        }
+        // A worker that passed the Running check just before the watchdog/stop
+        // may have re-armed the timer after the first cancel. Cancel/flush again
+        // before releasing the state page.
+        if (PostboxStatePtr)
+        {
+            ((FnKeCancelTimer) g_KeCancelTimer)(&PostboxStatePtr->Timer);
+            ((FnKeFlushQueuedDpcs) g_KeFlushQueuedDpcs)();
+        }
         PostboxReleaseProcess();
-        if (__atomic_load_n(&PostboxInFlight, __ATOMIC_ACQUIRE) == 0)
+        if (!PostboxStartReaper())
             PostboxFreeStatePage();
+        __atomic_store_n(&PostboxTeardown, 0, __ATOMIC_RELEASE);
         return;
     }
 
@@ -1113,12 +1258,26 @@ void PostboxStop()
         ((FnKeDelayExecutionThread) g_KeDelayExecutionThread)(0, 0, &Interval);
     }
 
+    // A worker that passed the Running check just before PostboxCancel may have
+    // re-armed the timer after the first cancel. If it is still in flight, leave
+    // the whole state resident; its terminal path owns teardown.
+    if (__atomic_load_n(&PostboxInFlight, __ATOMIC_ACQUIRE) != 0)
+    {
+        print(ERROR("Postbox: worker still in flight; leaving state resident"));
+        __atomic_store_n(&PostboxTeardown, 0, __ATOMIC_RELEASE);
+        return;
+    }
+
+    // Quiesced: cancel/flush again to cover the re-arm window, then release.
+    ((FnKeCancelTimer) g_KeCancelTimer)(&PostboxStatePtr->Timer);
+    ((FnKeFlushQueuedDpcs) g_KeFlushQueuedDpcs)();
     PostboxFreeStage();
     PostboxReleaseProcess();
     PostboxFreeState();
-    if (__atomic_load_n(&PostboxInFlight, __ATOMIC_ACQUIRE) == 0)
+    if (!PostboxStartReaper())
         PostboxFreeStatePage();
     print(INFO("Postbox: stopped"));
+    __atomic_store_n(&PostboxTeardown, 0, __ATOMIC_RELEASE);
 }
 
 #endif // POSTBOX_CHANNEL

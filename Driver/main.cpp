@@ -133,7 +133,8 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
         if (!ProtectImageSections((const PostboxConfig*) RegistryPath))
         {
             print(ERROR("DriverEntry: ProtectImageSections failed, returning 0xC0000001"));
-            return static_cast<win::ntstatus>(0xC0000001);
+            return static_cast<win::ntstatus>(
+                0xC0000000u | (PostboxStartFailure ? PostboxStartFailure : 20u));
         }
         print(INFO("DriverEntry: step 0.1 ProtectImageSections() ok"));
     }
@@ -237,7 +238,8 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
     if (!PostboxMode || !PostboxStart((const PostboxConfig*) RegistryPath))
     {
         print(ERROR("DriverEntry: PostboxStart() failed, returning 0xC0000001"));
-        return static_cast<win::ntstatus>(0xC0000001);
+        return static_cast<win::ntstatus>(
+            0xC0000000u | (PostboxStartFailure ? PostboxStartFailure : 30u));
     }
     print(INFO("DriverEntry: step 6 PostboxStart() ok"));
 #endif

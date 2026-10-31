@@ -73,10 +73,21 @@ if(POSTBOX_NMI)
     list(APPEND POSTBOX_NMI_SOURCES PostboxNmi.S)
 endif()
 
+# Self-free reaper: the terminal work routine creates a system thread whose entry
+# is an assembly stub in the image. The stub tail-jumps to MmFreeIndependentPages,
+# so the free returns to PspSystemThreadStartup and no image instruction is fetched
+# after the image is released. Only the Postbox build has this lifetime model.
+set(POSTBOX_REAPER_SOURCES)
+if(POSTBOX_CHANNEL)
+    enable_language(ASM)
+    list(APPEND POSTBOX_REAPER_SOURCES PostboxReaper.S)
+endif()
+
 # Driver entry point
 wdk_add_driver(Driver
         main.cpp
         ${POSTBOX_NMI_SOURCES}
+        ${POSTBOX_REAPER_SOURCES}
 )
 
 # All defines in one place: the shared seed plus the variant switch. _ITERATOR_DEBUG_LEVEL=0 turns the
