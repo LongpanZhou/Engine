@@ -151,16 +151,25 @@ constexpr uint32_t PostboxSectionHandoffMagic = 0x31584250;   // "PBX1"
 constexpr uint32_t PostboxSectionHandoffVersion = 2;
 constexpr uint32_t PostboxSectionBytes = 0x1000;              // one page
 
+// Deferred-key handshake state, stored in PostboxSectionHandoff::Reserved. The
+// client publishes the key only after the loader has finished provider/map work
+// and signals LOADER_READY, so the key is not resident in the section during the
+// loader's bring-up window.
+constexpr uint32_t PostboxSectionStateWaiting = 0;
+constexpr uint32_t PostboxSectionStateLoaderReady = 1;
+constexpr uint32_t PostboxSectionStateKeyReady = 2;
+constexpr uint32_t PostboxSectionStateConsumed = 3;
+
 struct alignas(8) PostboxSectionHandoff
 {
     uint32_t Magic;
     uint32_t Version;               // PostboxSectionHandoffVersion
     uint32_t Pid;                   // mailbox owner
-    uint32_t Reserved;
+    uint32_t Reserved;              // PostboxSectionState* handshake state
     uint64_t MailboxVa;             // user VA of the mailbox (8-byte aligned)
     uint64_t SessionId;             // per-session random ID
     uint64_t CreateTime;            // client process creation time, diagnostic
-    uint8_t Key[32];                // master key; loader copies, then wipes
+    uint8_t Key[32];                // master key; zero until LOADER_READY
 };
 static_assert(sizeof(PostboxSectionHandoff) == 0x48, "PostboxSectionHandoff layout changed");
 static_assert(offsetof(PostboxSectionHandoff, MailboxVa) == 0x10,

@@ -61,6 +61,8 @@ static bool RandomBytes(void* Buffer, size_t Size)
 static HANDLE g_HandoffSection = nullptr;
 static void* g_HandoffView = nullptr;
 static ULONGLONG g_HandoffWipeAt = 0;
+static uint8_t g_HandoffKey[32] = {};
+static bool g_HandoffKeyPending = false;
 constexpr ULONGLONG HandoffKeyGraceMs = 60000;
 
 // Explicit DACL: the creating user, Administrators, and SYSTEM. A default DACL
@@ -105,10 +107,14 @@ struct HandoffSectionSecurity
             return false;
 
         Acl = reinterpret_cast<ACL*>(AclStorage);
+        // The loader opens the section RW for the deferred-key handshake; the
+        // creator keeps its RW handle. Same-user readers could already read the
+        // key, so SECTION_MAP_WRITE is not a new confidentiality boundary.
+        const DWORD SectionAccess = SECTION_MAP_READ | SECTION_MAP_WRITE | READ_CONTROL;
         if (!InitializeAcl(Acl, AclSize, ACL_REVISION) ||
-            !AddAccessAllowedAce(Acl, ACL_REVISION, SECTION_MAP_READ | READ_CONTROL, UserSid) ||
-            !AddAccessAllowedAce(Acl, ACL_REVISION, SECTION_MAP_READ | READ_CONTROL, AdminSid) ||
-            !AddAccessAllowedAce(Acl, ACL_REVISION, SECTION_MAP_READ | READ_CONTROL, SystemSid))
+            !AddAccessAllowedAce(Acl, ACL_REVISION, SectionAccess, UserSid) ||
+            !AddAccessAllowedAce(Acl, ACL_REVISION, SectionAccess, AdminSid) ||
+            !AddAccessAllowedAce(Acl, ACL_REVISION, SectionAccess, SystemSid))
             return false;
         if (!InitializeSecurityDescriptor(&Sd, SECURITY_DESCRIPTOR_REVISION) ||
             !SetSecurityDescriptorDacl(&Sd, TRUE, Acl, FALSE))
@@ -170,12 +176,32 @@ static bool CreateHandoffSection(const PostboxSectionHandoff& Handoff, wchar_t* 
 
 static void WipeHandoffSection()
 {
+    SecureZeroMemory(g_HandoffKey, sizeof(g_HandoffKey));
+    g_HandoffKeyPending = false;
     if (g_HandoffView)
         SecureZeroMemory(g_HandoffView, PostboxSectionBytes);
 }
 
+// Publish the master key only after the loader has finished provider/map work
+// and set LOADER_READY. The loader reads the key and sets CONSUMED immediately;
+// the client never leaves the key in the section during bring-up.
+static void PublishHandoffKey()
+{
+    if (!g_HandoffView || !g_HandoffKeyPending) return;
+    auto* Handoff = static_cast<PostboxSectionHandoff*>(g_HandoffView);
+    if (Handoff->Reserved != PostboxSectionStateLoaderReady) return;
+    std::memcpy(Handoff->Key, g_HandoffKey, sizeof(Handoff->Key));
+    MemoryBarrier();
+    Handoff->Reserved = PostboxSectionStateKeyReady;
+    SecureZeroMemory(g_HandoffKey, sizeof(g_HandoffKey));
+    g_HandoffKeyPending = false;
+    std::printf("handoff: key published after loader-ready\n");
+    std::fflush(stdout);
+}
+
 static void ExpireHandoffSection()
 {
+    PublishHandoffKey();
     if (g_HandoffView && GetTickCount64() >= g_HandoffWipeAt)
         WipeHandoffSection();
 }
@@ -454,12 +480,16 @@ int PostboxClientMain(int argc, char** argv)
     Handoff.MailboxVa = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Base));
     Handoff.SessionId = SessionId;
     Handoff.CreateTime = CreateTime64;
-    std::memcpy(Handoff.Key, Master, sizeof(Handoff.Key));
+    Handoff.Reserved = PostboxSectionStateWaiting;
+    std::memcpy(g_HandoffKey, Master, sizeof(g_HandoffKey));
+    g_HandoffKeyPending = true;
 
     wchar_t SectionName[64] = {};
     if (!CreateHandoffSection(Handoff, SectionName, _countof(SectionName)))
     {
         SecureZeroMemory(&Handoff, sizeof(Handoff));
+        SecureZeroMemory(g_HandoffKey, sizeof(g_HandoffKey));
+        g_HandoffKeyPending = false;
         SecureZeroMemory(Master, sizeof(Master));
         std::printf("postbox: handoff section creation failed, error %lu\n", GetLastError());
         return 1;
