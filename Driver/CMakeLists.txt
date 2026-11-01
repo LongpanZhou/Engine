@@ -82,6 +82,17 @@ if(T2_PROBE)
     list(APPEND VARIANT_DEFINES T2_PROBE)
 endif()
 
+# Test-only E3 DPC probe: a CPU-1-targeted DPC remaps a test page's PTE and
+# records the stale read before the product KeIpiGenericCall flush and the
+# flushed read after it. Never part of the shipped build.
+option(E3_DPC_PROBE "Test-only DPC-based CPU-1 stale-TLB probe" OFF)
+if(E3_DPC_PROBE)
+    if(NOT POSTBOX_CHANNEL)
+        message(FATAL_ERROR "E3_DPC_PROBE requires POSTBOX_CHANNEL=ON")
+    endif()
+    list(APPEND VARIANT_DEFINES E3_DPC_PROBE)
+endif()
+
 # Self-free reaper: the terminal work routine creates a system thread whose entry
 # is an assembly stub in the image. The stub tail-jumps to MmFreeIndependentPages,
 # so the free returns to PspSystemThreadStartup and no image instruction is fetched

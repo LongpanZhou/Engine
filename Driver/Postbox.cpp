@@ -191,6 +191,24 @@ struct PostboxNmiImports
     uint64_t MmUnmapIoSpace;
 };
 
+#ifdef E3_DPC_PROBE
+// Test-only E3 result block. Appended to PostboxState so the shipped layout is
+// unchanged; KD reads it at state+0x348. Magic is "E3TLB001".
+struct PostboxE3Result
+{
+    uint64_t Magic;
+    uint64_t Va;
+    uint64_t PteBefore;
+    uint64_t PteAfter;
+    uint64_t Pre;       // CPU-1 read before the PTE change
+    uint64_t P1;        // CPU-1 read after the PTE change, before the flush
+    uint64_t P2;        // CPU-1 read after the KeIpiGenericCall flush
+    uint64_t Cpu1;
+    uint64_t Cpu2;
+    uint64_t Phase;     // 0x100 complete; 0xE0..0xEC failure
+};
+#endif
+
 // The live protocol state (config, keys, timer/DPC/work, client EPROCESS, stage)
 // lives on a separate independent RW/NX page. Only this pointer stays in .data.
 struct PostboxState
@@ -221,7 +239,13 @@ struct PostboxState
     // them into this field and zeroes the statics.
     PostboxMemCaches Caches;
     PostboxNmiImports NmiImports;
+#ifdef E3_DPC_PROBE
+    PostboxE3Result E3;
+#endif
 };
+#ifdef E3_DPC_PROBE
+static_assert(offsetof(PostboxState, E3) == 0x348, "E3 result offset changed");
+#endif
 static PostboxState* PostboxStatePtr = nullptr;
 static uint32_t PostboxPollRefs = 0;
 static bool PostboxPollTeardown = false;
@@ -366,6 +390,170 @@ static void T2Probe(uint64_t Base, uint64_t Ipi, uint32_t Phase)
 {
     print(INFO("[T2] P%u probe start base=%p"), Phase, (void*) (uintptr_t) Base);
     ((FnKeIpiGenericCall) Ipi)(&T2ProbeCallback, Base);
+}
+#endif
+
+#ifdef E3_DPC_PROBE
+// Test-only E3 CPU-1 stale-TLB probe. Never part of the shipped build.
+//
+// Two independent pages A and B are filled with 0x41 and 0x42. A's PTE is
+// rewritten to B's PFN while CPU 1 still holds the A translation. A DPC targeted
+// at CPU 1 records the read before the product KeIpiGenericCall+invlpg flush
+// (P1: stale 0x41) and after it (P2: 0x42). The result block lives in the state
+// page at +0x348 for KD.
+using FnKeSetTargetProcessorDpc = void (*)(PostboxDpc*, uint8_t);
+using FnKeInsertQueueDpc = uint8_t (*)(PostboxDpc*, void*, void*);
+using FnKeGetCurrentProcessorNumberEx = void (*)(void*);
+using FnKeSetSystemAffinityThreadEx = uint64_t (*)(uint64_t);
+using FnKeRevertToUserAffinityThreadEx = void (*)(uint64_t);
+
+static PostboxDpc E3Dpc1;
+static PostboxDpc E3Dpc2;
+static uint64_t* E3Pte = nullptr;
+static uint64_t E3PteOld = 0;
+static uint64_t E3PteNew = 0;
+static uint8_t* E3PageA = nullptr;
+static uint8_t* E3PageB = nullptr;
+static volatile long E3PhaseDone = 0;
+static volatile long E3Started = 0;
+static address E3SetTarget = 0;
+static address E3InsertDpc = 0;
+static address E3GetProc = 0;
+
+static uint32_t E3CurrentProcessor()
+{
+    struct { uint16_t Group; uint8_t Number; uint8_t Reserved; } Pn{};
+    if (E3GetProc) ((FnKeGetCurrentProcessorNumberEx) E3GetProc)(&Pn);
+    return Pn.Number;
+}
+
+static void E3DpcPhase1(void*, void*, void*, void*)
+{
+    PostboxState* S = PostboxStatePtr;
+    if (!S) return;
+    S->E3.Cpu1 = E3CurrentProcessor();
+    volatile uint64_t* A = (volatile uint64_t*) (uintptr_t) E3PageA;
+    S->E3.Pre = *A;
+    __atomic_store_n(E3Pte, E3PteNew, __ATOMIC_RELEASE);
+    S->E3.P1 = *A;
+    __atomic_store_n(&E3PhaseDone, 1, __ATOMIC_RELEASE);
+}
+
+static void E3DpcPhase2(void*, void*, void*, void*)
+{
+    PostboxState* S = PostboxStatePtr;
+    if (!S) return;
+    S->E3.Cpu2 = E3CurrentProcessor();
+    volatile uint64_t* A = (volatile uint64_t*) (uintptr_t) E3PageA;
+    S->E3.P2 = *A;
+    __atomic_store_n(&E3PhaseDone, 2, __ATOMIC_RELEASE);
+}
+
+static bool E3WaitDone(long Want)
+{
+    for (uint64_t i = 0; i < 100000000ull; ++i)
+    {
+        if (__atomic_load_n(&E3PhaseDone, __ATOMIC_ACQUIRE) == Want) return true;
+        __builtin_ia32_pause();
+    }
+    return false;
+}
+
+static void E3FlushPage(address Ipi, uint64_t Va)
+{
+    PostboxTlbRange Range{ Va, Va + 0x1000 };
+    ((FnKeIpiGenericCall) Ipi)(&PostboxFlushTlb, (uint64_t) (uintptr_t) &Range);
+}
+
+static void E3RunProbe()
+{
+    PostboxState* S = PostboxStatePtr;
+    if (!S) return;
+    S->E3.Magic = 0x4533544C42303031ull;   // "E3TLB001"
+    S->E3.Phase = 1;
+
+    uint64_t* PteA = nullptr;
+    uint64_t* PteB = nullptr;
+    uint64_t OldAffinity = 0;
+    constexpr uint64_t PfnMask = 0x000FFFFFFFFFF000ull;
+
+    if (!g_MmAllocateIndependentPages || !g_MmSetPageProtection || !g_MmFreeIndependentPages)
+    { S->E3.Phase = 0xE1; return; }
+
+    const address Nt = GetNtoskrnl();
+    if (!Nt) { S->E3.Phase = 0xE2; return; }
+    E3SetTarget = FindFuncExports(Nt, "KeSetTargetProcessorDpc");
+    E3InsertDpc = FindFuncExports(Nt, "KeInsertQueueDpc");
+    E3GetProc = FindFuncExports(Nt, "KeGetCurrentProcessorNumberEx");
+    const address SetAffinity = FindFuncExports(Nt, "KeSetSystemAffinityThreadEx");
+    const address RevertAffinity = FindFuncExports(Nt, "KeRevertToUserAffinityThreadEx");
+    const address Ipi = FindFuncExports(Nt, "KeIpiGenericCall");
+    if (!E3SetTarget || !E3InsertDpc || !E3GetProc || !Ipi ||
+        !SetAffinity || !RevertAffinity)
+    { S->E3.Phase = 0xE3; return; }
+
+    E3PageA = (uint8_t*) ((FnMmAllocateIndependentPages) g_MmAllocateIndependentPages)(
+        0x1000, 0xFFFFFFFF, 0, 0);
+    E3PageB = (uint8_t*) ((FnMmAllocateIndependentPages) g_MmAllocateIndependentPages)(
+        0x1000, 0xFFFFFFFF, 0, 0);
+    if (!E3PageA || !E3PageB) { S->E3.Phase = 0xE4; goto cleanup; }
+    if (!((FnMmSetPageProtection) g_MmSetPageProtection)(E3PageA, 0x1000, 0x04) ||
+        !((FnMmSetPageProtection) g_MmSetPageProtection)(E3PageB, 0x1000, 0x04))
+    { S->E3.Phase = 0xE5; goto cleanup; }
+
+    for (uint32_t i = 0; i < 0x1000; ++i) { E3PageA[i] = 0x41; E3PageB[i] = 0x42; }
+
+    if (!GetPteForVa(address((uint64_t) (uintptr_t) E3PageA), PteA) ||
+        !GetPteForVa(address((uint64_t) (uintptr_t) E3PageB), PteB) || PteA == PteB)
+    { S->E3.Phase = 0xE6; goto cleanup; }
+
+    E3PteOld = *PteA;
+    E3PteNew = (E3PteOld & ~PfnMask) | (*PteB & PfnMask);
+    if ((E3PteOld & 1) == 0 || (E3PteNew & 1) == 0 ||
+        ((E3PteOld ^ E3PteNew) & PfnMask) == 0)
+    { S->E3.Phase = 0xE7; goto cleanup; }
+
+    E3Pte = PteA;
+    S->E3.Va = (uint64_t) (uintptr_t) E3PageA;
+    S->E3.PteBefore = E3PteOld;
+    S->E3.PteAfter = E3PteNew;
+
+    OldAffinity = ((FnKeSetSystemAffinityThreadEx) SetAffinity)(2);   // CPU 1
+    for (uint64_t i = 0; i < 100000000ull && E3CurrentProcessor() != 1; ++i)
+        __builtin_ia32_pause();
+
+    ((FnKeInitializeDpc) g_KeInitializeDpc)(&E3Dpc1, &E3DpcPhase1, nullptr);
+    ((FnKeInitializeDpc) g_KeInitializeDpc)(&E3Dpc2, &E3DpcPhase2, nullptr);
+    ((FnKeSetTargetProcessorDpc) E3SetTarget)(&E3Dpc1, 1);
+    ((FnKeSetTargetProcessorDpc) E3SetTarget)(&E3Dpc2, 1);
+
+    __atomic_store_n(&E3PhaseDone, 0, __ATOMIC_RELEASE);
+    if (!((FnKeInsertQueueDpc) E3InsertDpc)(&E3Dpc1, nullptr, nullptr))
+    { S->E3.Phase = 0xE8; goto cleanup; }
+    if (!E3WaitDone(1)) { S->E3.Phase = 0xE9; goto cleanup; }
+
+    E3FlushPage(Ipi, (uint64_t) (uintptr_t) E3PageA);
+
+    __atomic_store_n(&E3PhaseDone, 0, __ATOMIC_RELEASE);
+    if (!((FnKeInsertQueueDpc) E3InsertDpc)(&E3Dpc2, nullptr, nullptr))
+    { S->E3.Phase = 0xEA; goto cleanup; }
+    if (!E3WaitDone(2)) { S->E3.Phase = 0xEB; goto cleanup; }
+
+    S->E3.Phase = 0x100;
+
+cleanup:
+    if (E3Pte)
+    {
+        __atomic_store_n(E3Pte, E3PteOld, __ATOMIC_RELEASE);
+        invlpg(address((uint64_t) (uintptr_t) E3PageA));
+        E3FlushPage(Ipi, (uint64_t) (uintptr_t) E3PageA);
+        E3Pte = nullptr;
+    }
+    if (E3PageA) ((FnMmFreeIndependentPages) g_MmFreeIndependentPages)(E3PageA, 0x1000);
+    if (E3PageB) ((FnMmFreeIndependentPages) g_MmFreeIndependentPages)(E3PageB, 0x1000);
+    E3PageA = nullptr;
+    E3PageB = nullptr;
+    ((FnKeRevertToUserAffinityThreadEx) RevertAffinity)(OldAffinity);
 }
 #endif
 
@@ -937,7 +1125,14 @@ extern "C" void PostboxWorkRoutine(void*)
 {
     PostboxState* State = PostboxStatePtr;
     if (__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE))
+    {
+#ifdef E3_DPC_PROBE
+        // Run the test-only CPU-1 probe once, before the first mailbox poll.
+        if (__atomic_exchange_n(&E3Started, 1, __ATOMIC_ACQ_REL) == 0)
+            E3RunProbe();
+#endif
         PostboxPoll();
+    }
 
     // Terminal work item: running is clear and the timer is cancelled, so no DPC
     // can queue this item again. The worker already loaded WorkerRoutine; clear
