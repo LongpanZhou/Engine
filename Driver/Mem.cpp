@@ -366,6 +366,17 @@ static uint64_t CachedNtoskrnl = 0;
 static uint64_t CachedPteBase = 0;
 static uint64_t CachedPfnPteAddressBase = 0;
 
+// ROT1-decode an export name into a stack buffer. The two data-export names
+// are stored encoded so the mapped image's .rdata carries no plaintext
+// "PsInitialSystemProcess"/"PsLoadedModuleList" strings.
+static void MemDecodeName(const char* Encoded, char* Out, uint32_t OutSize)
+{
+    uint32_t i = 0;
+    for (; i + 1 < OutSize && Encoded[i]; ++i)
+        Out[i] = (char) (Encoded[i] - 1);
+    Out[i] = 0;
+}
+
 // The loader supplies the ntoskrnl base before ProtectImageSections calls
 // PostboxResolve. Resolve the two data exports here and keep them in the
 // transient cache until MemAdoptCaches() moves them to the state page.
@@ -374,12 +385,25 @@ void MemSetPreStartNtoskrnl(uint64_t Base)
     __atomic_store_n(&PreStartNtoskrnl, Base, __ATOMIC_SEQ_CST);
     if (!Base) return;
     __atomic_store_n(&CachedNtoskrnl, Base, __ATOMIC_SEQ_CST);
+
+    static const char EncodedPsInitial[] = "QtJojujbmTztufnQspdftt";
+    static const char EncodedPsLoaded[] = "QtMpbefeNpevmfMjtu";
+    char PsInitialName[32];
+    char PsLoadedName[32];
+    MemDecodeName(EncodedPsInitial, PsInitialName, sizeof(PsInitialName));
+    MemDecodeName(EncodedPsLoaded, PsLoadedName, sizeof(PsLoadedName));
+
     if (!CachedPsInitialSystemProcess)
         CachedPsInitialSystemProcess =
-            (uint64_t) (uintptr_t) FindFuncExports((address) Base, "PsInitialSystemProcess");
+            (uint64_t) (uintptr_t) FindFuncExports((address) Base, PsInitialName);
     if (!CachedPsLoadedModuleList)
         CachedPsLoadedModuleList =
-            (uint64_t) (uintptr_t) FindFuncExports((address) Base, "PsLoadedModuleList");
+            (uint64_t) (uintptr_t) FindFuncExports((address) Base, PsLoadedName);
+
+    for (uint32_t i = 0; i < sizeof(PsInitialName); ++i)
+        ((volatile char*) PsInitialName)[i] = 0;
+    for (uint32_t i = 0; i < sizeof(PsLoadedName); ++i)
+        ((volatile char*) PsLoadedName)[i] = 0;
 }
 
 // True when a loader BaseDllName equals Expected (ASCII, case-insensitive). The read is bounded by
