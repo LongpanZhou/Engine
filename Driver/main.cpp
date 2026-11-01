@@ -33,6 +33,7 @@ using namespace intrin;
 // so the table is empty. Add an entry here if a global object with a runtime constructor is introduced
 extern "C" void (*__CTOR_LIST__[2])() = {nullptr, nullptr};
 
+#ifndef MANUAL_MAP_ONLY
 win::ntstatus DriverExit(win::DRIVER_OBJECT* DriverObject)
 {
 #ifdef MANUAL_MAP_ONLY
@@ -96,6 +97,7 @@ win::ntstatus DriverExit(win::DRIVER_OBJECT* DriverObject)
     return win::ntstatus::success;
 #endif
 }
+#endif // MANUAL_MAP_ONLY
 
 win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING* RegistryPath)
 {
@@ -193,9 +195,13 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
         print(INFO("DriverEntry: step 2 LinkMapTable() returned %u"), (uint32_t) Linked);
     }
 
+#ifndef MANUAL_MAP_ONLY
     // Set before the unlink, so an unload only undoes what DriverEntry actually did. A manually mapped driver
-    // (kdmapper) gets a NULL DriverObject and no unload callback, so only set it when there is one
+    // (kdmapper) gets a NULL DriverObject and no unload callback, so only set it when there is one.
+    // The manual-map-only build has no unload path at all; excluding it removes the dead
+    // DriverExit/PostboxStop stub from the mapped image.
     if (DriverObject) DriverObject->DriverUnload = DriverExit;
+#endif
 
 #ifndef MANUAL_MAP_ONLY
     // Unlink the driver from PsLoadedModuleList, so module walks no longer report it. A manually mapped driver

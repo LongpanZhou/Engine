@@ -59,14 +59,14 @@ static_assert(sizeof(PostboxHeader) == PostboxDataAt, "header must end at the bo
 static_assert((offsetof(PostboxHeader, Seq) % 4) == 0, "Seq must be 4-byte aligned");
 static_assert((offsetof(PostboxHeader, Address) % 8) == 0, "Address must be 8-byte aligned");
 
-constexpr uint32_t PostboxConfigMagic = 0x50424F58;   // "PBOX"
+constexpr uint32_t PostboxConfigMagic = 0x8E2B41D7;   // non-ASCII config tag
 
 // The mapped image is headerless and .pdata/.reloc are zeroed, so the driver cannot
 // parse its own PE section table at runtime. The loader builds this compact layout
 // from the file and passes it in the config. The driver applies it to the image PTE
 // block before the channel starts: .text RX, writable sections RW/NX, everything
 // else (header, .rdata, .pdata, .reloc, .pbox, pool padding) R/NX.
-constexpr uint32_t PostboxLayoutMagic = 0x59414C50;   // "PLAY"
+constexpr uint32_t PostboxLayoutMagic = 0x3C9A6F52;   // non-ASCII layout tag
 constexpr uint32_t PostboxLayoutVersion = 1;
 constexpr uint32_t PostboxMaxSections = 8;
 
@@ -119,12 +119,13 @@ struct PostboxConfig
     uint64_t MmFreeIndependentPages;// loader-resolved stage free routine
 };
 
-// Client -> loader bootstrap handoff, carried in a pagefile-backed named section.
-// The client creates the section (random name, explicit DACL), maps it RW, writes
-// this record, and passes the name on the loader command line. The loader opens
-// the section read-only, copies the
-// record, unmaps/closes, and never touches the client address space. The section
-// is page-granular and is deleted when the last handle closes.
+// Client -> loader bootstrap handoff, carried in an unnamed pagefile-backed
+// section. The client creates the section, keeps the creation handle, and spawns
+// the loader with only that handle inherited. The loader maps the inherited
+// handle, copies the record, unmaps/closes, and never touches the client address
+// space. There is no name or DACL to discover; the handle value is passed on the
+// loader command line. The section is page-granular and is deleted when the last
+// handle closes.
 //
 // CreateTime is not independently verified by the loader any more (that needed a
 // process handle + GetProcessTimes). The driver re-checks it with

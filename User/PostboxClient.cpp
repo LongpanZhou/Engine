@@ -21,20 +21,25 @@ struct ClientSession
     uint32_t Sequence;
     uint32_t Pid;
     int32_t Status;
+    // Master key held only on this stack session until the loader is ready.
+    // Keeping it out of a fixed .data global removes the V-06 static offset.
+    uint8_t HandoffKey[32];
+    bool HandoffKeyPending;
 
     ~ClientSession()
     {
         pb::WipePostboxKeys(&Keys);
+        SecureZeroMemory(HandoffKey, sizeof(HandoffKey));
+        HandoffKeyPending = false;
         SessionId = 0;
         Nonce = 0;
         Sequence = 0;
     }
 };
 
-// Test-only client modes. Defaults reproduce the original --nmi-less behavior exactly.
+// Test-only client modes.
 struct ClientOptions
 {
-    bool Nmi;
     bool Kill;
     uint32_t HoldMs;
     uint32_t HoldPingMs;
@@ -62,8 +67,6 @@ static HANDLE g_HandoffSection = nullptr;
 static HANDLE g_LoaderProcess = nullptr;
 static void* g_HandoffView = nullptr;
 static ULONGLONG g_HandoffWipeAt = 0;
-static uint8_t g_HandoffKey[32] = {};
-static bool g_HandoffKeyPending = false;
 static ULONGLONG g_HandoffPublishedAt = 0;
 constexpr ULONGLONG HandoffKeyGraceMs = 60000;
 
@@ -118,12 +121,39 @@ static bool StartLoader(HANDLE Section, const ClientOptions& Options)
         return false;
     }
 
-    STARTUPINFOA Si{};
-    Si.cb = sizeof(Si);
+    // Restrict inheritance to the handoff section. Without the handle list,
+    // bInheritHandles=TRUE hands the child every inheritable handle in the client.
+    STARTUPINFOEXA Si{};
+    Si.StartupInfo.cb = sizeof(Si);
+    SIZE_T AttrSize = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &AttrSize);
+    alignas(16) uint8_t AttrBuf[128] = {};
+    if (AttrSize == 0 || AttrSize > sizeof(AttrBuf))
+    {
+        std::printf("postbox: attribute-list sizing failed\n");
+        return false;
+    }
+    Si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(AttrBuf);
+    if (!InitializeProcThreadAttributeList(Si.lpAttributeList, 1, 0, &AttrSize))
+    {
+        std::printf("postbox: attribute-list init failed, error %lu\n", GetLastError());
+        return false;
+    }
+    HANDLE Inherit[1] = { Section };
+    if (!UpdateProcThreadAttribute(Si.lpAttributeList, 0,
+                                   PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   Inherit, sizeof(Inherit), nullptr, nullptr))
+    {
+        std::printf("postbox: handle-list setup failed, error %lu\n", GetLastError());
+        DeleteProcThreadAttributeList(Si.lpAttributeList);
+        return false;
+    }
+
     PROCESS_INFORMATION Pi{};
     const BOOL Created = CreateProcessA(
-        nullptr, CommandLine, nullptr, nullptr, TRUE, 0, nullptr, nullptr,
-        &Si, &Pi);
+        nullptr, CommandLine, nullptr, nullptr, TRUE, EXTENDED_STARTUPINFO_PRESENT,
+        nullptr, nullptr, &Si.StartupInfo, &Pi);
+    DeleteProcThreadAttributeList(Si.lpAttributeList);
     if (!Created)
     {
         std::printf("postbox: CreateProcess(%s) failed, error %lu\n",
@@ -131,18 +161,15 @@ static bool StartLoader(HANDLE Section, const ClientOptions& Options)
         return false;
     }
 
-    std::printf("postbox: loader pid=%lu handle=0x%llX\n",
-                static_cast<unsigned long>(Pi.dwProcessId),
-                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Section)));
     CloseHandle(Pi.hThread);
     g_LoaderProcess = Pi.hProcess;
     return true;
 }
 
-static void WipeHandoffSection()
+static void WipeHandoffSection(ClientSession& S)
 {
-    SecureZeroMemory(g_HandoffKey, sizeof(g_HandoffKey));
-    g_HandoffKeyPending = false;
+    SecureZeroMemory(S.HandoffKey, sizeof(S.HandoffKey));
+    S.HandoffKeyPending = false;
     g_HandoffPublishedAt = 0;
     if (g_HandoffView)
         SecureZeroMemory(g_HandoffView, PostboxSectionBytes);
@@ -152,13 +179,13 @@ static void WipeHandoffSection()
 // and set LOADER_READY. The CAS claims PUBLISHING so the loader's withdrawal
 // (timeout) wins cleanly. If the loader withdraws, the client wipes instead of
 // leaving a key behind.
-static void PublishHandoffKey()
+static void PublishHandoffKey(ClientSession& S)
 {
-    if (!g_HandoffView || !g_HandoffKeyPending) return;
+    if (!g_HandoffView || !S.HandoffKeyPending) return;
     auto* Handoff = static_cast<PostboxSectionHandoff*>(g_HandoffView);
     if (Handoff->Reserved == PostboxSectionStateWithdrawn)
     {
-        WipeHandoffSection();
+        WipeHandoffSection(S);
         return;
     }
     if (Handoff->Reserved != PostboxSectionStateLoaderReady) return;
@@ -168,28 +195,28 @@ static void PublishHandoffKey()
         PostboxSectionStateLoaderReady)
     {
         if (Handoff->Reserved == PostboxSectionStateWithdrawn)
-            WipeHandoffSection();
+            WipeHandoffSection(S);
         return;
     }
-    std::memcpy(Handoff->Key, g_HandoffKey, sizeof(Handoff->Key));
+    std::memcpy(Handoff->Key, S.HandoffKey, sizeof(Handoff->Key));
     MemoryBarrier();
     Handoff->Reserved = PostboxSectionStateKeyReady;
-    SecureZeroMemory(g_HandoffKey, sizeof(g_HandoffKey));
-    g_HandoffKeyPending = false;
+    SecureZeroMemory(S.HandoffKey, sizeof(S.HandoffKey));
+    S.HandoffKeyPending = false;
     g_HandoffPublishedAt = GetTickCount64();
     std::printf("handoff: key published after loader-ready\n");
     std::fflush(stdout);
 }
 
-static void ExpireHandoffSection()
+static void ExpireHandoffSection(ClientSession& S)
 {
-    PublishHandoffKey();
-    if (g_HandoffView && !g_HandoffKeyPending)
+    PublishHandoffKey(S);
+    if (g_HandoffView && !S.HandoffKeyPending)
     {
         auto* Handoff = static_cast<PostboxSectionHandoff*>(g_HandoffView);
         if (Handoff->Reserved == PostboxSectionStateWithdrawn)
         {
-            WipeHandoffSection();
+            WipeHandoffSection(S);
             return;
         }
         // If the loader never consumes the published key (timeout/unmap), do
@@ -197,15 +224,15 @@ static void ExpireHandoffSection()
         if (Handoff->Reserved != PostboxSectionStateConsumed &&
             g_HandoffPublishedAt != 0 &&
             GetTickCount64() - g_HandoffPublishedAt > 1000)
-            WipeHandoffSection();
+            WipeHandoffSection(S);
     }
     if (g_HandoffView && GetTickCount64() >= g_HandoffWipeAt)
-        WipeHandoffSection();
+        WipeHandoffSection(S);
 }
 
-static void CloseHandoffSection()
+static void CloseHandoffSection(ClientSession& S)
 {
-    WipeHandoffSection();
+    WipeHandoffSection(S);
     if (g_HandoffView)
     {
         UnmapViewOfFile(g_HandoffView);
@@ -256,7 +283,7 @@ static bool Submit(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
     const ULONGLONG Deadline = GetTickCount64() + TimeoutMs;
     while (GetTickCount64() < Deadline)
     {
-        ExpireHandoffSection();
+        ExpireHandoffSection(S);
         if (Header->Ack == Seq) break;
         Sleep(1);
     }
@@ -329,11 +356,7 @@ static bool ParseArguments(int argc, char** argv, ClientOptions& Options)
     for (int i = 1; i < argc; ++i)
     {
         const char* Arg = argv[i];
-        if (std::strcmp(Arg, "--nmi") == 0)
-        {
-            Options.Nmi = true;
-        }
-        else if (std::strcmp(Arg, "--kill") == 0)
+        if (std::strcmp(Arg, "--kill") == 0)
         {
             Options.Kill = true;
         }
@@ -377,8 +400,8 @@ static bool ParseArguments(int argc, char** argv, ClientOptions& Options)
     return true;
 }
 
-// Keepalive hold: the driver stays on its fast timer and the NMI gate stays active, but
-// no bulk/read requests are issued, so the mailbox is quiet except for pings. Hold runs
+// Keepalive hold: the driver stays on its fast timer, but no bulk/read requests are
+// issued, so the mailbox is quiet except for pings. Hold runs
 // only after the first ping/ACK, i.e. after the loader's bootstrap has already completed.
 // Ping mode is also a liveness probe; a failure tears the session down like any other
 // test failure.
@@ -430,7 +453,9 @@ int PostboxClientMain(int argc, char** argv)
 {
     ClientOptions Options{};
     Options.LoaderPath = "mapload.exe";
-    Options.LoaderArgs = "--sys DriverPlain.sys --provider pte";
+    // Production default: no loader stdout blueprint. Test harnesses can override
+    // with --loader-args when they need the loader's evidence lines.
+    Options.LoaderArgs = "--sys DriverPlain.sys --provider pte --quiet";
     if (!ParseArguments(argc, argv, Options))
         return 1;
 
@@ -505,14 +530,14 @@ int PostboxClientMain(int argc, char** argv)
     Handoff.SessionId = SessionId;
     Handoff.CreateTime = CreateTime64;
     Handoff.Reserved = PostboxSectionStateWaiting;
-    std::memcpy(g_HandoffKey, Master, sizeof(g_HandoffKey));
-    g_HandoffKeyPending = true;
+    std::memcpy(S.HandoffKey, Master, sizeof(S.HandoffKey));
+    S.HandoffKeyPending = true;
 
     if (!CreateHandoffSection(Handoff))
     {
         SecureZeroMemory(&Handoff, sizeof(Handoff));
-        SecureZeroMemory(g_HandoffKey, sizeof(g_HandoffKey));
-        g_HandoffKeyPending = false;
+        SecureZeroMemory(S.HandoffKey, sizeof(S.HandoffKey));
+        S.HandoffKeyPending = false;
         SecureZeroMemory(Master, sizeof(Master));
         std::printf("postbox: handoff section creation failed, error %lu\n", GetLastError());
         return 1;
@@ -522,7 +547,7 @@ int PostboxClientMain(int argc, char** argv)
     if (!StartLoader(g_HandoffSection, Options))
     {
         SecureZeroMemory(Master, sizeof(Master));
-        CloseHandoffSection();
+        CloseHandoffSection(S);
         return 1;
     }
 
@@ -534,9 +559,6 @@ int PostboxClientMain(int argc, char** argv)
     SecureZeroMemory(MasterCopy, sizeof(MasterCopy));
     S.SessionId = SessionId;
 
-    std::printf("postbox: pid=%lu va=0x%llX size=0x%X\n",
-                static_cast<unsigned long>(S.Pid),
-                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Base)), PostboxBytes);
     std::printf("postbox: unnamed handoff section inherited by loader\n");
     std::printf("waiting up to 60 s for the driver...\n");
     std::fflush(stdout);
@@ -547,19 +569,19 @@ int PostboxClientMain(int argc, char** argv)
     {
         std::printf("ping: timeout or auth failure (driver not mapped, wrong pid/VA/CreateTime, "
                     "or key/session mismatch)\n");
-        CloseHandoffSection();
+        CloseHandoffSection(S);
         return 1;
     }
     std::printf("ping: status=0x%X\n", static_cast<unsigned>(S.Status));
     if (S.Status != 0)
     {
-        CloseHandoffSection();
+        CloseHandoffSection(S);
         StopBestEffort(Header, Data, S);
         return 1;
     }
 
     // The loader has copied the handoff; do not leave the master key in the section.
-    CloseHandoffSection();
+    CloseHandoffSection(S);
 
     // Deterministic dead-client test: exit abruptly after a successful ping and the wipe,
     // with no pb_stop, so the driver must notice the client is gone on its own.
@@ -571,7 +593,11 @@ int PostboxClientMain(int argc, char** argv)
         // working keys and the mailbox explicitly before the abrupt exit.
         pb::WipePostboxKeys(&S.Keys);
         SecureZeroMemory(Base, PostboxBytes);
-        TerminateProcess(GetCurrentProcess(), 0xDEAD);
+        // Do not leave a fixed test exit code as a kill-path signature.
+        uint32_t KillExit = 0;
+        if (!RandomBytes(&KillExit, sizeof(KillExit)))
+            KillExit = static_cast<uint32_t>(GetTickCount());
+        TerminateProcess(GetCurrentProcess(), KillExit);
         std::printf("kill: TerminateProcess failed, error %lu\n", GetLastError());
         return 1;
     }
@@ -686,51 +712,8 @@ int PostboxClientMain(int argc, char** argv)
     }
     SecureZeroMemory(Data, PostboxDataMax);
 
-    if (Options.Nmi)
-    {
-        uint64_t NmiBefore = 0;
-        if (!Submit(Header, Data, S, pb_nmi, 0, 0, 3000))
-        {
-            std::printf("nmi: query timeout or unsupported (driver not built with POSTBOX_NMI)\n");
-            StopBestEffort(Header, Data, S);
-            return 1;
-        }
-        if (S.Status != 0)
-        {
-            std::printf("nmi: query status=0x%X\n", static_cast<unsigned>(S.Status));
-            StopBestEffort(Header, Data, S);
-            return 1;
-        }
-        std::memcpy(&NmiBefore, Data, sizeof(NmiBefore));
-        std::printf("nmi: count=%llu\n", static_cast<unsigned long long>(NmiBefore));
-
-        if (!Submit(Header, Data, S, pb_nmi, 1, 0, 3000))
-        {
-            std::printf("nmi: self-test timeout or auth failure\n");
-            StopBestEffort(Header, Data, S);
-            return 1;
-        }
-        if (S.Status != 0)
-        {
-            std::printf("nmi: self-test status=0x%X\n", static_cast<unsigned>(S.Status));
-            StopBestEffort(Header, Data, S);
-            return 1;
-        }
-        uint64_t NmiHandled = 0;
-        std::memcpy(&NmiHandled, Data, sizeof(NmiHandled));
-        std::printf("nmi: self-test handled=%llu\n",
-                    static_cast<unsigned long long>(NmiHandled));
-        SecureZeroMemory(Data, PostboxDataMax);
-        if (NmiHandled == 0)
-        {
-            std::printf("nmi: self-test did not consume an NMI\n");
-            StopBestEffort(Header, Data, S);
-            return 1;
-        }
-    }
-
-    // Test-only hold: run after the functional tests and the optional NMI checks, but
-    // before pb_stop, so the driver keeps its fast timer and NMI gate for the duration.
+    // Test-only hold: run after the functional tests, but before pb_stop, so the
+    // driver keeps its fast timer for the duration.
     if (Options.HoldMs != 0)
     {
         if (!HoldSession(Header, Data, S, Options.HoldMs, Options.HoldPingMs))

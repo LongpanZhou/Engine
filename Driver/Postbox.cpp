@@ -897,7 +897,7 @@ static void PostboxWipe(void* Data, size_t Size)
 static void PostboxFreeStage()
 {
     if (!PostboxStatePtr || !PostboxStatePtr->Stage) return;
-    PostboxWipe(PostboxStatePtr->Stage, StageBytes);
+    PostboxWipe(PostboxStatePtr->Stage, StageAllocBytes);
     if (PostboxStatePtr->StageIndependent && g_MmFreeIndependentPages)
         ((FnMmFreeIndependentPages) g_MmFreeIndependentPages)(
             PostboxStatePtr->Stage, StageAllocBytes);
@@ -1539,8 +1539,8 @@ bool PostboxStart(const PostboxConfig* Config)
     PostboxStatePtr->Cfg.MmAllocateIndependentPages = 0;
     PostboxStatePtr->Cfg.MmSetPageProtection = 0;
     PostboxStatePtr->Cfg.MmFreeIndependentPages = 0;
-    // The magic/version are validation-only. Leaving the 8-byte "PBOX"+version
-    // prefix in .data makes the resident control block trivially findable by a
+    // The magic/version are validation-only. Leaving the 8-byte config tag plus
+    // version in .data makes the resident control block trivially findable by a
     // magic scan; wipe it after the check.
     PostboxStatePtr->Cfg.Magic = 0;
     PostboxStatePtr->Cfg.Version = 0;
@@ -1671,7 +1671,7 @@ bool PostboxStart(const PostboxConfig* Config)
         PostboxFreeStatePage();
         return false;
     }
-    PostboxWipe(PostboxStatePtr->Stage, StageBytes);
+    PostboxWipe(PostboxStatePtr->Stage, StageAllocBytes);
 
 #ifdef POSTBOX_NMI
     // The IDT is not touched at start. The gate is installed transiently only for
