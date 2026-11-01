@@ -223,6 +223,8 @@ struct PostboxState
     PostboxNmiImports NmiImports;
 };
 static PostboxState* PostboxStatePtr = nullptr;
+static uint32_t PostboxPollRefs = 0;
+static bool PostboxPollTeardown = false;
 
 // Mem.cpp calls this on every lookup. Before the state page exists it returns
 // null, so the transient static cache is used; after PostboxStart it returns the
@@ -873,9 +875,18 @@ static bool PostboxStartReaper()
 
 // The client EPROCESS reference is acquired once at start, not per poll. The
 // poll acquires/releases the exit synchronization around each mailbox exchange.
+// Teardown sets a flag and waits for the last poll reference before it
+// dereferences the EPROCESS, so a stop cannot free it under an in-flight poll.
 static void PostboxReleaseProcess()
 {
     if (!PostboxStatePtr) return;
+    __atomic_store_n(&PostboxPollTeardown, true, __ATOMIC_RELEASE);
+    for (uint32_t i = 0; i < 100000 &&
+                       __atomic_load_n(&PostboxPollRefs, __ATOMIC_ACQUIRE); ++i)
+        __builtin_ia32_pause();
+    if (__atomic_load_n(&PostboxPollRefs, __ATOMIC_ACQUIRE) != 0)
+        return;
+
     void* Process = PostboxStatePtr->Process;
     PostboxStatePtr->Process = nullptr;
     if (Process && g_ObDereferenceObject)
@@ -1187,8 +1198,16 @@ static void PostboxPollAttached(void* MailboxProcess)
 // so the poll does not attach or detach itself.
 static void PostboxPoll()
 {
-    if (!__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE)) return;
-    if (!PostboxStatePtr->MailboxVa)
+    if (__atomic_load_n(&PostboxPollTeardown, __ATOMIC_ACQUIRE)) return;
+    __atomic_add_fetch(&PostboxPollRefs, 1, __ATOMIC_ACQ_REL);
+    if (__atomic_load_n(&PostboxPollTeardown, __ATOMIC_ACQUIRE) ||
+        !__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE))
+    {
+        __atomic_sub_fetch(&PostboxPollRefs, 1, __ATOMIC_ACQ_REL);
+        return;
+    }
+
+    if (!PostboxStatePtr || !PostboxStatePtr->MailboxVa)
     {
         // A zeroed/corrupted state must not leave the fast timer armed forever:
         // the dead-client watchdog is bypassed by this early return, and a manual
@@ -1199,6 +1218,7 @@ static void PostboxPoll()
         // Finish every state-page write before the reaper can free the page.
         PostboxStatePtr->SessionId = 0;
         PostboxStatePtr->LastNonce = 0;
+        __atomic_sub_fetch(&PostboxPollRefs, 1, __ATOMIC_ACQ_REL);
         PostboxMaybeReleaseProcess();
         PostboxStartReaper();
         return;
@@ -1210,6 +1230,7 @@ static void PostboxPoll()
     {
         PostboxDeadTick();
         PostboxIdleTick();
+        __atomic_sub_fetch(&PostboxPollRefs, 1, __ATOMIC_ACQ_REL);
         PostboxMaybeReleaseProcess();
         return;
     }
@@ -1224,11 +1245,13 @@ static void PostboxPoll()
     {
         PostboxDeadTick();
         PostboxIdleTick();
+        __atomic_sub_fetch(&PostboxPollRefs, 1, __ATOMIC_ACQ_REL);
         PostboxMaybeReleaseProcess();
         return;
     }
     PostboxPollAttached(Process);
     ((FnPsReleaseProcessExitSynchronization) g_PsReleaseProcessExitSynchronization)(Process);
+    __atomic_sub_fetch(&PostboxPollRefs, 1, __ATOMIC_ACQ_REL);
     PostboxMaybeReleaseProcess();
 }
 
@@ -1236,6 +1259,8 @@ static void PostboxPoll()
 bool PostboxStart(const PostboxConfig* Config)
 {
     PostboxStartFailure = 30;
+    PostboxPollRefs = 0;
+    PostboxPollTeardown = false;
 
     if (__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE)) return true;
     if (!Config || Config->Magic != PostboxConfigMagic || Config->Version != 4 ||
