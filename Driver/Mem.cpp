@@ -10,8 +10,26 @@ enum pagesize : uint32_t
 // CR3 of the System process: maps all kernel memory and is fixed for the rest of the boot. Filled lazily
 // (the value only exists after boot); every later caller reuses the runtime global
 static uint64_t SystemCr3Value = 0;
+static uint64_t CachedPsInitialSystemProcess = 0;
+static uint64_t CachedPsLoadedModuleList = 0;
+static uint64_t PreStartNtoskrnl = 0;
 cr3 GetSystemCr3()
 {
+#ifdef POSTBOX_CHANNEL
+    uint64_t Value = __atomic_load_n(&SystemCr3Value, __ATOMIC_SEQ_CST);
+    if (!Value)
+    {
+        PostboxMemCaches* Caches = PostboxGetMemCaches();
+        uint64_t PsInitial = Caches ? Caches->PsInitialSystemProcess : 0;
+        if (!PsInitial)
+            PsInitial = __atomic_load_n(&CachedPsInitialSystemProcess, __ATOMIC_SEQ_CST);
+        if (!PsInitial)
+            return cr3{0};
+        Value = ((_KPROCESS *) *(_KPROCESS **) (uintptr_t) PsInitial)->DirectoryTableBase;
+        __atomic_store_n(&SystemCr3Value, Value, __ATOMIC_SEQ_CST);
+    }
+    return cr3{Value};
+#else
     uint64_t Value = __atomic_load_n(&SystemCr3Value, __ATOMIC_SEQ_CST);
     if (!Value)
     {
@@ -19,6 +37,7 @@ cr3 GetSystemCr3()
         __atomic_store_n(&SystemCr3Value, Value, __ATOMIC_SEQ_CST);
     }
     return cr3{Value};
+#endif
 }
 
 // Claims an empty entry (all-zero) for a mapping, atomically, so a live mapping's entry is never taken
@@ -347,6 +366,22 @@ static uint64_t CachedNtoskrnl = 0;
 static uint64_t CachedPteBase = 0;
 static uint64_t CachedPfnPteAddressBase = 0;
 
+// The loader supplies the ntoskrnl base before ProtectImageSections calls
+// PostboxResolve. Resolve the two data exports here and keep them in the
+// transient cache until MemAdoptCaches() moves them to the state page.
+void MemSetPreStartNtoskrnl(uint64_t Base)
+{
+    __atomic_store_n(&PreStartNtoskrnl, Base, __ATOMIC_SEQ_CST);
+    if (!Base) return;
+    __atomic_store_n(&CachedNtoskrnl, Base, __ATOMIC_SEQ_CST);
+    if (!CachedPsInitialSystemProcess)
+        CachedPsInitialSystemProcess =
+            (uint64_t) (uintptr_t) FindFuncExports((address) Base, "PsInitialSystemProcess");
+    if (!CachedPsLoadedModuleList)
+        CachedPsLoadedModuleList =
+            (uint64_t) (uintptr_t) FindFuncExports((address) Base, "PsLoadedModuleList");
+}
+
 // True when a loader BaseDllName equals Expected (ASCII, case-insensitive). The read is bounded by
 // Name.Length: BaseDllName is a counted string, not necessarily NUL-terminated
 static bool ModuleNameEquals(const _UNICODE_STRING &Name, const char *Expected)
@@ -375,6 +410,15 @@ address GetNtoskrnl()
     uint64_t Cached = __atomic_load_n(Slot, __ATOMIC_SEQ_CST);
     if (Cached) return Cached == Failed ? nullptr : (address) Cached;
 
+#ifdef POSTBOX_CHANNEL
+    const uint64_t Pre = __atomic_load_n(&PreStartNtoskrnl, __ATOMIC_SEQ_CST);
+    if (Pre)
+    {
+        __atomic_store_n(Slot, Pre, __ATOMIC_SEQ_CST);
+        return (address) Pre;
+    }
+    return nullptr;
+#else
     // Start inside the image (the import slot of PsInitialSystemProcess lands in its data), page-aligned
     address base = (address) ((uint64_t) (void *) __imp_PsInitialSystemProcess & ~0xFFFull);
 
@@ -461,6 +505,7 @@ address GetNtoskrnl()
     print(ERROR("GetNtoskrnl: NOT FOUND after %llu steps, %llu valid DOS headers"), Steps, MzSeen);
     __atomic_store_n(Slot, Failed, __ATOMIC_SEQ_CST);
     return nullptr;
+#endif
 }
 
 // Shared body of the two extractors below: scans PAGE then .text of ntoskrnl for the instruction
@@ -535,9 +580,15 @@ void MemAdoptCaches(PostboxMemCaches* Dst)
     Dst->Ntoskrnl = __atomic_load_n(&CachedNtoskrnl, __ATOMIC_SEQ_CST);
     Dst->PteBase = __atomic_load_n(&CachedPteBase, __ATOMIC_SEQ_CST);
     Dst->PfnPteAddressBase = __atomic_load_n(&CachedPfnPteAddressBase, __ATOMIC_SEQ_CST);
+    Dst->PsInitialSystemProcess =
+        __atomic_load_n(&CachedPsInitialSystemProcess, __ATOMIC_SEQ_CST);
+    Dst->PsLoadedModuleList =
+        __atomic_load_n(&CachedPsLoadedModuleList, __ATOMIC_SEQ_CST);
     __atomic_store_n(&CachedNtoskrnl, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&CachedPteBase, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&CachedPfnPteAddressBase, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&CachedPsInitialSystemProcess, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&CachedPsLoadedModuleList, 0, __ATOMIC_SEQ_CST);
 }
 
 // PA -> VA through the self-map: read PfnDatabase[PA >> 12].PteAddress, then the PTE's index in the

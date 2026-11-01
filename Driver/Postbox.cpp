@@ -10,19 +10,6 @@
 #include "../Common/Postbox.h"
 #include "../Common/PostboxCrypto.h"
 
-// Build marker for the loader's --postbox guard. It lives in its own PE
-// section so mapload can verify the section table instead of scanning the
-// whole file for four incidental bytes. Layout is shared with mapload/main.cpp:
-//   POSTBOX_MARKER_TAG + NUL + u32 little-endian ABI version (4) + 4 reserved.
-// The volatile read in PostboxStart keeps the section reachable from
-// DriverEntry, so -Wl,--gc-sections cannot discard it.
-__attribute__((section(POSTBOX_SECTION_NAME), used, aligned(16)))
-static const volatile uint8_t PostboxSectionMarker[16] = {
-    'P', 'B', 'X', '7', 'Q', '2', 'A', 0x00,
-    0x04, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00
-};
-
 // Minimal kernel layouts, kept local so the channel does not depend on the vendor headers
 // declaring these types. Sizes are the x64 Windows 10 layouts; the static_asserts catch a
 // header change at compile time.
@@ -399,11 +386,16 @@ bool ProtectImageSections(const PostboxConfig* Config)
 
     const PostboxImageLayout& L = Config->Layout;
     if (L.ImageSize == 0 || L.AllocSize == 0 || L.SectionCount == 0 ||
-        L.SectionCount > PostboxMaxSections)
+        L.SectionCount > PostboxMaxSections || L.NtoskrnlBase == 0)
     {
         PostboxStartFailure = 21;
         return false;
     }
+
+    // The loader resolved ntoskrnl before mapping. Hand it to the memory layer
+    // so the driver can resolve PsInitialSystemProcess/PsLoadedModuleList without
+    // importing them (and without a __imp_ IAT slot in the mapped image).
+    MemSetPreStartNtoskrnl(L.NtoskrnlBase);
 
     // Resolve KeIpiGenericCall before the PTE walk: the global flush needs it.
     // Keep it in a local, not .data, so the image has no routine pointer there.
@@ -879,8 +871,8 @@ static bool PostboxStartReaper()
     return true;
 }
 
-// The client EPROCESS reference is acquired once at start, not per poll. Release it
-// only after the last in-flight poll has detached and dropped its exit synchronization.
+// The client EPROCESS reference is acquired once at start, not per poll. The
+// poll acquires/releases the exit synchronization around each mailbox exchange.
 static void PostboxReleaseProcess()
 {
     if (!PostboxStatePtr) return;
@@ -1244,15 +1236,13 @@ static void PostboxPoll()
 bool PostboxStart(const PostboxConfig* Config)
 {
     PostboxStartFailure = 30;
-    // Reachability reference that keeps .pbox in the file for the loader's marker
-    // check. The mapper deliberately does not copy .pbox into the published image,
-    // so the mapped byte is zero; only a corrupt 0xFF fails the start.
-    if (PostboxSectionMarker[0] == 0xFF)
-        return false;
 
     if (__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE)) return true;
     if (!Config || Config->Magic != PostboxConfigMagic || Config->Version != 4 ||
-        !Config->Pid || !Config->MailboxVa || !Config->CreateTime || !Config->SessionId) return false;
+        !Config->Pid || !Config->MailboxVa || !Config->CreateTime || !Config->SessionId)
+        return false;
+    if (!Config->Layout.NtoskrnlBase) return false;
+    MemSetPreStartNtoskrnl(Config->Layout.NtoskrnlBase);
     // The self-free reaper may only call MmFreeIndependentPages on an independent
     // allocation. The loader sets Reserved bit 0 for that layout; fail closed for
     // a pool image instead of arming a wrong free.
