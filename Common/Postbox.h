@@ -4,7 +4,9 @@
 
 // Build identity is a 64-bit FNV-1a hash of the driver file. The loader embeds
 // only this value; the driver carries no marker section or ASCII tag.
+#ifndef POSTBOX_BUILD_HASH
 constexpr uint64_t POSTBOX_BUILD_HASH = 0x9061d574d28ac4b2ull;   // FNV-1a of Driver.sys
+#endif
 
 // Postbox: the driver <-> client mailbox described in out/research/AC-25_channel.md.
 //

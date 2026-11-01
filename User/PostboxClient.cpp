@@ -445,13 +445,29 @@ int PostboxClientMain(int argc, char** argv)
     void* Pad = VirtualAlloc(nullptr, PadBytes,
                              MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE);
     (void) Pad;
-    void* Base = VirtualAlloc(nullptr, PostboxBytes,
-                              MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE);
-    if (!Base)
+
+    // D-05: put a PAGE_NOACCESS guard on each side of the mailbox. The driver's
+    // MailboxVa points at the middle page; a client-side overrun or underrun
+    // faults instead of corrupting an adjacent allocation.
+    constexpr SIZE_T MailboxGuard = 0x1000;
+    void* MailboxAlloc = VirtualAlloc(nullptr, PostboxBytes + 2 * MailboxGuard,
+                                      MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN,
+                                      PAGE_READWRITE);
+    if (!MailboxAlloc)
     {
         std::printf("postbox: VirtualAlloc failed, error %lu\n", GetLastError());
         return 1;
     }
+    DWORD OldProtect = 0;
+    if (!VirtualProtect(MailboxAlloc, MailboxGuard, PAGE_NOACCESS, &OldProtect) ||
+        !VirtualProtect(static_cast<uint8_t*>(MailboxAlloc) + MailboxGuard + PostboxBytes,
+                        MailboxGuard, PAGE_NOACCESS, &OldProtect))
+    {
+        std::printf("postbox: mailbox guard setup failed, error %lu\n", GetLastError());
+        VirtualFree(MailboxAlloc, 0, MEM_RELEASE);
+        return 1;
+    }
+    void* Base = static_cast<uint8_t*>(MailboxAlloc) + MailboxGuard;
 
     PostboxHeader* Header = static_cast<PostboxHeader*>(Base);
     std::memset(Base, 0, PostboxBytes);            // fault in all 16 mailbox pages
@@ -551,6 +567,10 @@ int PostboxClientMain(int argc, char** argv)
     {
         std::printf("kill: terminating without pb_stop\n");
         std::fflush(stdout);
+        // D-05: TerminateProcess skips the ClientSession destructor, so wipe the
+        // working keys and the mailbox explicitly before the abrupt exit.
+        pb::WipePostboxKeys(&S.Keys);
+        SecureZeroMemory(Base, PostboxBytes);
         TerminateProcess(GetCurrentProcess(), 0xDEAD);
         std::printf("kill: TerminateProcess failed, error %lu\n", GetLastError());
         return 1;
