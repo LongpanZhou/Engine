@@ -1634,9 +1634,9 @@ bool PostboxStart(const PostboxConfig* Config)
     // Wipe the entire copy; the poll uses MailboxVa, auth uses SessionId/Keys.
     PostboxWipe(&PostboxStatePtr->Cfg, sizeof(PostboxConfig));
 
-    // Separate NX stage. Prefer page-granular independent pages so the channel
-    // does not leave a 64 KiB 'Ntfs' NonPagedPoolNx entry for its lifetime; fall
-    // back to the pool when an older loader did not pass the helpers.
+    // Separate NX stage. Independent pages only: a pool fallback would leave a
+    // 64 KiB 'Ntfs' BigPool entry for the channel lifetime (V-27). Fail closed
+    // if the loader did not pass the helpers or the allocation/protection fails.
     PostboxStatePtr->Stage = nullptr;
     PostboxStatePtr->StageIndependent = false;
     if (g_MmAllocateIndependentPages && g_MmSetPageProtection && g_MmFreeIndependentPages)
@@ -1660,13 +1660,7 @@ bool PostboxStart(const PostboxConfig* Config)
     }
     if (!PostboxStatePtr->Stage)
     {
-        PostboxStatePtr->Stage = (uint8_t*) ((FnExAllocatePoolWithTag) g_ExAllocatePoolWithTag)(
-            0x200 /* NonPagedPoolNx */, StageBytes, 0x7366744E /* 'Ntfs' */);
-        PostboxStatePtr->StageIndependent = false;
-    }
-    if (!PostboxStatePtr->Stage)
-    {
-        print(ERROR("Postbox: NX stage allocation failed"));
+        print(ERROR("Postbox: independent-page NX stage unavailable; failing closed"));
         PostboxReleaseProcess();
         PostboxFreeStatePage();
         return false;
