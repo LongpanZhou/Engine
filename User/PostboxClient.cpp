@@ -836,12 +836,14 @@ int PostboxClientMain(int argc, char** argv)
 
         PostboxStackProbeResult Result{};
         std::memcpy(&Result, Data, sizeof(Result));
-        std::printf("stack probe: magic=0x%X hidden=%u gadget=%016llx real_rsp=%016llx fake_top=%016llx real_ret=%016llx\n",
+        std::printf("stack probe: magic=0x%X hidden=%u gadget=%016llx real_rsp=%016llx fake_top=%016llx real_ret=%016llx spoof_gadget=%016llx spoof_ret=%016llx\n",
                     Result.Magic, Result.Hidden,
                     static_cast<unsigned long long>(Result.Gadget),
                     static_cast<unsigned long long>(Result.RealRsp),
                     static_cast<unsigned long long>(Result.FakeTop),
-                    static_cast<unsigned long long>(Result.RealRet));
+                    static_cast<unsigned long long>(Result.RealRet),
+                    static_cast<unsigned long long>(Result.SpoofGadget),
+                    static_cast<unsigned long long>(Result.SpoofRet));
         std::fflush(stdout);
         SecureZeroMemory(Data, PostboxDataMax);
     }
