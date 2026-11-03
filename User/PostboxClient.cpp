@@ -45,6 +45,10 @@ struct ClientOptions
     uint32_t HoldPingMs;
     const char* LoaderPath;
     const char* LoaderArgs;
+#ifdef NMI_PROBE
+    bool NmiProbe;
+    uint32_t NmiSpinMs;
+#endif
 };
 
 static bool RandomBytes(void* Buffer, size_t Size)
@@ -299,6 +303,9 @@ static bool Submit(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
     const uint32_t ResponseBodyLen =
         VerifiedStatus != 0 ? 0 :
         (Op == pb_read) ? Size :
+#ifdef NMI_PROBE
+        (Op == pb_nmi_probe) ? static_cast<uint32_t>(sizeof(PostboxNmiProbeResult)) :
+#endif
         (Op == pb_nmi) ? static_cast<uint32_t>(sizeof(uint64_t)) : 0;
     uint8_t ResponseTag[16];
     pb::MacResponseTag(ResponseTag, S.Keys, S.SessionId, Seq, Header->Ack, VerifiedStatus,
@@ -312,6 +319,11 @@ static bool Submit(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
     {
         if (Op == pb_read && Size != 0)
             pb::OpenResponseBody(Data, Size, S.Keys, S.SessionId, Nonce);
+#ifdef NMI_PROBE
+        else if (Op == pb_nmi_probe)
+            pb::OpenResponseBody(Data, static_cast<uint32_t>(sizeof(PostboxNmiProbeResult)),
+                                 S.Keys, S.SessionId, Nonce);
+#endif
         else if (Op == pb_nmi)
             pb::OpenResponseBody(Data, static_cast<uint32_t>(sizeof(uint64_t)), S.Keys,
                                  S.SessionId, Nonce);
@@ -369,6 +381,21 @@ static bool ParseArguments(int argc, char** argv, ClientOptions& Options)
             }
             ++i;
         }
+#ifdef NMI_PROBE
+        else if (std::strcmp(Arg, "--nmi-probe") == 0)
+        {
+            Options.NmiProbe = true;
+        }
+        else if (std::strcmp(Arg, "--nmi-spin") == 0)
+        {
+            if (i + 1 >= argc || !ParseMilliseconds(argv[i + 1], Options.NmiSpinMs))
+            {
+                std::printf("postbox: --nmi-spin requires a millisecond value\n");
+                return false;
+            }
+            ++i;
+        }
+#endif
         else if (std::strcmp(Arg, "--hold-ping") == 0)
         {
             if (i + 1 >= argc || !ParseMilliseconds(argv[i + 1], Options.HoldPingMs))
@@ -711,6 +738,68 @@ int PostboxClientMain(int argc, char** argv)
         return 1;
     }
     SecureZeroMemory(Data, PostboxDataMax);
+
+#ifdef NMI_PROBE
+    // Test-only NMI callback probe. The driver registers KeRegisterNmiCallback,
+    // sends HalSendNMI to each core, and reports the interrupted machine frame.
+    // InModule=0 for the mapped image is the expected detector hit; it proves the
+    // callback saw execution outside PsLoadedModuleList.
+    if (Options.NmiProbe)
+    {
+        if (!Submit(Header, Data, S, pb_nmi_probe, 0, 0, 20000))
+        {
+            std::printf("nmi probe: timeout or auth failure\n");
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+        std::printf("nmi probe: status=0x%X\n", static_cast<unsigned>(S.Status));
+        if (S.Status != 0)
+        {
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+
+        PostboxNmiProbeResult Result{};
+        std::memcpy(&Result, Data, sizeof(Result));
+        uint32_t Cores = Result.CoreCount;
+        if (Cores > PostboxNmiProbeMaxCores)
+            Cores = PostboxNmiProbeMaxCores;
+        for (uint32_t i = 0; i < Cores; ++i)
+        {
+            const PostboxNmiProbeCore& Core = Result.Core[i];
+            std::printf("nmi core %u: count=%llu rip=%016llx rsp=%016llx user=%llu in_module=%llu\n",
+                        static_cast<unsigned>(i),
+                        static_cast<unsigned long long>(Core.Count),
+                        static_cast<unsigned long long>(Core.Rip),
+                        static_cast<unsigned long long>(Core.Rsp),
+                        static_cast<unsigned long long>(Core.User),
+                        static_cast<unsigned long long>(Core.InModule));
+        }
+        std::fflush(stdout);
+        SecureZeroMemory(Data, PostboxDataMax);
+    }
+
+    // Test-only mapped-code window: hold the driver inside its own image so an
+    // external NMI sampler (donnaskiez/nmi) can catch a RIP outside PsLoadedModuleList.
+    if (Options.NmiSpinMs != 0)
+    {
+        const uint32_t SpinMs = Options.NmiSpinMs;
+        if (!Submit(Header, Data, S, pb_nmi_probe, SpinMs, 0, SpinMs + 10000))
+        {
+            std::printf("nmi spin: timeout or auth failure\n");
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+        std::printf("nmi spin: status=0x%X ms=%u\n",
+                    static_cast<unsigned>(S.Status), static_cast<unsigned>(SpinMs));
+        std::fflush(stdout);
+        if (S.Status != 0)
+        {
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+    }
+#endif
 
     // Test-only hold: run after the functional tests, but before pb_stop, so the
     // driver keeps its fast timer for the duration.

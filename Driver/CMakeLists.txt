@@ -93,6 +93,28 @@ if(E3_DPC_PROBE)
     list(APPEND VARIANT_DEFINES E3_DPC_PROBE)
 endif()
 
+# Test-only NMI callback probe: KeRegisterNmiCallback + HalSendNMI to every
+# core, record the interrupted machine frame, and check RIP against
+# PsLoadedModuleList. Never part of the shipped build.
+option(NMI_PROBE "Test-only NMI callback RIP/RSP probe" OFF)
+if(NMI_PROBE)
+    if(NOT POSTBOX_CHANNEL)
+        message(FATAL_ERROR "NMI_PROBE requires POSTBOX_CHANNEL=ON")
+    endif()
+    list(APPEND VARIANT_DEFINES NMI_PROBE)
+endif()
+
+# NMI sample sanitizer: register an NMI callback that runs after an external
+# detector's callback and rewrites the detector's recorded RIP to a valid
+# loaded-module address. Callback-list only: no IDT/TSS/SSDT or code hooks.
+option(NMI_SANITIZE "Sanitize external NMI detector samples" OFF)
+if(NMI_SANITIZE)
+    if(NOT POSTBOX_CHANNEL)
+        message(FATAL_ERROR "NMI_SANITIZE requires POSTBOX_CHANNEL=ON")
+    endif()
+    list(APPEND VARIANT_DEFINES NMI_SANITIZE)
+endif()
+
 # Self-free reaper: the terminal work routine creates a system thread whose entry
 # is an assembly stub in the image. The stub tail-jumps to MmFreeIndependentPages,
 # so the free returns to PspSystemThreadStartup and no image instruction is fetched

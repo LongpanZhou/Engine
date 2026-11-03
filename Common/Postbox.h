@@ -37,7 +37,30 @@ enum PostboxOp : uint32_t
     pb_write = 3,
     pb_stop = 4,
     pb_nmi = 5,             // POSTBOX_NMI builds only: query/self-test the NMI gate
+    pb_nmi_probe = 6,       // NMI_PROBE test builds only: callback RIP/RSP probe
 };
+
+// Test-only NMI callback probe result. The driver registers KeRegisterNmiCallback,
+// sends HalSendNMI to each core, and records the interrupted machine frame. The
+// client prints this; the product build never uses it.
+constexpr uint32_t PostboxNmiProbeMaxCores = 16;
+struct PostboxNmiProbeCore
+{
+    uint64_t Rip;
+    uint64_t Rsp;
+    uint64_t Count;
+    uint64_t InModule;
+    uint64_t User;
+};
+static_assert(sizeof(PostboxNmiProbeCore) == 0x28, "NMI probe core ABI changed");
+
+struct PostboxNmiProbeResult
+{
+    uint32_t CoreCount;
+    uint32_t Reserved;
+    PostboxNmiProbeCore Core[PostboxNmiProbeMaxCores];
+};
+static_assert(sizeof(PostboxNmiProbeResult) == 8 + 16 * 0x28, "NMI probe result ABI changed");
 
 // Naturally aligned: the atomic fields are 4-byte aligned and the 8-byte fields are
 // 8-byte aligned. Packing this struct would make the atomic accesses unaligned.
