@@ -606,6 +606,7 @@ address GetNtoskrnl()
 template<size_t N>
 static address ExtractImm64(const Pattern<N> &Sig, uint32_t GuardOffset, const char *What)
 {
+    (void) What;   // diagnostic label; print() is compiled out in release
     address Base = GetNtoskrnl();
     if (!Base) return nullptr;
 
@@ -911,6 +912,7 @@ bool VerifyPteBase()
 // directly readable at DriverEntry's IRQL). Returns the number of failed checks
 static uint32_t VerifyOneAddress(address Va, cr3 SystemCR3, const char *What)
 {
+    (void) What;   // diagnostic label; print() is compiled out in release
     uint32_t Failures = 0;
 
     // VA -> PA, our walk against the kernel's

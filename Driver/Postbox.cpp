@@ -1614,21 +1614,32 @@ static void PostboxNmiSanitizeStop(PostboxState* S)
 // (header, .rdata, .pdata, .reloc, .pbox, padding) R/NX. No page is left RWX.
 uint32_t PostboxStartFailure = 0;
 
-bool ProtectImageSections(const PostboxConfig* Config)
+bool ProtectImageSectionsLayout(const PostboxImageLayout* Layout, bool FlushAllCpus = true)
 {
     PostboxStartFailure = 20;
-    if (!Config || Config->Layout.Magic != PostboxLayoutMagic ||
-        Config->Layout.Version != PostboxLayoutVersion)
+    if (!Layout || Layout->Magic != PostboxLayoutMagic ||
+        Layout->Version != PostboxLayoutVersion)
     {
         print(ERROR("Postbox: image layout missing or invalid"));
         return false;
     }
 
-    const PostboxImageLayout& L = Config->Layout;
+    const PostboxImageLayout& L = *Layout;
     if (L.ImageSize == 0 || L.AllocSize == 0 || L.SectionCount == 0 ||
         L.SectionCount > PostboxMaxSections || L.NtoskrnlBase == 0)
     {
         PostboxStartFailure = 21;
+        return false;
+    }
+
+    // Bound the loader-supplied allocation before walking PTEs: a malformed
+    // layout must not make the driver rewrite or IPI-flush an arbitrary kernel
+    // range. The loader caps the PE image well below this.
+    constexpr uint64_t PostboxLayoutMaxBytes = 0x10000000;   // 256 MiB
+    if (L.ImageSize > PostboxLayoutMaxBytes || L.AllocSize > PostboxLayoutMaxBytes ||
+        L.ImageSize > L.AllocSize || L.RawBase + L.AllocSize < L.RawBase)
+    {
+        PostboxStartFailure = 24;
         return false;
     }
 
@@ -1691,40 +1702,73 @@ bool ProtectImageSections(const PostboxConfig* Config)
             PostboxStartFailure = 25;
             return false;
         }
-#ifdef DEBUG
-        if (!VerifyPageProtection(address(Va), Write, Execute))
+
+        // E3: verify the PTE the driver just wrote, not just the API return.
+        // Fail closed if a page is still writable+executable, or if the
+        // writable/NX bits do not match the section map. This runs in release
+        // too, so the F1 batch and the persistent path both prove the split.
+        uint64_t* Verify = nullptr;
+        if (!GetPteForVa(address(Va), Verify))
         {
-            print(ERROR("Postbox: PTE verify failed at %p (W=%u X=%u)"),
-                  (void*) (uintptr_t) Va, (uint32_t) Write, (uint32_t) Execute);
-            PostboxStartFailure = 25;
+            print(ERROR("Postbox: PTE verify walk failed at %p"), (void*) (uintptr_t) Va);
+            PostboxStartFailure = 27;
             return false;
         }
-#endif
+        const uint64_t Pte = *Verify;
+        const bool PteWrite = (Pte & 2) != 0;
+        const bool PteNx = (Pte & (1ull << 63)) != 0;
+        if (PteWrite != Write || PteNx == Execute)
+        {
+            print(ERROR("Postbox: PTE verify mismatch at %p (pte 0x%llX)"),
+                  (void*) (uintptr_t) Va, (unsigned long long) Pte);
+            PostboxStartFailure = 27;
+            return false;
+        }
         ++Pages;
     }
+    (void) Pages;   // used by print(), which is compiled out in release
 
     // The per-page invlpg only covers the current CPU. A T2 AC can cache the
     // pre-protection RWX entry on the other CPU; flush every CPU so the stale
     // entry cannot write .text or execute .data after the split.
-    if (!IpiGenericCall)
+    if (FlushAllCpus)
     {
-        print(ERROR("Postbox: KeIpiGenericCall not resolved"));
-        PostboxStartFailure = 26;
-        return false;
+        if (!IpiGenericCall)
+        {
+            print(ERROR("Postbox: KeIpiGenericCall not resolved"));
+            PostboxStartFailure = 26;
+            return false;
+        }
+#ifdef T2_PROBE
+        T2Probe(L.ImageBase, (uint64_t) (uintptr_t) IpiGenericCall, 1);
+#endif
+        PostboxTlbRange Range{ L.ImageBase, End };
+        ((FnKeIpiGenericCall) IpiGenericCall)(
+            &PostboxFlushTlb, (uint64_t) (uintptr_t) &Range);
+#ifdef T2_PROBE
+        T2Probe(L.ImageBase, (uint64_t) (uintptr_t) IpiGenericCall, 2);
+#endif
     }
-#ifdef T2_PROBE
-    T2Probe(L.ImageBase, (uint64_t) (uintptr_t) IpiGenericCall, 1);
-#endif
-    PostboxTlbRange Range{ L.ImageBase, End };
-    ((FnKeIpiGenericCall) IpiGenericCall)(
-        &PostboxFlushTlb, (uint64_t) (uintptr_t) &Range);
-#ifdef T2_PROBE
-    T2Probe(L.ImageBase, (uint64_t) (uintptr_t) IpiGenericCall, 2);
-#endif
+    else
+    {
+        // F1: the loader applied final protections before the entry and no
+        // other CPU accessed the private image; the per-page invlpg above
+        // covers the entry CPU. The persistent path keeps the global flush.
+    }
 
     print(INFO("Postbox: image protections applied (%u pages, %u sections)"),
           Pages, L.SectionCount);
     return true;
+}
+
+bool ProtectImageSections(const PostboxConfig* Config)
+{
+    if (!Config)
+    {
+        PostboxStartFailure = 20;
+        return false;
+    }
+    return ProtectImageSectionsLayout(&Config->Layout);
 }
 
 static void PostboxPoll();

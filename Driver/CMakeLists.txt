@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.22)
+﻿cmake_minimum_required(VERSION 3.22)
 project(Driver)
 
 # Language standard: 23 comes from wdk_add_driver (CXX_STANDARD 23 + REQUIRED).
@@ -48,6 +48,24 @@ set(POSTBOX_NMI_SOURCES)
 if(POSTBOX_NMI)
     list(APPEND VARIANT_DEFINES POSTBOX_NMI)
     list(APPEND POSTBOX_NMI_SOURCES PostboxNmi.S)
+endif()
+# F1 Job-post: one map, one entry, N jobs, one teardown. Test-only; the
+# deployment build leaves it OFF.
+option(POSTBOX_JOB "Test-only F1 job-post batch mode" OFF)
+if(POSTBOX_JOB)
+    if(NOT POSTBOX_CHANNEL)
+        message(FATAL_ERROR "POSTBOX_JOB requires POSTBOX_CHANNEL=ON")
+    endif()
+    if(NOT MANUAL_MAP_ONLY)
+        message(FATAL_ERROR "POSTBOX_JOB requires MANUAL_MAP_ONLY=ON")
+    endif()
+    # The job build frees the image after the entry. With MAPPED_SAFE=OFF the
+    # image's map table stays linked into the shared page tables and would point
+    # at freed memory after that free.
+    if(NOT MAPPED_SAFE)
+        message(FATAL_ERROR "POSTBOX_JOB requires MAPPED_SAFE=ON (map-table lifetime)")
+    endif()
+    list(APPEND VARIANT_DEFINES POSTBOX_JOB)
 endif()
 if(T2_PROBE)
     list(APPEND VARIANT_DEFINES T2_PROBE)

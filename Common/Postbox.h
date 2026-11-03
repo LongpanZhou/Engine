@@ -399,6 +399,7 @@ inline bool PostboxConfigValid(const PostboxConfig& cfg, uint32_t* error = nullp
     if (error) *error = 0;
     return true;
 }
+
 // ---------------------------------------------------------------------------
 // F1 Job-post ABI (test-only; POSTBOX_JOB builds).
 //
