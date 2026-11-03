@@ -17,8 +17,11 @@ PostboxMmCopySpoof:
     leaq -0x200(%rsp), %r11
     andq $-16, %r11                 # fake stack top
     movq g_PostboxPopRspRet(%rip), %rax
+    movq %rax, g_PostboxLastGadget(%rip)
     movq %rax, 0(%r11)              # API return address = nt gadget
+    movq %r10, g_PostboxLastRealRsp(%rip)
     movq %r10, 8(%r11)              # gadget restores this real rsp
+    movq %r11, g_PostboxLastFakeTop(%rip)
     movq 0x28(%rsp), %rax           # Size
     movq %rax, 0x28(%r11)
     movq 0x30(%rsp), %rax           # PreviousMode

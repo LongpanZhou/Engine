@@ -38,6 +38,7 @@ enum PostboxOp : uint32_t
     pb_stop = 4,
     pb_nmi = 5,             // POSTBOX_NMI builds only: query/self-test the NMI gate
     pb_nmi_probe = 6,       // NMI_PROBE test builds only: callback RIP/RSP probe
+    pb_stack_probe = 7,     // STACK_SPOOF test builds only: call-site stack capture
 };
 
 // Test-only NMI callback probe result. The driver registers KeRegisterNmiCallback,
@@ -61,6 +62,20 @@ struct PostboxNmiProbeResult
     PostboxNmiProbeCore Core[PostboxNmiProbeMaxCores];
 };
 static_assert(sizeof(PostboxNmiProbeResult) == 8 + 16 * 0x28, "NMI probe result ABI changed");
+
+// Test-only call-site stack probe. The MmCopyVirtualMemory trampoline records
+// the fake-stack gadget, the real RSP, and the mapped real return address.
+constexpr uint32_t PostboxStackProbeMagic = 0x4F4F5053;   // "SPOO"
+struct PostboxStackProbeResult
+{
+    uint32_t Magic;
+    uint32_t Hidden;
+    uint64_t Gadget;
+    uint64_t RealRsp;
+    uint64_t FakeTop;
+    uint64_t RealRet;
+};
+static_assert(sizeof(PostboxStackProbeResult) == 0x28, "stack probe result ABI changed");
 
 // Naturally aligned: the atomic fields are 4-byte aligned and the 8-byte fields are
 // 8-byte aligned. Packing this struct would make the atomic accesses unaligned.

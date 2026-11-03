@@ -1394,6 +1394,9 @@ static bool PostboxResolve(address* IpiGenericCallOut)
 #ifdef STACK_SPOOF
 extern "C" uint64_t g_PostboxMmCopyTarget = 0;
 extern "C" uint64_t g_PostboxPopRspRet = 0;
+extern "C" uint64_t g_PostboxLastGadget = 0;
+extern "C" uint64_t g_PostboxLastRealRsp = 0;
+extern "C" uint64_t g_PostboxLastFakeTop = 0;
 extern "C" int32_t PostboxMmCopySpoof(void* SourceProcess, void* SourceAddress,
                                       void* TargetProcess, void* TargetAddress,
                                       size_t Size, int32_t PreviousMode, size_t* Done);
@@ -1453,6 +1456,29 @@ static bool PostboxCopy(void* MailboxProcess, address UserVa, void* Buffer,
     }
     return Status >= 0 && Done == Size;
 }
+
+#ifdef STACK_SPOOF
+static bool PostboxStackProbeRun(void* MailboxProcess, address DataVa,
+                                 PostboxStackProbeResult* Out)
+{
+    if (!Out) return false;
+    uint8_t Buf[8] = {};
+    const bool Ok = PostboxCopy(MailboxProcess, DataVa, Buf, sizeof(Buf), false);
+    Out->Magic = PostboxStackProbeMagic;
+    Out->Gadget = g_PostboxLastGadget;
+    Out->RealRsp = g_PostboxLastRealRsp;
+    Out->FakeTop = g_PostboxLastFakeTop;
+    Out->RealRet = Out->RealRsp ? *(uint64_t*) (uintptr_t) Out->RealRsp : 0;
+    const uint64_t NtBase = PostboxStatePtr->NmiSanitize.NtBase;
+    const uint64_t NtSize = PostboxStatePtr->NmiSanitize.NtSize;
+    const uint64_t ImageBase = PostboxStatePtr->NmiSanitize.ImageBase;
+    const uint64_t ImageSize = PostboxStatePtr->NmiSanitize.ImageSize;
+    Out->Hidden = (Ok && NtSize && ImageSize &&
+                   Out->Gadget >= NtBase && Out->Gadget < NtBase + NtSize &&
+                   Out->RealRet >= ImageBase && Out->RealRet < ImageBase + ImageSize) ? 1 : 0;
+    return Ok;
+}
+#endif
 
 // Cancels the timer and waits for queued DPCs. Safe at PASSIVE, including from the work
 // routine itself (a work item is not a DPC, so flushing DPCs cannot wait on this thread).
@@ -1853,10 +1879,16 @@ static void PostboxPollAttached(void* MailboxProcess)
 #ifdef NMI_PROBE
                          || Op == pb_nmi_probe
 #endif
+#ifdef STACK_SPOOF
+                         || Op == pb_stack_probe
+#endif
                          ;
     const bool ZeroBodyOp = Op == pb_ping || Op == pb_stop || Op == pb_nmi
 #ifdef NMI_PROBE
                             || Op == pb_nmi_probe
+#endif
+#ifdef STACK_SPOOF
+                            || Op == pb_stack_probe
 #endif
                             ;
     const bool SizeOk = Size <= StageBytes && (ZeroBodyOp ? Size == 0 : Size != 0);
@@ -1874,6 +1906,9 @@ static void PostboxPollAttached(void* MailboxProcess)
                                (Op == pb_nmi) ? (uint32_t) sizeof(uint64_t) :
 #ifdef NMI_PROBE
                                (Op == pb_nmi_probe) ? (uint32_t) sizeof(PostboxNmiProbeResult) :
+#endif
+#ifdef STACK_SPOOF
+                               (Op == pb_stack_probe) ? (uint32_t) sizeof(PostboxStackProbeResult) :
 #endif
                                0;
 
@@ -2028,6 +2063,26 @@ static void PostboxPollAttached(void* MailboxProcess)
                 ResponseBody = PostboxStatePtr->Stage;
                 ResponseLen = sizeof(Result);
             }
+        }
+    }
+#endif
+
+#ifdef STACK_SPOOF
+    else if (Op == pb_stack_probe)
+    {
+        PostboxStackProbeResult Result{};
+        if (!PostboxStackProbeRun(MailboxProcess, DataVa, &Result))
+        {
+            Status = (int32_t) 0xC0000001;      // STATUS_UNSUCCESSFUL
+        }
+        else
+        {
+            __builtin_memcpy(PostboxStatePtr->Stage, &Result, sizeof(Result));
+            pb::SealResponseBody(PostboxStatePtr->Stage, sizeof(Result),
+                                 PostboxStatePtr->Keys, PostboxStatePtr->SessionId,
+                                 Sealed.Nonce);
+            ResponseBody = PostboxStatePtr->Stage;
+            ResponseLen = sizeof(Result);
         }
     }
 #endif

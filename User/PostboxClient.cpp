@@ -49,6 +49,9 @@ struct ClientOptions
     bool NmiProbe;
     uint32_t NmiSpinMs;
 #endif
+#ifdef STACK_SPOOF
+    bool StackProbe;
+#endif
 };
 
 static bool RandomBytes(void* Buffer, size_t Size)
@@ -306,6 +309,9 @@ static bool Submit(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
 #ifdef NMI_PROBE
         (Op == pb_nmi_probe) ? static_cast<uint32_t>(sizeof(PostboxNmiProbeResult)) :
 #endif
+#ifdef STACK_SPOOF
+        (Op == pb_stack_probe) ? static_cast<uint32_t>(sizeof(PostboxStackProbeResult)) :
+#endif
         (Op == pb_nmi) ? static_cast<uint32_t>(sizeof(uint64_t)) : 0;
     uint8_t ResponseTag[16];
     pb::MacResponseTag(ResponseTag, S.Keys, S.SessionId, Seq, Header->Ack, VerifiedStatus,
@@ -322,6 +328,11 @@ static bool Submit(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
 #ifdef NMI_PROBE
         else if (Op == pb_nmi_probe)
             pb::OpenResponseBody(Data, static_cast<uint32_t>(sizeof(PostboxNmiProbeResult)),
+                                 S.Keys, S.SessionId, Nonce);
+#endif
+#ifdef STACK_SPOOF
+        else if (Op == pb_stack_probe)
+            pb::OpenResponseBody(Data, static_cast<uint32_t>(sizeof(PostboxStackProbeResult)),
                                  S.Keys, S.SessionId, Nonce);
 #endif
         else if (Op == pb_nmi)
@@ -394,6 +405,12 @@ static bool ParseArguments(int argc, char** argv, ClientOptions& Options)
                 return false;
             }
             ++i;
+        }
+#endif
+#ifdef STACK_SPOOF
+        else if (std::strcmp(Arg, "--stack-probe") == 0)
+        {
+            Options.StackProbe = true;
         }
 #endif
         else if (std::strcmp(Arg, "--hold-ping") == 0)
@@ -798,6 +815,35 @@ int PostboxClientMain(int argc, char** argv)
             StopBestEffort(Header, Data, S);
             return 1;
         }
+    }
+#endif
+
+#ifdef STACK_SPOOF
+    if (Options.StackProbe)
+    {
+        if (!Submit(Header, Data, S, pb_stack_probe, 0, 0, 5000))
+        {
+            std::printf("stack probe: timeout or auth failure\n");
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+        std::printf("stack probe: status=0x%X\n", static_cast<unsigned>(S.Status));
+        if (S.Status != 0)
+        {
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+
+        PostboxStackProbeResult Result{};
+        std::memcpy(&Result, Data, sizeof(Result));
+        std::printf("stack probe: magic=0x%X hidden=%u gadget=%016llx real_rsp=%016llx fake_top=%016llx real_ret=%016llx\n",
+                    Result.Magic, Result.Hidden,
+                    static_cast<unsigned long long>(Result.Gadget),
+                    static_cast<unsigned long long>(Result.RealRsp),
+                    static_cast<unsigned long long>(Result.FakeTop),
+                    static_cast<unsigned long long>(Result.RealRet));
+        std::fflush(stdout);
+        SecureZeroMemory(Data, PostboxDataMax);
     }
 #endif
 
