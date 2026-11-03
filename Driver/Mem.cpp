@@ -57,6 +57,21 @@ void ReleaseEntry(T *Entry)
     __atomic_store_n((uint64_t *) Entry, 0, __ATOMIC_SEQ_CST);
 }
 
+// Scope guard for one claimed mapping slot. ReleaseEntry runs exactly once, on every
+// exit path between the claim and the callback's return, so a failed lookup or an early
+// return cannot leave a present PTE pointing at arbitrary physical memory. A bugcheck
+// bypasses destructors, so the crash window stays open: the guard closes early returns,
+// not crashes
+template<typename T>
+struct ClaimGuard
+{
+    T *Slot;
+    explicit ClaimGuard(T *Raw) : Slot(Raw) {}
+    ClaimGuard(const ClaimGuard &) = delete;
+    ClaimGuard &operator=(const ClaimGuard &) = delete;
+    ~ClaimGuard() { ReleaseEntry(Slot); }
+};
+
 // The dedicated table: one 4 KB page of 512 slots in the driver image, for 4 KB mappings while linked
 alignas(4096) uint64_t MapTableStorage[512];
 uint64_t *MapTableEntries = nullptr;     // the slots the mapper claims; null while the table is not linked
@@ -84,9 +99,9 @@ bool MapInDedicatedTable(address PhysicalAddress, T &&Callback)
         Value.execute_disable = 1;
         Value.page_frame_number = PhysicalAddress >> 12;
         if (!ClaimEntry(Entry, Value)) continue;
+        ClaimGuard<pte> Holder(Entry);   // releases the slot on every exit path
 
         Callback(address(MapTableBase + (uint64_t) Slot * 0x1000 + PhysicalAddress.offset));
-        ReleaseEntry(Entry);
         return true;
     }
     return false;
@@ -366,14 +381,16 @@ static uint64_t CachedNtoskrnl = 0;
 static uint64_t CachedPteBase = 0;
 static uint64_t CachedPfnPteAddressBase = 0;
 
-// ROT1-decode an export name into a stack buffer. The two data-export names
-// are stored encoded so the mapped image's .rdata carries no plaintext
-// "PsInitialSystemProcess"/"PsLoadedModuleList" strings.
+// SEED-XOR decode an export name into a stack buffer. The two data-export names are
+// stored through Crypt.cpp's EncodeName, so the mapped image's .rdata carries neither
+// plaintext nor ROT1-decipherable "PsInitialSystemProcess"/"PsLoadedModuleList"
+// strings: every stored byte sits in 0x80..0xFF, and neither the plain-ASCII scan
+// nor the ROT1 key reads it back. Decode is the same XOR into a stack buffer
 static void MemDecodeName(const char* Encoded, char* Out, uint32_t OutSize)
 {
     uint32_t i = 0;
     for (; i + 1 < OutSize && Encoded[i]; ++i)
-        Out[i] = (char) (Encoded[i] - 1);
+        Out[i] = (char) ((unsigned char) Encoded[i] ^ SEED);
     Out[i] = 0;
 }
 
@@ -386,12 +403,12 @@ void MemSetPreStartNtoskrnl(uint64_t Base)
     if (!Base) return;
     __atomic_store_n(&CachedNtoskrnl, Base, __ATOMIC_SEQ_CST);
 
-    static const char EncodedPsInitial[] = "QtJojujbmTztufnQspdftt";
-    static const char EncodedPsLoaded[] = "QtMpbefeNpevmfMjtu";
+    static constexpr EncodedName EncodedPsInitial = EncodeName("PsInitialSystemProcess");
+    static constexpr EncodedName EncodedPsLoaded = EncodeName("PsLoadedModuleList");
     char PsInitialName[32];
     char PsLoadedName[32];
-    MemDecodeName(EncodedPsInitial, PsInitialName, sizeof(PsInitialName));
-    MemDecodeName(EncodedPsLoaded, PsLoadedName, sizeof(PsLoadedName));
+    MemDecodeName(EncodedPsInitial.Bytes, PsInitialName, sizeof(PsInitialName));
+    MemDecodeName(EncodedPsLoaded.Bytes, PsLoadedName, sizeof(PsLoadedName));
 
     if (!CachedPsInitialSystemProcess)
         CachedPsInitialSystemProcess =
@@ -406,8 +423,10 @@ void MemSetPreStartNtoskrnl(uint64_t Base)
         ((volatile char*) PsLoadedName)[i] = 0;
 }
 
+#ifndef POSTBOX_CHANNEL
 // True when a loader BaseDllName equals Expected (ASCII, case-insensitive). The read is bounded by
-// Name.Length: BaseDllName is a counted string, not necessarily NUL-terminated
+// Name.Length: BaseDllName is a counted string, not necessarily NUL-terminated. Only the
+// non-Postbox GetNtoskrnl list walk consumes it; the Postbox build compiles the whole walk out
 static bool ModuleNameEquals(const _UNICODE_STRING &Name, const char *Expected)
 {
     const size_t Length = Name.Length / sizeof(wchar_t);
@@ -423,6 +442,7 @@ static bool ModuleNameEquals(const _UNICODE_STRING &Name, const char *Expected)
     }
     return true;
 }
+#endif
 
 // ntoskrnl base, from PsLoadedModuleList when possible, else by scanning pages downwards from inside the
 // image. Cached for the boot
@@ -686,6 +706,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                 Value.page_size = 1;
                 Value.page_frame_number = PhysicalAddress >> 30;
                 if (!ClaimEntry((pdpe_1gb *) PDPTE, Value)) continue;
+                ClaimGuard<pdpe_1gb> Holder((pdpe_1gb *) PDPTE);   // releases on every exit path
 
                 VA.offset = PhysicalAddress.offset;
                 VA.p1_index = PhysicalAddress.p1_index;
@@ -695,7 +716,6 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                 VA.sign = (PML4_IDX >= 256) ? 0xFFFF : 0;   // kernel-half VAs sign-extend bit 47
 
                 Callback(VA);
-                ReleaseEntry((pdpe_1gb *) PDPTE);
                 return true;
             }
 
@@ -720,6 +740,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                     Value.page_size = 1;
                     Value.page_frame_number = PhysicalAddress >> 21;
                     if (!ClaimEntry((pde_2mb *) PDE, Value)) continue;
+                    ClaimGuard<pde_2mb> Holder((pde_2mb *) PDE);   // releases on every exit path
 
                     VA.offset = PhysicalAddress.offset;
                     VA.p1_index = PhysicalAddress.p1_index;
@@ -729,7 +750,6 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                     VA.sign = (PML4_IDX >= 256) ? 0xFFFF : 0;   // kernel-half VAs sign-extend bit 47
 
                     Callback(VA);
-                    ReleaseEntry((pde_2mb *) PDE);
                     return true;
                 }
 
@@ -751,6 +771,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                     Value.execute_disable = 1;
                     Value.page_frame_number = PhysicalAddress >> 12;
                     if (!ClaimEntry(PTE_4KB, Value)) continue;
+                    ClaimGuard<pte> Holder(PTE_4KB);   // releases on every exit path
 
                     VA.offset = PhysicalAddress.offset;
                     VA.p1_index = PT_IDX;
@@ -760,7 +781,6 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                     VA.sign = (PML4_IDX >= 256) ? 0xFFFF : 0;   // kernel-half VAs sign-extend bit 47
 
                     Callback(VA);
-                    ReleaseEntry(PTE_4KB);
                     return true;
                 }
             }

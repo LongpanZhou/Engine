@@ -20,9 +20,14 @@ namespace win {
     // if applicable
     ntstatus DbgPrintEx(std::uint32_t component_id, std::uint32_t level, const char* fmt, ...);
 
-    arch::address MmGetPhysicalAddress(arch::address virtual_address);
+    // The two Mm routines return the plain underlying pointer, not arch::address: an extern "C"
+    // declaration cannot carry a user-defined return type (-Wreturn-type-c-linkage), and the
+    // kernel export really is PVOID MmGetPhysicalAddress(PVOID). arch::address converts to void*
+    // for the arguments and constructs implicitly from void* for the result, so call sites are
+    // unchanged, and on x64 the underlying ABI (a 64-bit value in RAX) is identical either way.
+    void* MmGetPhysicalAddress(arch::address virtual_address);
 
-    arch::address MmGetVirtualForPhysical(arch::address physical_address);
+    void* MmGetVirtualForPhysical(arch::address physical_address);
 
     bool MmIsAddressValid(arch::address virtual_address);
     } // extern "C"

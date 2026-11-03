@@ -247,6 +247,26 @@ struct PostboxNmiSanitizeState
 #endif
     uint32_t Active;
     uint32_t Reserved;
+    // N-10: the sanitizer can be ready but inactive when the detector is not
+    // loaded yet. The PASSIVE work routine retries activation and refreshes the
+    // detector range; RefreshTick paces the module-list walk.
+    uint32_t Ready;
+    uint32_t RefreshTick;
+    // N-10: a dedicated PASSIVE refresh thread so a long-running mailbox command
+    // (for example the mapped spin) cannot delay detector activation.
+    uint32_t RefreshRun;
+    uint32_t RefreshThreadActive;
+#ifdef NMI_PROBE
+    // Test-only evidence block for the pb_nmi_status command. Not in the
+    // shipped layout (NMI_PROBE is off in the product).
+    uint64_t Writes;
+    uint64_t LastCount;
+    uint64_t LastUser;
+    uint64_t LastCore;
+    uint64_t LastRip;
+    uint64_t LastRsp;
+    uint64_t RefreshCount;
+#endif
 };
 #endif
 
@@ -336,6 +356,16 @@ constexpr uint32_t StageAllocBytes = (StageBytes + 0xFFFu) & ~0xFFFu;
 static uint32_t PostboxPeriodMs = 4;
 static uint32_t PostboxIdleTicks = 0;
 static uint32_t PostboxDeadTicks = 0;
+
+#ifdef POSTBOX_ONESHOT_TIMER
+// One-shot handshake state. PostboxTimerGen increments once per cancel; a DPC re-arm
+// requires the generation it entered under, so a stale instance from before a stop
+// cannot arm the next session's timer. PostboxDpcRefs counts in-flight DPC instances;
+// PostboxCancel quiesces on it before its final KeCancelTimer, so no re-arm decided
+// inside a DPC can outlive the stop that is freeing the state page.
+static uint32_t PostboxTimerGen = 0;
+static int32_t PostboxDpcRefs = 0;
+#endif
 
 #ifdef POSTBOX_NMI
 bool PostboxNmiInstall();
@@ -816,7 +846,53 @@ using FnNmiRegister = void* (*)(uint8_t (*)(void*, uint8_t), void*);
 using FnNmiDeregister = int32_t (*)(void*);
 using FnNmiGetProc = uint32_t (*)(void*);
 
-static bool PostboxNmiNameEquals(const _UNICODE_STRING& Name, const char* Expected)
+extern "C" uint8_t PostboxNmiSanitizeEntry(void* Context, uint8_t Handled);
+
+// N-21: the NMI API names are stored XOR-SEED encoded like the main resolve
+// table, so the mapped image's .rdata carries no plaintext NMI export names.
+// Decoded into a stack buffer for the export walk and wiped after use.
+static constexpr EncodedName EncodedNmiApis[] = {
+    EncodeName("KeRegisterNmiCallback"),
+    EncodeName("KeDeregisterNmiCallback"),
+    EncodeName("KeGetCurrentProcessorNumberEx"),
+};
+
+static void PostboxNmiDecodeName(const EncodedName& In, char* Out, uint32_t OutSize)
+{
+    if (!Out || !OutSize) return;
+    uint32_t i = 0;
+    for (; i + 1 < OutSize && In.Bytes[i]; ++i)
+        Out[i] = (char) ((unsigned char) In.Bytes[i] ^ SEED);
+    Out[i] = 0;
+}
+
+static void PostboxNmiWipe(void* Data, size_t Size)
+{
+    volatile uint8_t* P = (volatile uint8_t*) Data;
+    while (Size--) *P++ = 0;
+}
+
+// Unaligned read helper: the PE header/section table and the KTHREAD stack
+// fields are not guaranteed to be naturally aligned, and casting their byte
+// pointers to a wider type is undefined and warns under -Wcast-align.
+template<typename T>
+static T PostboxReadUnaligned(const void* P)
+{
+    T Value{};
+    __builtin_memcpy(&Value, P, sizeof(T));
+    return Value;
+}
+
+struct PostboxNmiSection
+{
+    uint64_t Va;
+    uint64_t Size;
+};
+
+// Name matcher kept alongside the NMI-sanitizers' module-stem matching; the active
+// paths use the separator-normalized variant below. The attribute silences the
+// unused-function analyzer without removing the helper from the sanitizer set.
+[[maybe_unused]] static bool PostboxNmiNameEquals(const _UNICODE_STRING& Name, const char* Expected)
 {
     if (!Name.Buffer || (Name.Length & 1)) return false;
     const size_t Len = Name.Length / sizeof(wchar_t);
@@ -835,21 +911,25 @@ static bool PostboxNmiNameEquals(const _UNICODE_STRING& Name, const char* Expect
 }
 
 // The detector's KLDR BaseDllName varies by build/path: nmi_callback_handler,
-// nmi-callback-handler.sys, etc. Normalize separators and match the stem.
+// nmi-callback-handler.sys, etc. Normalize separators and match the stem. The
+// stem is encoded so the plaintext module name does not appear in .rdata.
+static constexpr EncodedName EncodedDetectorStem = EncodeName("nmicallbackhandler");
+static constexpr uint32_t DetectorStemLen = sizeof("nmicallbackhandler") - 1;
+
 static bool PostboxNmiNameIsDetector(const _UNICODE_STRING& Name)
 {
-    static const char Token[] = "nmicallbackhandler";
     if (!Name.Buffer || (Name.Length & 1)) return false;
     size_t T = 0;
-    for (size_t i = 0; i < Name.Length / sizeof(wchar_t) && T < sizeof(Token) - 1; ++i)
+    for (size_t i = 0; i < Name.Length / sizeof(wchar_t) && T < DetectorStemLen; ++i)
     {
         wchar_t C = Name.Buffer[i];
         if (C >= L'A' && C <= L'Z') C += 32;
         if (C == L'-' || C == L'_' || C == L'.') continue;
-        if (C != (wchar_t) Token[T]) return false;
+        const char Expected = (char) ((unsigned char) EncodedDetectorStem.Bytes[T] ^ SEED);
+        if (C != (wchar_t) Expected) return false;
         ++T;
     }
-    return T == sizeof(Token) - 1;
+    return T == DetectorStemLen;
 }
 
 static void PostboxNmiFindDetector(PostboxState* S)
@@ -874,13 +954,107 @@ static void PostboxNmiFindDetector(PostboxState* S)
     }
 }
 
+// Resolve the loaded module that owns Address. Used by the callback-property
+// detector match below, so a renamed detector still yields a valid range.
+static bool PostboxNmiModuleForAddress(PostboxState* S, uint64_t Address,
+                                       uint64_t* BaseOut, uint64_t* SizeOut)
+{
+    if (BaseOut) *BaseOut = 0;
+    if (SizeOut) *SizeOut = 0;
+    if (!S || !Address) return false;
+    const uint64_t Head = S->Caches.PsLoadedModuleList;
+    if (!Head) return false;
+    auto* List = (_LIST_ENTRY*) (uintptr_t) Head;
+    auto* Link = List->Flink;
+    for (uint32_t i = 0; i < 0x1000 && Link && Link != List; ++i)
+    {
+        if ((uint64_t) (uintptr_t) Link < 0xFFFF800000000000ull) break;
+        auto* Entry = CONTAINING_RECORD(Link, _KLDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+        const uint64_t Base = (uint64_t) (uintptr_t) Entry->DllBase;
+        const uint64_t Size = Entry->SizeOfImage;
+        if (Base && Size && Address >= Base && Address < Base + Size)
+        {
+            if (BaseOut) *BaseOut = Base;
+            if (SizeOut) *SizeOut = Size;
+            return true;
+        }
+        Link = Link->Flink;
+    }
+    return false;
+}
+
+// N-11: validate a detector context record before writing it. The context is a
+// kernel-pool array of 0x18-byte NMI_CONTEXT records; a pointer outside the
+// kernel range, a misaligned record, an insane count, or a kernel sample whose
+// RIP/RSP is a user address is not the detector layout and must not be touched.
+// A user sample (User=1) legitimately carries user RIP/RSP values.
+static bool PostboxNmiContextLooksLikeDetector(PostboxState* S, uint64_t Ctx,
+                                               uint32_t Core)
+{
+    if (!S || !Ctx || Ctx < 0xFFFF800000000000ull || (Ctx & 7)) return false;
+    const uint64_t ImageBase = S->NmiSanitize.ImageBase;
+    const uint64_t ImageSize = S->NmiSanitize.ImageSize;
+    if (ImageSize && Ctx >= ImageBase && Ctx < ImageBase + ImageSize) return false;
+    const uint64_t NtBase = S->NmiSanitize.NtBase;
+    const uint64_t NtSize = S->NmiSanitize.NtSize;
+    if (NtSize && Ctx >= NtBase && Ctx < NtBase + NtSize) return false;
+    const uint64_t Offset = (uint64_t) Core * sizeof(PostboxDetectorNmiContext);
+    const uint64_t Rec = Ctx + Offset;
+    if (Rec < Ctx) return false;
+    const auto* Nmi = (const PostboxDetectorNmiContext*) (uintptr_t) Rec;
+    if (Nmi->Count > 0x100000) return false;
+    if (Nmi->User > 1) return false;
+    if (Nmi->User == 0)
+    {
+        if (Nmi->Rip && Nmi->Rip < 0xFFFF800000000000ull) return false;
+        if (Nmi->Rsp && Nmi->Rsp < 0xFFFF800000000000ull) return false;
+    }
+    return true;
+}
+
+// N-10/N-09 fallback: a renamed detector no longer matches the module-name
+// stem, so identify its callback by properties instead: a registered callback
+// outside ntoskrnl and outside this image whose context passes the NMI_CONTEXT
+// layout check. PASSIVE only (init/work), never the NMI callback.
+static bool PostboxNmiFindDetectorByCallback(PostboxState* S)
+{
+    if (!S || !S->NmiSanitize.ListHead) return false;
+    const uint64_t ImageBase = S->NmiSanitize.ImageBase;
+    const uint64_t ImageSize = S->NmiSanitize.ImageSize;
+    const uint64_t NtBase = S->NmiSanitize.NtBase;
+    const uint64_t NtSize = S->NmiSanitize.NtSize;
+    uint64_t Entry = *(uint64_t*) (uintptr_t) S->NmiSanitize.ListHead;
+    for (uint32_t i = 0; i < 64 && Entry; ++i)
+    {
+        const uint64_t Next = *(uint64_t*) (uintptr_t) Entry;
+        const uint64_t Fn = *(uint64_t*) (uintptr_t) (Entry + 8);
+        const uint64_t Ctx = *(uint64_t*) (uintptr_t) (Entry + 0x10);
+        if (Fn && Ctx && Fn != (uint64_t) (uintptr_t) &PostboxNmiSanitizeEntry &&
+            !(ImageSize && Fn >= ImageBase && Fn < ImageBase + ImageSize) &&
+            !(NtSize && Fn >= NtBase && Fn < NtBase + NtSize) &&
+            PostboxNmiContextLooksLikeDetector(S, Ctx, 0))
+        {
+            uint64_t Base = 0;
+            uint64_t Size = 0;
+            if (PostboxNmiModuleForAddress(S, Fn, &Base, &Size))
+            {
+                S->NmiSanitize.DetectorBase = Base;
+                S->NmiSanitize.DetectorSize = Size;
+                return true;
+            }
+        }
+        Entry = Next;
+    }
+    return false;
+}
+
 // Locate KiNmiCallbackListHead by decoding KeRegisterNmiCallback's call to
 // KiRegisterNmiSxCallback and that function's RIP-relative load of the list head.
 static uint64_t PostboxNmiFindListHead(address Register)
 {
     const uint8_t* P = (const uint8_t*) (uintptr_t) Register;
     if (!P || P[0x0D] != 0xE8) return 0;
-    const int32_t Rel = *(const int32_t*) (P + 0x0E);
+    const int32_t Rel = PostboxReadUnaligned<int32_t>(P + 0x0E);
     const address KiRegister = Register + 0x12 + Rel;
     if (KiRegister < 0xFFFF800000000000ull) return 0;
 
@@ -889,7 +1063,7 @@ static uint64_t PostboxNmiFindListHead(address Register)
     {
         if (Q[i] == 0x48 && Q[i + 1] == 0x8B && Q[i + 2] == 0x15)
         {
-            const int32_t Disp = *(const int32_t*) (Q + i + 3);
+            const int32_t Disp = PostboxReadUnaligned<int32_t>(Q + i + 3);
             const uint64_t Target = KiRegister + i + 7 + Disp;
             if (Target > 0xFFFF800000000000ull) return Target;
         }
@@ -918,29 +1092,56 @@ static void PostboxNmiFindNt(PostboxState* S, address Nt)
     }
 }
 
+// Enumerate the executable sections of the loaded nt image without casting the
+// (possibly unaligned) PE header/section table to struct pointers. The header
+// and every section are bounds-checked against NtSize.
+static uint32_t PostboxNmiExecSections(address Nt, uint64_t NtSize,
+                                       PostboxNmiSection* Out, uint32_t Max)
+{
+    if (!Nt || NtSize < 0x1000 || !Out || Max == 0) return 0;
+    auto* Dos = (_IMAGE_DOS_HEADER*) (uintptr_t) Nt;
+    if (Dos->e_magic != 0x5A4D) return 0;
+    const uint64_t NtHdrOff = (uint64_t) (uint32_t) Dos->e_lfanew;
+    if (NtHdrOff < 0x40 || NtHdrOff + 0x18 > NtSize) return 0;
+    const uint8_t* Base = (const uint8_t*) (uintptr_t) Nt;
+    if (PostboxReadUnaligned<uint32_t>(Base + NtHdrOff) != 0x4550) return 0;
+    const uint16_t NumberOfSections =
+        PostboxReadUnaligned<uint16_t>(Base + NtHdrOff + 0x06);
+    const uint16_t SizeOfOptionalHeader =
+        PostboxReadUnaligned<uint16_t>(Base + NtHdrOff + 0x14);
+    const uint64_t SecOff = NtHdrOff + 0x18 + SizeOfOptionalHeader;
+    if (SecOff > NtSize || (uint64_t) NumberOfSections * 0x28 > NtSize - SecOff)
+        return 0;
+    const uint8_t* Sec = Base + SecOff;
+    uint32_t Count = 0;
+    for (uint16_t i = 0; i < NumberOfSections && Count < Max; ++i)
+    {
+        const uint8_t* S = Sec + (uint64_t) i * 0x28;
+        const uint32_t Characteristics = PostboxReadUnaligned<uint32_t>(S + 0x24);
+        if (!(Characteristics & 0x20000000u)) continue;   // IMAGE_SCN_MEM_EXECUTE
+        const uint64_t Va = (uint64_t) (uintptr_t) Nt +
+                            PostboxReadUnaligned<uint32_t>(S + 0x0C);
+        const uint64_t Size = PostboxReadUnaligned<uint32_t>(S + 0x08);
+        if (Va < (uint64_t) (uintptr_t) Nt || Va + Size > (uint64_t) (uintptr_t) Nt + NtSize)
+            continue;
+        Out[Count].Va = Va;
+        Out[Count].Size = Size;
+        ++Count;
+    }
+    return Count;
+}
+
 // First 0xC3 in an executable nt section. Executing at that byte is a valid ret;
 // the frame trampoline uses it to pop the original RIP and resume the mapped code.
 static uint64_t PostboxNmiFindRetGadget(address Nt, uint64_t NtSize)
 {
-    if (!Nt || NtSize < 0x1000) return 0;
-    auto* Dos = (_IMAGE_DOS_HEADER*) (uintptr_t) Nt;
-    if (Dos->e_magic != 0x5A4D) return 0;
-    if (Dos->e_lfanew < 0x40 ||
-        (uint64_t) Dos->e_lfanew + sizeof(_IMAGE_NT_HEADERS64) > NtSize) return 0;
-    auto* NtHdr = (_IMAGE_NT_HEADERS64*) ((uint8_t*) (uintptr_t) Nt + Dos->e_lfanew);
-    if (NtHdr->Signature != 0x4550) return 0;
-    auto* Sec = (_IMAGE_SECTION_HEADER*)
-        ((uint8_t*) &NtHdr->OptionalHeader + NtHdr->FileHeader.SizeOfOptionalHeader);
-    for (uint16_t i = 0; i < NtHdr->FileHeader.NumberOfSections; ++i)
+    PostboxNmiSection Sections[16] = {};
+    const uint32_t Count = PostboxNmiExecSections(Nt, NtSize, Sections, 16);
+    for (uint32_t i = 0; i < Count; ++i)
     {
-        if (!(Sec[i].Characteristics & 0x20000000u)) continue;   // IMAGE_SCN_MEM_EXECUTE
-        const uint64_t Va = (uint64_t) (uintptr_t) Nt + Sec[i].VirtualAddress;
-        const uint64_t Size = Sec[i].Misc.VirtualSize;
-        if (Va < (uint64_t) (uintptr_t) Nt || Va + Size > (uint64_t) (uintptr_t) Nt + NtSize)
-            continue;
-        const uint8_t* P = (const uint8_t*) (uintptr_t) Va;
-        for (uint64_t j = 0; j < Size; ++j)
-            if (P[j] == 0xC3) return Va + j;
+        const uint8_t* P = (const uint8_t*) (uintptr_t) Sections[i].Va;
+        for (uint64_t j = 0; j < Sections[i].Size; ++j)
+            if (P[j] == 0xC3) return Sections[i].Va + j;
     }
     return 0;
 }
@@ -950,25 +1151,13 @@ static uint64_t PostboxNmiFindRetGadget(address Nt, uint64_t NtSize)
 // trampoline uses it to restore the real RSP and return to the mapped caller.
 static uint64_t PostboxNmiFindPopRspRet(address Nt, uint64_t NtSize)
 {
-    if (!Nt || NtSize < 0x1000) return 0;
-    auto* Dos = (_IMAGE_DOS_HEADER*) (uintptr_t) Nt;
-    if (Dos->e_magic != 0x5A4D) return 0;
-    if (Dos->e_lfanew < 0x40 ||
-        (uint64_t) Dos->e_lfanew + sizeof(_IMAGE_NT_HEADERS64) > NtSize) return 0;
-    auto* NtHdr = (_IMAGE_NT_HEADERS64*) ((uint8_t*) (uintptr_t) Nt + Dos->e_lfanew);
-    if (NtHdr->Signature != 0x4550) return 0;
-    auto* Sec = (_IMAGE_SECTION_HEADER*)
-        ((uint8_t*) &NtHdr->OptionalHeader + NtHdr->FileHeader.SizeOfOptionalHeader);
-    for (uint16_t i = 0; i < NtHdr->FileHeader.NumberOfSections; ++i)
+    PostboxNmiSection Sections[16] = {};
+    const uint32_t Count = PostboxNmiExecSections(Nt, NtSize, Sections, 16);
+    for (uint32_t i = 0; i < Count; ++i)
     {
-        if (!(Sec[i].Characteristics & 0x20000000u)) continue;
-        const uint64_t Va = (uint64_t) (uintptr_t) Nt + Sec[i].VirtualAddress;
-        const uint64_t Size = Sec[i].Misc.VirtualSize;
-        if (Va < (uint64_t) (uintptr_t) Nt || Va + Size > (uint64_t) (uintptr_t) Nt + NtSize)
-            continue;
-        const uint8_t* P = (const uint8_t*) (uintptr_t) Va;
-        for (uint64_t j = 0; j + 1 < Size; ++j)
-            if (P[j] == 0x5C && P[j + 1] == 0xC3) return Va + j;
+        const uint8_t* P = (const uint8_t*) (uintptr_t) Sections[i].Va;
+        for (uint64_t j = 0; j + 1 < Sections[i].Size; ++j)
+            if (P[j] == 0x5C && P[j + 1] == 0xC3) return Sections[i].Va + j;
     }
     return 0;
 }
@@ -980,27 +1169,15 @@ static uint64_t PostboxNmiFindPopRspRet(address Nt, uint64_t NtSize)
 // arguments into the shadow space without corrupting the restore chain.
 static uint64_t PostboxNmiFindPopRspRetSkip(address Nt, uint64_t NtSize)
 {
-    if (!Nt || NtSize < 0x1000) return 0;
-    auto* Dos = (_IMAGE_DOS_HEADER*) (uintptr_t) Nt;
-    if (Dos->e_magic != 0x5A4D) return 0;
-    if (Dos->e_lfanew < 0x40 ||
-        (uint64_t) Dos->e_lfanew + sizeof(_IMAGE_NT_HEADERS64) > NtSize) return 0;
-    auto* NtHdr = (_IMAGE_NT_HEADERS64*) ((uint8_t*) (uintptr_t) Nt + Dos->e_lfanew);
-    if (NtHdr->Signature != 0x4550) return 0;
-    auto* Sec = (_IMAGE_SECTION_HEADER*)
-        ((uint8_t*) &NtHdr->OptionalHeader + NtHdr->FileHeader.SizeOfOptionalHeader);
-    for (uint16_t i = 0; i < NtHdr->FileHeader.NumberOfSections; ++i)
+    PostboxNmiSection Sections[16] = {};
+    const uint32_t Count = PostboxNmiExecSections(Nt, NtSize, Sections, 16);
+    for (uint32_t i = 0; i < Count; ++i)
     {
-        if (!(Sec[i].Characteristics & 0x20000000u)) continue;
-        const uint64_t Va = (uint64_t) (uintptr_t) Nt + Sec[i].VirtualAddress;
-        const uint64_t Size = Sec[i].Misc.VirtualSize;
-        if (Va < (uint64_t) (uintptr_t) Nt || Va + Size > (uint64_t) (uintptr_t) Nt + NtSize)
-            continue;
-        const uint8_t* P = (const uint8_t*) (uintptr_t) Va;
-        for (uint64_t j = 0; j + 4 < Size; ++j)
+        const uint8_t* P = (const uint8_t*) (uintptr_t) Sections[i].Va;
+        for (uint64_t j = 0; j + 4 < Sections[i].Size; ++j)
             if (P[j] == 0x48 && P[j + 1] == 0x83 && P[j + 2] == 0xC4 &&
                 P[j + 3] == 0x28 && P[j + 4] == 0xC3)
-                return Va + j;
+                return Sections[i].Va + j;
     }
     return 0;
 }
@@ -1011,26 +1188,14 @@ static uint64_t PostboxNmiFindPopRspRetSkip(address Nt, uint64_t NtSize)
 // visible stack.
 static uint64_t PostboxNmiFindShadowJumpGadget(address Nt, uint64_t NtSize)
 {
-    if (!Nt || NtSize < 0x1000) return 0;
-    auto* Dos = (_IMAGE_DOS_HEADER*) (uintptr_t) Nt;
-    if (Dos->e_magic != 0x5A4D) return 0;
-    if (Dos->e_lfanew < 0x40 ||
-        (uint64_t) Dos->e_lfanew + sizeof(_IMAGE_NT_HEADERS64) > NtSize) return 0;
-    auto* NtHdr = (_IMAGE_NT_HEADERS64*) ((uint8_t*) (uintptr_t) Nt + Dos->e_lfanew);
-    if (NtHdr->Signature != 0x4550) return 0;
-    auto* Sec = (_IMAGE_SECTION_HEADER*)
-        ((uint8_t*) &NtHdr->OptionalHeader + NtHdr->FileHeader.SizeOfOptionalHeader);
-    for (uint16_t i = 0; i < NtHdr->FileHeader.NumberOfSections; ++i)
+    PostboxNmiSection Sections[16] = {};
+    const uint32_t Count = PostboxNmiExecSections(Nt, NtSize, Sections, 16);
+    for (uint32_t i = 0; i < Count; ++i)
     {
-        if (!(Sec[i].Characteristics & 0x20000000u)) continue;
-        const uint64_t Va = (uint64_t) (uintptr_t) Nt + Sec[i].VirtualAddress;
-        const uint64_t Size = Sec[i].Misc.VirtualSize;
-        if (Va < (uint64_t) (uintptr_t) Nt || Va + Size > (uint64_t) (uintptr_t) Nt + NtSize)
-            continue;
-        const uint8_t* P = (const uint8_t*) (uintptr_t) Va;
-        for (uint64_t j = 0; j + 3 < Size; ++j)
+        const uint8_t* P = (const uint8_t*) (uintptr_t) Sections[i].Va;
+        for (uint64_t j = 0; j + 3 < Sections[i].Size; ++j)
             if (P[j] == 0x41 && P[j + 1] == 0xFF && P[j + 2] == 0x66 && P[j + 3] == 0x83)
-                return Va + j;
+                return Sections[i].Va + j;
     }
     return 0;
 }
@@ -1059,7 +1224,11 @@ extern "C" uint8_t PostboxNmiSanitizeCallback(void* Context, uint8_t Handled,
                                                uint64_t EntryRsp, uint64_t RetAddr)
 {
     (void) Handled;
-    auto* S = (PostboxState*) Context;
+    // N-06: the callback is registered with a null context. Resolve the state
+    // from the image global so the KNMI node carries no pointer to the state
+    // page (node+0x10 was a deterministic state-page tell).
+    (void) Context;
+    auto* S = PostboxStatePtr;
     if (!S || !S->NmiSanitize.Active || !S->NmiSanitize.ListHead) return 1;
 
     const uint64_t Kpcr = __readmsr(0xC0000101);
@@ -1068,8 +1237,8 @@ extern "C" uint8_t PostboxNmiSanitizeCallback(void* Context, uint8_t Handled,
     void* Thread = *(void**) (uintptr_t) (Kpcr + 0x188);
     if (Thread)
     {
-        StackLimit = *(uint64_t*) ((uint8_t*) Thread + 0x30);
-        StackBase = *(uint64_t*) ((uint8_t*) Thread + 0x38);
+        StackLimit = PostboxReadUnaligned<uint64_t>((uint8_t*) Thread + 0x30);
+        StackBase = PostboxReadUnaligned<uint64_t>((uint8_t*) Thread + 0x38);
     }
     uint64_t InterruptedRip = 0;
     auto* Tss = *(PostboxTss64**) (uintptr_t) (Kpcr + 8);
@@ -1105,11 +1274,26 @@ extern "C" uint8_t PostboxNmiSanitizeCallback(void* Context, uint8_t Handled,
             // would make every record identical (time-series tell).
             if (Mapped)
             {
+                // N-11: validate the context layout and the values written before
+                // touching the detector's record. A changed/foreign context must
+                // not be corrupted.
+                if (!PostboxNmiContextLooksLikeDetector(S, Ctx, Core)) return 1;
+                if (EntryRsp < 0xFFFF800000000000ull) return 1;
+                if (RetAddr && RetAddr < 0xFFFF800000000000ull) return 1;
                 auto* Nmi = (PostboxDetectorNmiContext*) (uintptr_t) Ctx;
                 Nmi[Core].Rip = RetAddr ? RetAddr : S->NmiSanitize.NtBase;
                 Nmi[Core].Rsp = EntryRsp;
-                Nmi[Core].Count = 1;
-                Nmi[Core].User = 0;
+                // N-12: preserve the detector's real sample count and user flag.
+                // Forcing 1/0 on every record is a time-series tell.
+                if (Nmi[Core].Count < 1) Nmi[Core].Count = 1;
+#ifdef NMI_PROBE
+                S->NmiSanitize.Writes++;
+                S->NmiSanitize.LastCount = Nmi[Core].Count;
+                S->NmiSanitize.LastUser = Nmi[Core].User;
+                S->NmiSanitize.LastCore = Core;
+                S->NmiSanitize.LastRip = Nmi[Core].Rip;
+                S->NmiSanitize.LastRsp = Nmi[Core].Rsp;
+#endif
             }
             return 1;
         }
@@ -1157,6 +1341,20 @@ static bool PostboxNmiOrderOk(PostboxState* S, uint64_t Self)
     return true;
 }
 
+// N-10/N-09: refresh the detector range from PASSIVE context (init or the
+// work routine), never from the NMI callback. The common case is cheap: if the
+// current range still owns a registered callback, nothing changes. A rename or
+// a late load falls through to the name match, then to the callback-property
+// match.
+static void PostboxNmiRefreshDetector(PostboxState* S)
+{
+    if (!S || !S->NmiSanitize.ListHead) return;
+    if (PostboxNmiListHasDetector(S)) return;
+    PostboxNmiFindDetector(S);
+    if (PostboxNmiListHasDetector(S)) return;
+    PostboxNmiFindDetectorByCallback(S);
+}
+
 #ifdef NMI_FRAME_FIRST
 // Test-only pre-callback ordering. The detector registers its callback per
 // IOCTL, so its entry is newer and normally runs first. This PASSIVE monitor
@@ -1179,7 +1377,7 @@ static void PostboxNmiMonitorThread(void* Context)
                 S->NmiSanitize.ExtraCount < 16)
             {
                 void* H = ((FnNmiRegister) S->NmiSanitize.Register)(
-                    &PostboxNmiSanitizeEntry, S);
+                    &PostboxNmiSanitizeEntry, nullptr);
                 if (H)
                 {
                     const uint32_t Idx = S->NmiSanitize.ExtraCount++;
@@ -1194,6 +1392,96 @@ static void PostboxNmiMonitorThread(void* Context)
 }
 #endif
 
+// N-10: activate the sanitizer once a detector is present. Called from init and
+// from the PASSIVE work routine, never from the NMI callback. Registration is
+// detector-gated so a system with no detector gets no KNMI node/ETW event.
+static bool PostboxNmiTryActivate(PostboxState* S)
+{
+    if (!S) return false;
+    auto& N = S->NmiSanitize;
+    if (N.Active) return true;
+    if (!N.Ready || !N.Register || !N.Deregister || !N.ListHead) return false;
+
+    PostboxNmiRefreshDetector(S);
+    if (!N.DetectorBase || !N.DetectorSize) return false;
+
+    for (uint32_t Attempt = 0; Attempt < 4; ++Attempt)
+    {
+        // Let a detector poll that is already in flight finish before registering,
+        // so our entry is older than the detector's next per-IOCTL entry.
+        _LARGE_INTEGER Delay{};
+        Delay.QuadPart = -10 * 10000;
+        for (uint32_t i = 0; i < 50 && PostboxNmiListHasDetector(S); ++i)
+            PostboxDelayExecutionThread(0, 0, &Delay);
+
+        void* Handle = ((FnNmiRegister) N.Register)(&PostboxNmiSanitizeEntry, nullptr);
+        if (!Handle) return false;
+        N.Handle = (uint64_t) (uintptr_t) Handle;
+
+        if (PostboxNmiOrderOk(S, (uint64_t) (uintptr_t) &PostboxNmiSanitizeEntry))
+        {
+            N.Active = 1;
+#ifdef NMI_FRAME_FIRST
+            void* ThreadHandle = nullptr;
+            if (((FnPsCreateSystemThread) g_PsCreateSystemThread)(
+                    &ThreadHandle, 0x1FFFFF, nullptr, nullptr, nullptr,
+                    (void*) &PostboxNmiMonitorThread, S) >= 0 && ThreadHandle)
+                ((FnZwClose) g_ZwClose)(ThreadHandle);
+#endif
+            return true;
+        }
+
+        ((FnNmiDeregister) N.Deregister)(Handle);
+        N.Handle = 0;
+    }
+    return false;
+}
+
+// N-10: dedicated PASSIVE detector-refresh thread. The mailbox worker can be
+// blocked for the whole duration of a long command (the mapped spin), so the
+// work-routine refresh is only a fallback. This thread runs independently and
+// never touches the callback list from an NMI.
+static void PostboxNmiRefreshThread(void* Context)
+{
+    auto* S = (PostboxState*) Context;
+    if (!S) return;
+    __atomic_store_n(&S->NmiSanitize.RefreshThreadActive, 1, __ATOMIC_RELEASE);
+    for (;;)
+    {
+        if (!__atomic_load_n(&S->NmiSanitize.RefreshRun, __ATOMIC_ACQUIRE)) break;
+#ifdef NMI_PROBE
+        S->NmiSanitize.RefreshCount++;
+#endif
+        PostboxNmiRefreshDetector(S);
+        if (!S->NmiSanitize.Active)
+            PostboxNmiTryActivate(S);
+        _LARGE_INTEGER Delay{};
+        Delay.QuadPart = -100 * 10000;      // 1 s
+        PostboxDelayExecutionThread(0, 0, &Delay);
+    }
+    __atomic_store_n(&S->NmiSanitize.RefreshThreadActive, 0, __ATOMIC_RELEASE);
+}
+
+// Start the refresh thread after the timer is armed, so the start-failure path
+// never leaves a thread behind a freed state page. If creation fails, the
+// work-routine refresh remains as a fallback.
+static bool PostboxNmiStartRefreshThread(PostboxState* S)
+{
+    if (!S || !S->NmiSanitize.Ready) return false;
+    if (!g_PsCreateSystemThread || !g_ZwClose) return false;
+    __atomic_store_n(&S->NmiSanitize.RefreshRun, 1, __ATOMIC_RELEASE);
+    void* ThreadHandle = nullptr;
+    if (((FnPsCreateSystemThread) g_PsCreateSystemThread)(
+            &ThreadHandle, 0x1FFFFF, nullptr, nullptr, nullptr,
+            (void*) &PostboxNmiRefreshThread, S) >= 0 && ThreadHandle)
+    {
+        ((FnZwClose) g_ZwClose)(ThreadHandle);
+        return true;
+    }
+    __atomic_store_n(&S->NmiSanitize.RefreshRun, 0, __ATOMIC_RELEASE);
+    return false;
+}
+
 static bool PostboxNmiSanitizeInit(PostboxState* S, uint64_t ImageBase, uint64_t ImageSize)
 {
     if (!S) return false;
@@ -1202,9 +1490,20 @@ static bool PostboxNmiSanitizeInit(PostboxState* S, uint64_t ImageBase, uint64_t
 
     const address Nt = GetNtoskrnl();
     if (!Nt) return false;
-    const address Register = FindFuncExports(Nt, "KeRegisterNmiCallback");
-    const address Deregister = FindFuncExports(Nt, "KeDeregisterNmiCallback");
-    const address GetProc = FindFuncExports(Nt, "KeGetCurrentProcessorNumberEx");
+
+    // N-21: decode the encoded NMI API names into a stack buffer for one export
+    // walk, then wipe the plaintext. The image's .rdata only carries the
+    // XOR-SEED form.
+    char Decoded[3][40] = {};
+    const char* Names[3] = { Decoded[0], Decoded[1], Decoded[2] };
+    for (uint32_t i = 0; i < 3; ++i)
+        PostboxNmiDecodeName(EncodedNmiApis[i], Decoded[i], sizeof(Decoded[i]));
+    address Functions[3] = {};
+    FindFuncExportsBatch(Nt, Names, Functions, 3);
+    PostboxNmiWipe(Decoded, sizeof(Decoded));
+    const address Register = Functions[0];
+    const address Deregister = Functions[1];
+    const address GetProc = Functions[2];
     if (!Register || !Deregister || !GetProc) return false;
 
     const uint64_t ListHead = PostboxNmiFindListHead(Register);
@@ -1223,45 +1522,33 @@ static bool PostboxNmiSanitizeInit(PostboxState* S, uint64_t ImageBase, uint64_t
     N.PopRspRetSkip = PostboxNmiFindPopRspRetSkip(Nt, N.NtSize);
     N.ShadowJumpGadget = PostboxNmiFindShadowJumpGadget(Nt, N.NtSize);
 #endif
-    PostboxNmiFindDetector(S);
-    // Do not create a KNMI node/ETW event on a system with no detector module.
-    if (!N.DetectorBase || !N.DetectorSize) return false;
+    N.Ready = 1;
+    PostboxNmiRefreshDetector(S);
 
-    for (uint32_t Attempt = 0; Attempt < 4; ++Attempt)
-    {
-        // Let a detector poll that is already in flight finish before registering,
-        // so our entry is older than the detector's next per-IOCTL entry.
-        _LARGE_INTEGER Delay{};
-        Delay.QuadPart = -10 * 10000;
-        for (uint32_t i = 0; i < 50 && PostboxNmiListHasDetector(S); ++i)
-            PostboxDelayExecutionThread(0, 0, &Delay);
+    // No detector yet: stay ready but inactive. The PASSIVE work routine retries
+    // activation when a detector loads, so a late load is not bypassed and a
+    // system with no detector gets no KNMI node/ETW event.
+    if (!N.DetectorBase || !N.DetectorSize) return true;
 
-        void* Handle = ((FnNmiRegister) Register)(&PostboxNmiSanitizeEntry, S);
-        if (!Handle) return false;
-        N.Handle = (uint64_t) (uintptr_t) Handle;
-
-        if (PostboxNmiOrderOk(S, (uint64_t) (uintptr_t) &PostboxNmiSanitizeEntry))
-        {
-            N.Active = 1;
-#ifdef NMI_FRAME_FIRST
-            void* ThreadHandle = nullptr;
-            if (((FnPsCreateSystemThread) g_PsCreateSystemThread)(
-                    &ThreadHandle, 0x1FFFFF, nullptr, nullptr, nullptr,
-                    (void*) &PostboxNmiMonitorThread, S) >= 0 && ThreadHandle)
-                ((FnZwClose) g_ZwClose)(ThreadHandle);
-#endif
-            return true;
-        }
-
-        ((FnNmiDeregister) Deregister)(Handle);
-        N.Handle = 0;
-    }
-    return false;
+    PostboxNmiTryActivate(S);
+    return true;
 }
 
 static void PostboxNmiSanitizeStop(PostboxState* S)
 {
-    if (!S || !S->NmiSanitize.Active) return;
+    if (!S || !S->NmiSanitize.Ready) return;
+
+    // Stop the PASSIVE refresh thread first; it may be inside a detector wait.
+    __atomic_store_n(&S->NmiSanitize.RefreshRun, 0, __ATOMIC_RELEASE);
+    _LARGE_INTEGER ThreadDelay{};
+    ThreadDelay.QuadPart = -10 * 10000;      // 10 ms
+    for (uint32_t i = 0; i < 500; ++i)
+    {
+        if (!__atomic_load_n(&S->NmiSanitize.RefreshThreadActive, __ATOMIC_ACQUIRE))
+            break;
+        PostboxDelayExecutionThread(0, 0, &ThreadDelay);
+    }
+
 #ifdef NMI_FRAME_FIRST
     S->NmiSanitize.Active = 0;
     _LARGE_INTEGER MonitorDelay{};
@@ -1420,38 +1707,39 @@ static bool PostboxResolve(address* IpiGenericCallOut)
         return false;
     }
 
-    static const char EncodedNames[][40] = {
-        "LfJojujbmj{fUjnfsFy",
-        "LfJojujbmj{fEqd",
-        "LfTfuDpbmftdbcmfUjnfs",
-        "LfDbodfmUjnfs",
-        "LfGmvtiRvfvfeEqdt",
-        "FyRvfvfXpslJufn",
-        "QtMpplvqQspdfttCzQspdfttJe",
-        "PcEfsfgfsfodfPckfdu",
-        "LfEfmbzFyfdvujpoUisfbe",
-        "QtHfuQspdfttDsfbufUjnfRvbeQbsu",
-        "FyBmmpdbufQppmXjuiUbh",          // ExAllocatePoolWithTag
-        "FyGsffQppm",                      // ExFreePool
-        "NnDpqzWjsuvbmNfnpsz",             // MmCopyVirtualMemory
-        "LfJqjHfofsjdDbmm",                // KeIpiGenericCall
-        "QtHfuDvssfouQspdftt",             // PsGetCurrentProcess
-        "QtBdrvjsfQspdfttFyjuTzodispoj{bujpo",  // PsAcquireProcessExitSynchronization
-        "QtSfmfbtfQspdfttFyjuTzodispoj{bujpo",  // PsReleaseProcessExitSynchronization
-        "QtDsfbufTztufnUisfbe",           // PsCreateSystemThread
-        "OuDmptf",                        // NtClose (ZwClose alias)
+    // Compile-time encoded: Crypt.cpp's EncodeName XorSeeds each export name, so the
+    // image's .rdata carries neither plaintext nor ROT1-decipherable bytes. This is
+    // anti-static-scan, not secrecy: decoded into stack buffers and wiped after the
+    // resolve. The resolved pointers remain in .data.
+    static constexpr EncodedName EncodedNames[] = {
+        EncodeName("KeInitializeTimerEx"),
+        EncodeName("KeInitializeDpc"),
+        EncodeName("KeSetCoalescableTimer"),
+        EncodeName("KeCancelTimer"),
+        EncodeName("KeFlushQueuedDpcs"),
+        EncodeName("ExQueueWorkItem"),
+        EncodeName("PsLookupProcessByProcessId"),
+        EncodeName("ObDereferenceObject"),
+        EncodeName("KeDelayExecutionThread"),
+        EncodeName("PsGetProcessCreateTimeQuadPart"),
+        EncodeName("ExAllocatePoolWithTag"),
+        EncodeName("ExFreePool"),
+        EncodeName("MmCopyVirtualMemory"),
+        EncodeName("KeIpiGenericCall"),
+        EncodeName("PsGetCurrentProcess"),
+        EncodeName("PsAcquireProcessExitSynchronization"),
+        EncodeName("PsReleaseProcessExitSynchronization"),
+        EncodeName("PsCreateSystemThread"),
+        EncodeName("NtClose"),
     };
 
-    // The resolve table is stored ROT1-encoded so the image does not carry the plaintext
-    // export names. This is anti-static-scan, not secrecy: it is decoded in a stack buffer
-    // and wiped after the resolve. The resolved pointers remain in .data.
     char Decoded[19][40] = {};
     const char* Names[19] = {};
     for (uint32_t i = 0; i < 19; ++i)
     {
         uint32_t j = 0;
-        for (; j < 39 && EncodedNames[i][j]; ++j)
-            Decoded[i][j] = (char) (EncodedNames[i][j] - 1);
+        for (; j < 39 && EncodedNames[i].Bytes[j]; ++j)
+            Decoded[i][j] = (char) ((unsigned char) EncodedNames[i].Bytes[j] ^ SEED);
         Decoded[i][j] = 0;
         Names[i] = Decoded[i];
     }
@@ -1509,7 +1797,7 @@ static bool PostboxResolve(address* IpiGenericCallOut)
         for (uint32_t j = 0; j < 40; ++j) p[j] = 0;
     }
 
-    // The ROT1 table stays resident for now. Wiping it at runtime requires a
+    // The encoded-name table stays resident for now. Wiping it at runtime requires a
     // writable .rdata window and a global TLB flush; the first live attempt was
     // not observable because the lab VM hung, so it is deferred to a clean-VM
     // test. The loader-side import strip removes the PE descriptor/name strings.
@@ -1702,7 +1990,10 @@ static void PostboxDereferenceObject(void* Object)
     ((FnObDereferenceObject) g_ObDereferenceObject)(Object);
 }
 
-static void* PostboxAllocatePool(uint32_t PoolType, size_t Size, uint32_t Tag)
+// Wrapper-set parity: no shipped path calls it today (the NMI probe paths it was written
+// for allocate through other ties). Kept deliberately; the attribute silences the
+// unused-function analyzer without detaching the wrapper from its import.
+[[maybe_unused]] static void* PostboxAllocatePool(uint32_t PoolType, size_t Size, uint32_t Tag)
 {
 #ifdef STACK_SPOOF
     if (g_PostboxApiShadow && g_ExAllocatePoolWithTag)
@@ -1793,7 +2084,9 @@ static void PostboxInitializeDpc(PostboxDpc* Dpc, void (*Routine)(void*, void*, 
     ((FnKeInitializeDpc) g_KeInitializeDpc)(Dpc, Routine, Context);
 }
 
-static void* PostboxAllocateIndependentPages(size_t Size, uint32_t Arg2, uint32_t Arg3,
+// Direct raw casts handle the shipped allocation paths; the wrapper stays for the test
+// builds' spoof parity. The attribute silences the unused-function analyzer there.
+[[maybe_unused]] static void* PostboxAllocateIndependentPages(size_t Size, uint32_t Arg2, uint32_t Arg3,
                                              uint32_t Arg4)
 {
 #ifdef STACK_SPOOF
@@ -1984,13 +2277,31 @@ static bool PostboxStackProbeRun(void* MailboxProcess, address DataVa,
 }
 #endif
 
-// Cancels the timer and waits for queued DPCs. Safe at PASSIVE, including from the work
+// Cancels the timer and quiesces DPCs. Safe at PASSIVE, including from the work
 // routine itself (a work item is not a DPC, so flushing DPCs cannot wait on this thread).
 static void PostboxCancel()
 {
     __atomic_store_n(&PostboxRunning, 0, __ATOMIC_RELEASE);
+#ifdef POSTBOX_ONESHOT_TIMER
+    // Generation first: every DPC that entered before this fails its equality check
+    // and no longer re-arms. A re-arm already decided is handled by the cancel +
+    // quiesce + final-cancel sequence below.
+    __atomic_fetch_add(&PostboxTimerGen, 1, __ATOMIC_SEQ_CST);
+#endif
     PostboxCancelTimer(&PostboxStatePtr->Timer);
     PostboxFlushQueuedDpcs();
+#ifdef POSTBOX_ONESHOT_TIMER
+    // Quiesce: wait for every in-flight DPC instance to return before the final
+    // cancel, so a re-arm decided during the flush cannot outlive this stop. A DPC
+    // runs for microseconds at DISPATCH and never waits, so the spin is bounded and
+    // effectively instant.
+    for (uint32_t Quiesce = 0; Quiesce < 1000000; ++Quiesce)
+    {
+        if (__atomic_load_n(&PostboxDpcRefs, __ATOMIC_ACQUIRE) == 0) break;
+        __builtin_ia32_pause();
+    }
+    PostboxCancelTimer(&PostboxStatePtr->Timer);
+#endif
 #ifdef NMI_SANITIZE
     PostboxNmiSanitizeStop(PostboxStatePtr);
 #endif
@@ -2000,17 +2311,41 @@ static void PostboxCancel()
 #endif
 }
 
-// Re-arms the periodic timer. PASSIVE_LEVEL (PostboxStart or the work routine).
-// Returns false when the timer was not armed (running clear or KeSetCoalescableTimer
-// returned a failure); PostboxStart treats that as a failed start.
-static bool PostboxArm(uint32_t PeriodMs, uint32_t ToleranceMs)
+// Re-arms the timer. PASSIVE_LEVEL (PostboxStart or the work routine) and, with
+// POSTBOX_ONESHOT_TIMER, DISPATCH_LEVEL (the DPC re-arm). Returns false when the timer
+// was not armed (running clear or KeSetCoalescableTimer returned a failure);
+// PostboxStart treats that as a failed start.
+//
+// With POSTBOX_ONESHOT_TIMER the period is scheduled as a jittered one-shot due time and
+// the period argument is 0, so _KTIMER.Period stays 0: the timer table carries no fixed
+// cadence to diff, and each fire's spacing carries rdtsc-derived jitter. OFF restores
+// the stock periodic arm.
+static bool PostboxArm(uint32_t PeriodMs, uint32_t ToleranceMs, bool FromDpc = false)
 {
+    (void) FromDpc;   // only the one-shot DPC re-arm takes the direct path below
     if (!__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE)) return false;
     _LARGE_INTEGER Due{};
+#ifdef POSTBOX_ONESHOT_TIMER
+    // Jitter scales with the bucket, so neither 4 ms nor 250 ms shows up as a repeating
+    // due time in the timer table; only the due time moves, the period argument stays 0.
+    const uint32_t Jitter = (uint32_t) __rdtsc() & (PeriodMs <= 8u ? 0x3u : 0xFu);
+    Due.QuadPart = -((int64_t) (PeriodMs + Jitter) * 10000);
+    const uint32_t Period = 0;   // one-shot
+#else
     Due.QuadPart = -((int64_t) PeriodMs * 10000);
-    const uint32_t Status = PostboxSetCoalescableTimer(
-        &PostboxStatePtr->Timer, Due, PeriodMs, ToleranceMs, &PostboxStatePtr->Dpc);
-    return Status == 0;
+    const uint32_t Period = PeriodMs;
+#endif
+#ifdef POSTBOX_ONESHOT_TIMER
+    if (FromDpc)
+    {
+        // DPC context does not have the worker's r15 shadow top; the timer set stays
+        // direct there, per PostboxQueueWorkItem.
+        return ((FnKeSetCoalescableTimer) g_KeSetCoalescableTimer)(
+            &PostboxStatePtr->Timer, Due, Period, ToleranceMs, &PostboxStatePtr->Dpc) == 0;
+    }
+#endif
+    return PostboxSetCoalescableTimer(
+        &PostboxStatePtr->Timer, Due, Period, ToleranceMs, &PostboxStatePtr->Dpc) == 0;
 }
 
 // Slow the timer after a run of idle polls. Also called on a failed lookup/header read.
@@ -2275,14 +2610,34 @@ static void PostboxDeadTick()
     PostboxStartReaper();
 }
 
-// Runs at DISPATCH_LEVEL on the per-CPU DPC stack. It does no memory access: only the
-// in-flight exchange and the queue. The mailbox work happens in PostboxWorkRoutine.
+// Runs at DISPATCH_LEVEL on the per-CPU DPC stack. It does no mailbox access: only the
+// in-flight exchange, the queue and, with POSTBOX_ONESHOT_TIMER, the DPC-side re-arm.
+// The mailbox work happens in PostboxWorkRoutine.
 static void PostboxDpcRoutine(void*, void*, void*, void*)
 {
-    if (!__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE)) return;
-
-    if (__atomic_exchange_n(&PostboxInFlight, 1, __ATOMIC_ACQ_REL) == 0)
-        PostboxQueueWorkItem(&PostboxStatePtr->Work, 1);   // DelayedWorkQueue
+#ifdef POSTBOX_ONESHOT_TIMER
+    // Instance lifetime: the ref bracket makes every re-arm decision started in this
+    // instance visible to PostboxCancel (it quiesces on the refcount before its final
+    // cancel), and the entry generation rejects a stale instance from an earlier
+    // stop/start cycle.
+    const uint32_t EntryGen = __atomic_load_n(&PostboxTimerGen, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&PostboxDpcRefs, 1, __ATOMIC_ACQ_REL);
+#endif
+    if (__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE))
+    {
+        if (__atomic_exchange_n(&PostboxInFlight, 1, __ATOMIC_ACQ_REL) == 0)
+            PostboxQueueWorkItem(&PostboxStatePtr->Work, 1);   // DelayedWorkQueue
+    }
+#ifdef POSTBOX_ONESHOT_TIMER
+    // Re-arm only while running and unchanged since entry: a stop between entry and
+    // here (running clear, generation bumped) leaves the timer cancelled, and the
+    // final cancel after the quiesce removes anything re-armed before the generation
+    // was checked. FromDpc keeps the timer set direct at DISPATCH.
+    if (__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE) &&
+        __atomic_load_n(&PostboxTimerGen, __ATOMIC_SEQ_CST) == EntryGen)
+        (void) PostboxArm(PostboxPeriodMs, PostboxPeriodMs <= 8u ? 1u : 50u, true);
+    __atomic_sub_fetch(&PostboxDpcRefs, 1, __ATOMIC_ACQ_REL);
+#endif
 }
 
 // Runs at PASSIVE_LEVEL in an existing system worker thread. The assembly
@@ -2307,6 +2662,22 @@ extern "C" void PostboxWorkRoutine(void*)
     PostboxState* State = PostboxStatePtr;
     if (__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE))
     {
+#ifdef NMI_SANITIZE
+        // N-10: detector refresh/activation is PASSIVE work, never an NMI.
+        // 250 * 4 ms ~= 1 s, so a rename or late load is picked up promptly
+        // without walking the module list on every work item.
+        if (State && State->NmiSanitize.Ready)
+        {
+            if (++State->NmiSanitize.RefreshTick >= 250)
+            {
+                State->NmiSanitize.RefreshTick = 0;
+                if (!State->NmiSanitize.Active)
+                    PostboxNmiTryActivate(State);
+                else
+                    PostboxNmiRefreshDetector(State);
+            }
+        }
+#endif
 #ifdef E3_DPC_PROBE
         // Run the test-only CPU-1 probe once, before the first mailbox poll.
         if (__atomic_exchange_n(&E3Started, 1, __ATOMIC_ACQ_REL) == 0)
@@ -2395,6 +2766,7 @@ static void PostboxPollAttached(void* MailboxProcess)
 #endif
 #ifdef NMI_PROBE
                          || Op == pb_nmi_probe
+                         || Op == pb_nmi_status
 #endif
 #ifdef STACK_SPOOF
                          || Op == pb_stack_probe
@@ -2403,6 +2775,7 @@ static void PostboxPollAttached(void* MailboxProcess)
     const bool ZeroBodyOp = Op == pb_ping || Op == pb_stop || Op == pb_nmi
 #ifdef NMI_PROBE
                             || Op == pb_nmi_probe
+                            || Op == pb_nmi_status
 #endif
 #ifdef STACK_SPOOF
                             || Op == pb_stack_probe
@@ -2423,6 +2796,7 @@ static void PostboxPollAttached(void* MailboxProcess)
                                (Op == pb_nmi) ? (uint32_t) sizeof(uint64_t) :
 #ifdef NMI_PROBE
                                (Op == pb_nmi_probe) ? (uint32_t) sizeof(PostboxNmiProbeResult) :
+                               (Op == pb_nmi_status) ? (uint32_t) sizeof(PostboxNmiStatus) :
 #endif
 #ifdef STACK_SPOOF
                                (Op == pb_stack_probe) ? (uint32_t) sizeof(PostboxStackProbeResult) :
@@ -2581,6 +2955,35 @@ static void PostboxPollAttached(void* MailboxProcess)
                 ResponseLen = sizeof(Result);
             }
         }
+    }
+    else if (Op == pb_nmi_status)
+    {
+        // Test-only: report sanitizer activation and the last record rewrite.
+        PostboxNmiStatus St{};
+        St.Magic = PostboxNmiStatusMagic;
+        St.Active = PostboxStatePtr->NmiSanitize.Active;
+        St.Ready = PostboxStatePtr->NmiSanitize.Ready;
+        St.DetectorBase = PostboxStatePtr->NmiSanitize.DetectorBase;
+        St.DetectorSize = PostboxStatePtr->NmiSanitize.DetectorSize;
+        St.Writes = PostboxStatePtr->NmiSanitize.Writes;
+        St.LastCount = PostboxStatePtr->NmiSanitize.LastCount;
+        St.LastUser = PostboxStatePtr->NmiSanitize.LastUser;
+        St.LastCore = PostboxStatePtr->NmiSanitize.LastCore;
+        St.LastRip = PostboxStatePtr->NmiSanitize.LastRip;
+        St.LastRsp = PostboxStatePtr->NmiSanitize.LastRsp;
+        St.RefreshActive = PostboxStatePtr->NmiSanitize.RefreshThreadActive;
+        St.RefreshRun = PostboxStatePtr->NmiSanitize.RefreshRun;
+        St.RefreshCount = PostboxStatePtr->NmiSanitize.RefreshCount;
+        St.ListHead = PostboxStatePtr->NmiSanitize.ListHead;
+        St.NtBase = PostboxStatePtr->NmiSanitize.NtBase;
+        St.NtSize = PostboxStatePtr->NmiSanitize.NtSize;
+        St.PsLoadedModuleList = PostboxStatePtr->Caches.PsLoadedModuleList;
+        __builtin_memcpy(PostboxStatePtr->Stage, &St, sizeof(St));
+        pb::SealResponseBody(PostboxStatePtr->Stage, sizeof(St),
+                             PostboxStatePtr->Keys, PostboxStatePtr->SessionId,
+                             Sealed.Nonce);
+        ResponseBody = PostboxStatePtr->Stage;
+        ResponseLen = sizeof(St);
     }
 #endif
 
@@ -2819,10 +3222,13 @@ bool PostboxStart(const PostboxConfig* Config)
     // wiped. The Config.Reserved gate above guarantees the independent layout.
     PostboxStatePtr->ReaperBase = Config->Layout.RawBase;
     PostboxStatePtr->ReaperSize = Config->Layout.AllocSize;
+#ifdef NMI_SANITIZE
     // Capture the mapped image range for the NMI frame trampoline before the
-    // layout copy is wiped.
+    // layout copy is wiped. Only the sanitizer init consumes it here; the spoof
+    // and product paths read NmiSanitize.* fields instead.
     const uint64_t ImageBase = Config->Layout.ImageBase;
     const uint64_t ImageSize = Config->Layout.ImageSize;
+#endif
     // The section map is only needed by ProtectImageSections(), which ran before
     // this copy. Do not leave the RVAs/sizes in the resident .data image.
     PostboxWipe(&PostboxStatePtr->Cfg.Layout, sizeof(PostboxStatePtr->Cfg.Layout));
@@ -3006,6 +3412,13 @@ bool PostboxStart(const PostboxConfig* Config)
         PostboxFreeStatePage();
         return false;
     }
+
+#ifdef NMI_SANITIZE
+    // N-10: start the independent PASSIVE detector-refresh thread only after the
+    // timer is armed, so the start-failure path above cannot leave it running
+    // behind a freed state page.
+    PostboxNmiStartRefreshThread(PostboxStatePtr);
+#endif
 
     print(INFO("Postbox: live, pid %u mailbox %p, 4 ms timer"),
           MailboxPid, (void*) (uintptr_t) PostboxStatePtr->MailboxVa);

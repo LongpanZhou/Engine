@@ -39,6 +39,7 @@ enum PostboxOp : uint32_t
     pb_nmi = 5,             // POSTBOX_NMI builds only: query/self-test the NMI gate
     pb_nmi_probe = 6,       // NMI_PROBE test builds only: callback RIP/RSP probe
     pb_stack_probe = 7,     // STACK_SPOOF test builds only: call-site stack capture
+    pb_nmi_status = 8,      // NMI_PROBE test builds only: sanitizer activation/rewrite state
 };
 
 // Test-only NMI callback probe result. The driver registers KeRegisterNmiCallback,
@@ -62,6 +63,36 @@ struct PostboxNmiProbeResult
     PostboxNmiProbeCore Core[PostboxNmiProbeMaxCores];
 };
 static_assert(sizeof(PostboxNmiProbeResult) == 8 + 16 * 0x28, "NMI probe result ABI changed");
+
+#ifdef NMI_PROBE
+// Test-only sanitizer status. Reports whether the NMI sanitizer activated, the
+// detector range it resolved, and the last record it rewrote (preserved count,
+// real user flag, core, sanitized RIP/RSP). Product builds never compile it.
+constexpr uint32_t PostboxNmiStatusMagic = 0x53544E4D;   // "MNTS"
+struct PostboxNmiStatus
+{
+    uint32_t Magic;
+    uint32_t Active;
+    uint32_t Ready;
+    uint32_t Reserved;
+    uint64_t DetectorBase;
+    uint64_t DetectorSize;
+    uint64_t Writes;
+    uint64_t LastCount;
+    uint64_t LastUser;
+    uint64_t LastCore;
+    uint64_t LastRip;
+    uint64_t LastRsp;
+    uint64_t RefreshActive;
+    uint64_t RefreshRun;
+    uint64_t RefreshCount;
+    uint64_t ListHead;
+    uint64_t NtBase;
+    uint64_t NtSize;
+    uint64_t PsLoadedModuleList;
+};
+static_assert(sizeof(PostboxNmiStatus) == 0x88, "NMI status ABI changed");
+#endif
 
 // Test-only call-site stack probe. The MmCopyVirtualMemory trampoline records
 // the fake-stack gadget, the real RSP, and the mapped real return address.

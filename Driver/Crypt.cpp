@@ -34,3 +34,22 @@ constexpr std::array<char, N> EncodeBytes(const std::array<char, N> &Bytes)
 {
     return XorSeed(Bytes);
 }
+
+// Encoded export-name storage for the runtime-resolved import table. One pass of
+// XorSeed over ASCII letters puts every byte in 0x80..0xFF (SEED's low byte 0x99
+// flips the high bits), so the mapped image's .rdata carries neither plaintext
+// nor ROT1-decipherable names, and no content byte collapses to NUL. Decode is the
+// same XOR into a stack buffer, wiped after the name is used
+struct EncodedName
+{
+    char Bytes[40];
+};
+
+template<size_t N>
+constexpr EncodedName EncodeName(const char (&Src)[N])
+{
+    EncodedName Out{};
+    for (size_t i = 0; i + 1 < N; ++i)
+        Out.Bytes[i] = static_cast<char>(Src[i] ^ SEED);
+    return Out;
+}

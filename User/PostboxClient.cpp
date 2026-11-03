@@ -48,6 +48,7 @@ struct ClientOptions
 #ifdef NMI_PROBE
     bool NmiProbe;
     uint32_t NmiSpinMs;
+    bool NmiStatus;
 #endif
 #ifdef STACK_SPOOF
     bool StackProbe;
@@ -111,6 +112,16 @@ static bool CreateHandoffSection(const PostboxSectionHandoff& Handoff)
 // Spawn the loader with the section handle inherited. The handle value is only
 // meaningful inside the child's inherited handle table; the command line does
 // not carry a name or a capability that another process can use.
+//
+// Std-handle plumbing (0x3B-before-main fix, see README "unusable console handle"):
+// the restricted handle list used to hand the child nothing but the section, which
+// leaves the console-subsystem loader without valid std handles and with a broken
+// console attach state, faulting 0x3B in KiRestoreDebugRegisterState/KiSystemServiceExit
+// before or around main(). The client's own redirected std handles (valid file or
+// console handles under any parent) are marked inheritable, added to the handle-list
+// restriction, and passed via STARTF_USESTDHANDLES so the CRT init is grounded. The
+// GUI loader needs no console, so this is transparent for it; its evidence lines
+// simply start reaching the redirected stdout as well.
 static bool StartLoader(HANDLE Section, const ClientOptions& Options)
 {
     if (!Section || !Options.LoaderPath || !Options.LoaderArgs)
@@ -128,28 +139,64 @@ static bool StartLoader(HANDLE Section, const ClientOptions& Options)
         return false;
     }
 
-    // Restrict inheritance to the handoff section. Without the handle list,
-    // bInheritHandles=TRUE hands the child every inheritable handle in the client.
+    // Gather the client's own std handles. Under cmd's `> log` redirection these are
+    // real file handles; a NULL on any side falls back to the pre-fix behaviour, which
+    // is safe for the GUI loader and must not regress it.
+    HANDLE Std[3];
+    Std[0] = GetStdHandle(STD_INPUT_HANDLE);
+    Std[1] = GetStdHandle(STD_OUTPUT_HANDLE);
+    Std[2] = GetStdHandle(STD_ERROR_HANDLE);
+    bool HaveStd = true;
+    for (int i = 0; i < 3; ++i)
+    {
+        if (Std[i])
+        {
+            // cmd's redirect targets are not inheritable by default; the child link
+            // needs the flag so the handle-list entry is honoured.
+            if (!SetHandleInformation(Std[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT))
+                HaveStd = false;
+        }
+        else
+        {
+            HaveStd = false;
+        }
+    }
+
+    // Restrict inheritance to the handoff section plus, when valid, the std handles.
+    // Without the handle list, bInheritHandles=TRUE hands the child every inheritable
+    // handle in the client.
     STARTUPINFOEXA Si{};
     Si.StartupInfo.cb = sizeof(Si);
     SIZE_T AttrSize = 0;
-    InitializeProcThreadAttributeList(nullptr, 1, 0, &AttrSize);
-    alignas(16) uint8_t AttrBuf[128] = {};
+    InitializeProcThreadAttributeList(nullptr, 2, 0, &AttrSize);
+    alignas(16) uint8_t AttrBuf[256] = {};
     if (AttrSize == 0 || AttrSize > sizeof(AttrBuf))
     {
         std::printf("postbox: attribute-list sizing failed\n");
         return false;
     }
     Si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(AttrBuf);
-    if (!InitializeProcThreadAttributeList(Si.lpAttributeList, 1, 0, &AttrSize))
+    if (!InitializeProcThreadAttributeList(Si.lpAttributeList, 2, 0, &AttrSize))
     {
         std::printf("postbox: attribute-list init failed, error %lu\n", GetLastError());
         return false;
     }
-    HANDLE Inherit[1] = { Section };
+    HANDLE Inherit[4] = { Section, nullptr, nullptr, nullptr };
+    DWORD InheritCount = 1;
+    if (HaveStd)
+    {
+        Si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+        Si.StartupInfo.hStdInput = Std[0];
+        Si.StartupInfo.hStdOutput = Std[1];
+        Si.StartupInfo.hStdError = Std[2];
+        InheritCount = 4;   // section + the three std handles
+        for (int i = 0; i < 3; ++i)
+            Inherit[1 + i] = Std[i];
+    }
     if (!UpdateProcThreadAttribute(Si.lpAttributeList, 0,
                                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                   Inherit, sizeof(Inherit), nullptr, nullptr))
+                                   Inherit, InheritCount * sizeof(Inherit[0]),
+                                   nullptr, nullptr))
     {
         std::printf("postbox: handle-list setup failed, error %lu\n", GetLastError());
         DeleteProcThreadAttributeList(Si.lpAttributeList);
@@ -308,6 +355,7 @@ static bool Submit(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
         (Op == pb_read) ? Size :
 #ifdef NMI_PROBE
         (Op == pb_nmi_probe) ? static_cast<uint32_t>(sizeof(PostboxNmiProbeResult)) :
+        (Op == pb_nmi_status) ? static_cast<uint32_t>(sizeof(PostboxNmiStatus)) :
 #endif
 #ifdef STACK_SPOOF
         (Op == pb_stack_probe) ? static_cast<uint32_t>(sizeof(PostboxStackProbeResult)) :
@@ -328,6 +376,9 @@ static bool Submit(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
 #ifdef NMI_PROBE
         else if (Op == pb_nmi_probe)
             pb::OpenResponseBody(Data, static_cast<uint32_t>(sizeof(PostboxNmiProbeResult)),
+                                 S.Keys, S.SessionId, Nonce);
+        else if (Op == pb_nmi_status)
+            pb::OpenResponseBody(Data, static_cast<uint32_t>(sizeof(PostboxNmiStatus)),
                                  S.Keys, S.SessionId, Nonce);
 #endif
 #ifdef STACK_SPOOF
@@ -405,6 +456,10 @@ static bool ParseArguments(int argc, char** argv, ClientOptions& Options)
                 return false;
             }
             ++i;
+        }
+        else if (std::strcmp(Arg, "--nmi-status") == 0)
+        {
+            Options.NmiStatus = true;
         }
 #endif
 #ifdef STACK_SPOOF
@@ -815,6 +870,45 @@ int PostboxClientMain(int argc, char** argv)
             StopBestEffort(Header, Data, S);
             return 1;
         }
+    }
+
+    if (Options.NmiStatus)
+    {
+        // Test-only: prove the sanitizer activated (including after a late
+        // detector load) and show the last record it rewrote.
+        if (!Submit(Header, Data, S, pb_nmi_status, 0, 0, 5000))
+        {
+            std::printf("nmi status: timeout or auth failure\n");
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+        std::printf("nmi status: status=0x%X\n", static_cast<unsigned>(S.Status));
+        if (S.Status != 0)
+        {
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+        PostboxNmiStatus St{};
+        std::memcpy(&St, Data, sizeof(St));
+        std::printf("nmi status: magic=0x%X active=%u ready=%u detector=%016llx+%llx writes=%llu last_core=%llu last_count=%llu last_user=%llu last_rip=%016llx last_rsp=%016llx refresh_active=%llu refresh_run=%llu refresh_count=%llu list=%016llx nt=%016llx+%llx pslist=%016llx\n",
+                    St.Magic, St.Active, St.Ready,
+                    static_cast<unsigned long long>(St.DetectorBase),
+                    static_cast<unsigned long long>(St.DetectorSize),
+                    static_cast<unsigned long long>(St.Writes),
+                    static_cast<unsigned long long>(St.LastCore),
+                    static_cast<unsigned long long>(St.LastCount),
+                    static_cast<unsigned long long>(St.LastUser),
+                    static_cast<unsigned long long>(St.LastRip),
+                    static_cast<unsigned long long>(St.LastRsp),
+                    static_cast<unsigned long long>(St.RefreshActive),
+                    static_cast<unsigned long long>(St.RefreshRun),
+                    static_cast<unsigned long long>(St.RefreshCount),
+                    static_cast<unsigned long long>(St.ListHead),
+                    static_cast<unsigned long long>(St.NtBase),
+                    static_cast<unsigned long long>(St.NtSize),
+                    static_cast<unsigned long long>(St.PsLoadedModuleList));
+        std::fflush(stdout);
+        SecureZeroMemory(Data, PostboxDataMax);
     }
 #endif
 
