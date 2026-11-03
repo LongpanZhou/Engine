@@ -10,6 +10,10 @@
 // TargetPid == 0 means the current (loader) process. A cross-process batch
 // takes PsAcquireProcessExitSynchronization once, for the whole batch, and
 // releases it after the last job. Same-process batches take no exit sync.
+//
+// Test-only scope: the loader owns the job section in this branch. The product
+// form is a controller-owned inherited section handle; the driver ABI does not
+// change for that move.
 #ifdef POSTBOX_JOB
 
 // The job path needs seven resolved routines. Copy them to the stack and zero
@@ -132,6 +136,19 @@ bool PostboxRunJobs(const PostboxJobConfig* Config)
     {
         print(ERROR("PostboxJob: cannot read batch header"));
         PostboxStartFailure = 42;
+        PostboxWipe(&Batch, sizeof(Batch));
+        PostboxWipe(&Imports, sizeof(Imports));
+        PostboxWipe(&Cfg, sizeof(Cfg));
+        return false;
+    }
+
+    // Authenticate the input batch before trusting any record. The key is
+    // transient: it lives in the config page and this stack copy only.
+    const uint64_t BatchMac = pb::SipHash24(Cfg.Key, &Batch, sizeof(Batch));
+    if (BatchMac != Cfg.Mac)
+    {
+        print(ERROR("PostboxJob: batch MAC mismatch"));
+        PostboxStartFailure = 48;
         PostboxWipe(&Batch, sizeof(Batch));
         PostboxWipe(&Imports, sizeof(Imports));
         PostboxWipe(&Cfg, sizeof(Cfg));

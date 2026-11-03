@@ -461,13 +461,13 @@ struct PostboxJobConfig
     uint64_t TargetPid;             // 0 = current process
     uint64_t TargetCreateTime;      // 0 = do not verify
     uint64_t Nonce;                 // binds this config to the batch
-    uint8_t Key[32];                // reserved for a future batch MAC; zero now
+    uint8_t Key[32];                // SipHash-2-4 key in [0..15]; [16..31] zero
     PostboxImageLayout Layout;      // loader-built image section map
-    uint64_t Reserved2;
+    uint64_t Mac;                   // SipHash-2-4(Key, input PostboxJobBatch)
 };
 static_assert(sizeof(PostboxJobConfig) == 0x110, "job config ABI changed");
 static_assert(offsetof(PostboxJobConfig, Layout) == 0x58, "job config Layout offset changed");
-static_assert(offsetof(PostboxJobConfig, Reserved2) == 0x108, "job config tail offset changed");
+static_assert(offsetof(PostboxJobConfig, Mac) == 0x108, "job config tail offset changed");
 
 inline bool PostboxJobConfigValid(const PostboxJobConfig& cfg, uint32_t* error = nullptr)
 {
@@ -475,7 +475,13 @@ inline bool PostboxJobConfigValid(const PostboxJobConfig& cfg, uint32_t* error =
 
     if (cfg.Magic != PostboxJobConfigMagic || cfg.Version != PostboxJobConfigVersion)
         return fail();
-    if (cfg.Reserved != 0 || cfg.Reserved2 != 0) return fail();
+    if (cfg.Reserved != 0) return fail();
+
+    bool keyNonZero = false;
+    for (uint32_t i = 0; i < 16; ++i)
+        keyNonZero |= (cfg.Key[i] != 0);
+    if (!keyNonZero) return fail();
+
     if (!cfg.SectionVa || !cfg.SectionSize || (cfg.SectionVa & 7)) return fail();
     if (cfg.SectionSize < sizeof(PostboxJobBatch) || cfg.SectionSize > PostboxJobSectionMax)
         return fail();

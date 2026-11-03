@@ -17,6 +17,7 @@
 #include <cstring>
 
 #include "../../Common/Postbox.h"
+#include "../../Common/PostboxCrypto.h"
 
 static unsigned g_Pass = 0;
 static unsigned g_Fail = 0;
@@ -41,6 +42,9 @@ static PostboxJobConfig MakeValidConfig()
     cfg.TargetPid = 1234;
     cfg.TargetCreateTime = 0x1122334455667788ull;
     cfg.Nonce = 0x99AABBCCDDEEFF00ull;
+    for (uint32_t i = 0; i < 16; ++i)
+        cfg.Key[i] = static_cast<uint8_t>(i + 1);
+    cfg.Mac = 0x123456789ABCDEF0ull;
     cfg.Layout.Magic = PostboxLayoutMagic;
     cfg.Layout.Version = PostboxLayoutVersion;
     cfg.Layout.ImageSize = 0xB000;
@@ -92,7 +96,7 @@ static void TestAbi()
     CHECK(offsetof(PostboxJobConfig, Nonce) == 0x30);
     CHECK(offsetof(PostboxJobConfig, Layout) == 0x58);
     CHECK(offsetof(PostboxJobConfig, Layout) == offsetof(PostboxConfig, Layout));
-    CHECK(offsetof(PostboxJobConfig, Reserved2) == 0x108);
+    CHECK(offsetof(PostboxJobConfig, Mac) == 0x108);
 
     CHECK(PostboxJobConfigMagic == 0x8F3A27C1);
     CHECK(PostboxJobBatchMagic == 0x9B4D62E5);
@@ -124,7 +128,7 @@ static void TestConfigValid()
     CHECK(IsInvalid([](PostboxJobConfig& c) { c.Magic = 0; }));
     CHECK(IsInvalid([](PostboxJobConfig& c) { c.Version = PostboxJobConfigVersion - 1; }));
     CHECK(IsInvalid([](PostboxJobConfig& c) { c.Reserved = 1; }));
-    CHECK(IsInvalid([](PostboxJobConfig& c) { c.Reserved2 = 1; }));
+    CHECK(IsInvalid([](PostboxJobConfig& c) { memset(c.Key, 0, sizeof(c.Key)); }));
     CHECK(IsInvalid([](PostboxJobConfig& c) { c.SectionVa = 0; }));
     CHECK(IsInvalid([](PostboxJobConfig& c) { c.SectionVa = 0x1004; }));   // unaligned
     CHECK(IsInvalid([](PostboxJobConfig& c) { c.SectionSize = 0; }));
@@ -265,11 +269,34 @@ static void TestBatchValid()
     }
 }
 
+static void TestBatchMac()
+{
+    PostboxJobConfig cfg = MakeValidConfig();
+    PostboxJobBatch batch = MakeValidBatch(cfg);
+    uint8_t key[16] = {};
+    for (uint32_t i = 0; i < sizeof(key); ++i)
+        key[i] = static_cast<uint8_t>(0x80 + i);
+
+    const uint64_t mac1 = pb::SipHash24(key, &batch, sizeof(batch));
+    batch.Jobs[1].Size ^= 1;
+    const uint64_t mac2 = pb::SipHash24(key, &batch, sizeof(batch));
+    CHECK(mac1 != mac2);
+
+    batch.Jobs[1].Size ^= 1;
+    CHECK(pb::SipHash24(key, &batch, sizeof(batch)) == mac1);
+
+    uint8_t other[16] = {};
+    memcpy(other, key, sizeof(other));
+    other[0] ^= 1;
+    CHECK(pb::SipHash24(other, &batch, sizeof(batch)) != mac1);
+}
+
 int main()
 {
     TestAbi();
     TestConfigValid();
     TestBatchValid();
+    TestBatchMac();
 
     std::printf("\n==== kf_f1_job_tests: %u passed, %u failed ====\n", g_Pass, g_Fail);
     return g_Fail ? 1 : 0;
