@@ -1591,7 +1591,7 @@ static void PostboxNmiSanitizeStop(PostboxState* S)
 // (header, .rdata, .pdata, .reloc, .pbox, padding) R/NX. No page is left RWX.
 uint32_t PostboxStartFailure = 0;
 
-bool ProtectImageSectionsLayout(const PostboxImageLayout* Layout)
+bool ProtectImageSectionsLayout(const PostboxImageLayout* Layout, bool FlushAllCpus = true)
 {
     PostboxStartFailure = 20;
     if (!Layout || Layout->Magic != PostboxLayoutMagic ||
@@ -1709,21 +1709,30 @@ bool ProtectImageSectionsLayout(const PostboxImageLayout* Layout)
     // The per-page invlpg only covers the current CPU. A T2 AC can cache the
     // pre-protection RWX entry on the other CPU; flush every CPU so the stale
     // entry cannot write .text or execute .data after the split.
-    if (!IpiGenericCall)
+    if (FlushAllCpus)
     {
-        print(ERROR("Postbox: KeIpiGenericCall not resolved"));
-        PostboxStartFailure = 26;
-        return false;
+        if (!IpiGenericCall)
+        {
+            print(ERROR("Postbox: KeIpiGenericCall not resolved"));
+            PostboxStartFailure = 26;
+            return false;
+        }
+#ifdef T2_PROBE
+        T2Probe(L.ImageBase, (uint64_t) (uintptr_t) IpiGenericCall, 1);
+#endif
+        PostboxTlbRange Range{ L.ImageBase, End };
+        ((FnKeIpiGenericCall) IpiGenericCall)(
+            &PostboxFlushTlb, (uint64_t) (uintptr_t) &Range);
+#ifdef T2_PROBE
+        T2Probe(L.ImageBase, (uint64_t) (uintptr_t) IpiGenericCall, 2);
+#endif
     }
-#ifdef T2_PROBE
-    T2Probe(L.ImageBase, (uint64_t) (uintptr_t) IpiGenericCall, 1);
-#endif
-    PostboxTlbRange Range{ L.ImageBase, End };
-    ((FnKeIpiGenericCall) IpiGenericCall)(
-        &PostboxFlushTlb, (uint64_t) (uintptr_t) &Range);
-#ifdef T2_PROBE
-    T2Probe(L.ImageBase, (uint64_t) (uintptr_t) IpiGenericCall, 2);
-#endif
+    else
+    {
+        // F1: the loader applied final protections before the entry and no
+        // other CPU accessed the private image; the per-page invlpg above
+        // covers the entry CPU. The persistent path keeps the global flush.
+    }
 
     print(INFO("Postbox: image protections applied (%u pages, %u sections)"),
           Pages, L.SectionCount);
