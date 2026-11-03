@@ -232,6 +232,7 @@ struct PostboxNmiSanitizeState
     uint64_t NtBase;
     uint64_t NtSize;
     uint64_t RetGadget;
+    uint64_t PopRspRet;
     uint64_t DetectorBase;
     uint64_t DetectorSize;
     uint64_t Register;
@@ -931,6 +932,35 @@ static uint64_t PostboxNmiFindRetGadget(address Nt, uint64_t NtSize)
     return 0;
 }
 
+#ifdef STACK_SPOOF
+// First 5C C3 (pop rsp; ret) in an executable nt section. The call-site
+// trampoline uses it to restore the real RSP and return to the mapped caller.
+static uint64_t PostboxNmiFindPopRspRet(address Nt, uint64_t NtSize)
+{
+    if (!Nt || NtSize < 0x1000) return 0;
+    auto* Dos = (_IMAGE_DOS_HEADER*) (uintptr_t) Nt;
+    if (Dos->e_magic != 0x5A4D) return 0;
+    if (Dos->e_lfanew < 0x40 ||
+        (uint64_t) Dos->e_lfanew + sizeof(_IMAGE_NT_HEADERS64) > NtSize) return 0;
+    auto* NtHdr = (_IMAGE_NT_HEADERS64*) ((uint8_t*) (uintptr_t) Nt + Dos->e_lfanew);
+    if (NtHdr->Signature != 0x4550) return 0;
+    auto* Sec = (_IMAGE_SECTION_HEADER*)
+        ((uint8_t*) &NtHdr->OptionalHeader + NtHdr->FileHeader.SizeOfOptionalHeader);
+    for (uint16_t i = 0; i < NtHdr->FileHeader.NumberOfSections; ++i)
+    {
+        if (!(Sec[i].Characteristics & 0x20000000u)) continue;
+        const uint64_t Va = (uint64_t) (uintptr_t) Nt + Sec[i].VirtualAddress;
+        const uint64_t Size = Sec[i].Misc.VirtualSize;
+        if (Va < (uint64_t) (uintptr_t) Nt || Va + Size > (uint64_t) (uintptr_t) Nt + NtSize)
+            continue;
+        const uint8_t* P = (const uint8_t*) (uintptr_t) Va;
+        for (uint64_t j = 0; j + 1 < Size; ++j)
+            if (P[j] == 0x5C && P[j + 1] == 0xC3) return Va + j;
+    }
+    return 0;
+}
+#endif
+
 // Redirect a mapped interrupted RIP to an nt ret gadget. The original RIP is
 // written just below the interrupted RSP; the gadget pops it and resumes the
 // mapped code with the original RSP. No IDT/TSS change; only the saved frame.
@@ -1076,6 +1106,9 @@ static bool PostboxNmiSanitizeInit(PostboxState* S, uint64_t ImageBase, uint64_t
     N.ImageSize = ImageSize;
     PostboxNmiFindNt(S, Nt);
     N.RetGadget = PostboxNmiFindRetGadget(Nt, N.NtSize);
+#ifdef STACK_SPOOF
+    N.PopRspRet = PostboxNmiFindPopRspRet(Nt, N.NtSize);
+#endif
     PostboxNmiFindDetector(S);
     // Do not create a KNMI node/ETW event on a system with no detector module.
     if (!N.DetectorBase || !N.DetectorSize) return false;
@@ -1358,6 +1391,25 @@ static bool PostboxResolve(address* IpiGenericCallOut)
 // The API performs its own attach/exit synchronization, so the poll no longer
 // calls KeStackAttachProcess or PsAcquireProcessExitSynchronization. This keeps
 // the user-half supervisor PTE removed and cuts the driver's explicit CR3 churn.
+#ifdef STACK_SPOOF
+extern "C" uint64_t g_PostboxMmCopyTarget = 0;
+extern "C" uint64_t g_PostboxPopRspRet = 0;
+extern "C" int32_t PostboxMmCopySpoof(void* SourceProcess, void* SourceAddress,
+                                      void* TargetProcess, void* TargetAddress,
+                                      size_t Size, int32_t PreviousMode, size_t* Done);
+
+static int32_t PostboxMmCopyVirtualMemorySpoof(
+    void* SourceProcess, void* SourceAddress, void* TargetProcess, void* TargetAddress,
+    size_t Size, int32_t PreviousMode, size_t* Done)
+{
+    if (g_PostboxMmCopyTarget && g_PostboxPopRspRet)
+        return PostboxMmCopySpoof(SourceProcess, SourceAddress, TargetProcess,
+                                  TargetAddress, Size, PreviousMode, Done);
+    return ((FnMmCopyVirtualMemory) g_MmCopyVirtualMemory)(
+        SourceProcess, SourceAddress, TargetProcess, TargetAddress, Size, PreviousMode, Done);
+}
+#endif
+
 static bool PostboxCopy(void* MailboxProcess, address UserVa, void* Buffer,
                         size_t Size, bool Write)
 {
@@ -1373,17 +1425,31 @@ static bool PostboxCopy(void* MailboxProcess, address UserVa, void* Buffer,
         // Source = client user VA, target = kernel stage, both expressed against
         // the cached client EPROCESS. MmCopyVirtualMemory performs the attach
         // internally, so the driver no longer calls KeStackAttachProcess itself.
+#ifdef STACK_SPOOF
+        Status = PostboxMmCopyVirtualMemorySpoof(
+            MailboxProcess, (void*) (uintptr_t) UserVa,
+            ((FnPsGetCurrentProcess) g_PsGetCurrentProcess)(), Buffer,
+            Size, 0 /* KernelMode */, &Done);
+#else
         Status = ((FnMmCopyVirtualMemory) g_MmCopyVirtualMemory)(
             MailboxProcess, (void*) (uintptr_t) UserVa,
             ((FnPsGetCurrentProcess) g_PsGetCurrentProcess)(), Buffer,
             Size, 0 /* KernelMode */, &Done);
+#endif
     }
     else
     {
+#ifdef STACK_SPOOF
+        Status = PostboxMmCopyVirtualMemorySpoof(
+            ((FnPsGetCurrentProcess) g_PsGetCurrentProcess)(), Buffer,
+            MailboxProcess, (void*) (uintptr_t) UserVa,
+            Size, 0 /* KernelMode */, &Done);
+#else
         Status = ((FnMmCopyVirtualMemory) g_MmCopyVirtualMemory)(
             ((FnPsGetCurrentProcess) g_PsGetCurrentProcess)(), Buffer,
             MailboxProcess, (void*) (uintptr_t) UserVa,
             Size, 0 /* KernelMode */, &Done);
+#endif
     }
     return Status >= 0 && Done == Size;
 }
@@ -2287,6 +2353,10 @@ bool PostboxStart(const PostboxConfig* Config)
 #ifdef NMI_SANITIZE
     if (!PostboxNmiSanitizeInit(PostboxStatePtr, ImageBase, ImageSize))
         print(WARN("Postbox: NMI sanitizer inactive"));
+#endif
+#ifdef STACK_SPOOF
+    g_PostboxMmCopyTarget = g_MmCopyVirtualMemory;
+    g_PostboxPopRspRet = PostboxStatePtr->NmiSanitize.PopRspRet;
 #endif
 
 #ifdef POSTBOX_NMI

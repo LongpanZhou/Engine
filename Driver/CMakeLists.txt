@@ -115,6 +115,16 @@ if(NMI_SANITIZE)
     list(APPEND VARIANT_DEFINES NMI_SANITIZE)
 endif()
 
+# Test-only call-site stack spoof: MmCopyVirtualMemory gets a fake stack whose
+# return address is an nt pop-rsp-ret gadget. Never part of the shipped build.
+option(STACK_SPOOF "Test-only call-site stack spoof" OFF)
+if(STACK_SPOOF)
+    if(NOT NMI_SANITIZE)
+        message(FATAL_ERROR "STACK_SPOOF requires NMI_SANITIZE=ON")
+    endif()
+    list(APPEND VARIANT_DEFINES STACK_SPOOF)
+endif()
+
 # One-shot + jittered timer: the timer is armed with a due time of PeriodMs plus an
 # rdtsc-derived jitter and re-armed from the DPC with an explicit running/generation
 # double-check, so _KTIMER.Period stays 0 and the timer table carries no fixed
@@ -137,6 +147,9 @@ if(POSTBOX_CHANNEL)
     list(APPEND POSTBOX_REAPER_SOURCES PostboxReaper.S)
     if(NMI_SANITIZE)
         list(APPEND POSTBOX_REAPER_SOURCES PostboxNmiEntry.S)
+    endif()
+    if(STACK_SPOOF)
+        list(APPEND POSTBOX_REAPER_SOURCES PostboxStackSpoof.S)
     endif()
 endif()
 
