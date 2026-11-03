@@ -423,6 +423,54 @@ void MemSetPreStartNtoskrnl(uint64_t Base)
         ((volatile char*) PsLoadedName)[i] = 0;
 }
 
+#ifdef DEBUG
+// Debug-only self-test (DriverEntry step 0.7): MemSetPreStartNtoskrnl must
+// resolve the two data exports to the same addresses the import slots carry,
+// and the SEED-XOR name decode must recover the plaintext. Runs before
+// PostboxStart moves the caches into the state page.
+bool VerifyMemSetPreStartNtoskrnl(uint64_t NtoskrnlBase)
+{
+    if (!NtoskrnlBase)
+    {
+        print(ERROR("VerifyMemSetPreStartNtoskrnl: no ntoskrnl base"));
+        return false;
+    }
+    MemSetPreStartNtoskrnl(NtoskrnlBase);
+
+    bool Ok = true;
+    const uint64_t ExpectedInitial = (uint64_t) (uintptr_t) __imp_PsInitialSystemProcess;
+    const uint64_t ExpectedLoaded = (uint64_t) (uintptr_t) __imp_PsLoadedModuleList;
+    const uint64_t GotInitial = __atomic_load_n(&CachedPsInitialSystemProcess, __ATOMIC_SEQ_CST);
+    const uint64_t GotLoaded = __atomic_load_n(&CachedPsLoadedModuleList, __ATOMIC_SEQ_CST);
+
+    if (!GotInitial || GotInitial != ExpectedInitial)
+    {
+        print(ERROR("VerifyMemSetPreStartNtoskrnl: PsInitialSystemProcess %p != import %p"),
+              (void*) (uintptr_t) GotInitial, (void*) (uintptr_t) ExpectedInitial);
+        Ok = false;
+    }
+    if (!GotLoaded || GotLoaded != ExpectedLoaded)
+    {
+        print(ERROR("VerifyMemSetPreStartNtoskrnl: PsLoadedModuleList %p != import %p"),
+              (void*) (uintptr_t) GotLoaded, (void*) (uintptr_t) ExpectedLoaded);
+        Ok = false;
+    }
+
+    static constexpr EncodedName TestName = EncodeName("PsLoadedModuleList");
+    char Decoded[32];
+    MemDecodeName(TestName.Bytes, Decoded, sizeof(Decoded));
+    if (!StringEquals(Decoded, "PsLoadedModuleList"))
+    {
+        print(ERROR("VerifyMemSetPreStartNtoskrnl: name decode mismatch"));
+        Ok = false;
+    }
+    for (uint32_t i = 0; i < sizeof(Decoded); ++i)
+        ((volatile char*) Decoded)[i] = 0;
+
+    return Ok;
+}
+#endif
+
 #ifndef POSTBOX_CHANNEL
 // True when a loader BaseDllName equals Expected (ASCII, case-insensitive). The read is bounded by
 // Name.Length: BaseDllName is a counted string, not necessarily NUL-terminated. Only the

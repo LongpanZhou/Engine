@@ -72,24 +72,7 @@ address EnumerateModuleBaseAddress(_EPROCESS *pEProcess, const wchar_t *ModuleNa
     return nullptr;
 }
 
-// Case-folded comparison, so the search finds the module however the loader stored its name's case
-// (ci.dll must match CI.dll). ASCII file names: folding a-z to A-Z is exact. A is a counted
-// UNICODE_STRING buffer, so Count bounds every read; B must be NUL-terminated and end exactly at Count
-static bool WideEqualsIgnoreCase(const wchar_t *A, const wchar_t *B, size_t Count)
-{
-    for (size_t i = 0; i < Count; ++i)
-    {
-        wchar_t a = A[i];
-        wchar_t b = B[i];
-        if (!a || !b) return false;                     // A ended early, or B is shorter than A
-
-        if (a >= L'a' && a <= L'z') a = (wchar_t) (a - 0x20);
-        if (b >= L'a' && b <= L'z') b = (wchar_t) (b - 0x20);
-        if (a != b) return false;
-    }
-
-    return B[Count] == L'\0';                           // B must not have extra characters
-}
+// WideEqualsIgnoreCase lives in Lib/pure.h (host-unit-tested).
 
 address EnumerateKProcess(const wchar_t *ProcessName)
 {
@@ -191,3 +174,54 @@ _EPROCESS *EnumerateEProcess(const wchar_t *ProcessName, const uint64_t PID = -1
     print(ERROR("%ws NOT FOUND!"), ProcessName);
     return nullptr;
 }
+
+#ifdef DEBUG
+// Debug-only self-test (DriverEntry step 0.8): the EPROCESS/module walkers must
+// agree with the kernel's own anchors, and a missing process/module must fail
+// cleanly instead of walking off a list.
+bool VerifyProcessEnumeration()
+{
+    bool Ok = true;
+
+    _EPROCESS* System = EnumerateEProcess(L"System", 4);
+    const _EPROCESS* ExpectedSystem = (_EPROCESS*) *__imp_PsInitialSystemProcess;
+    if (!System || System != ExpectedSystem)
+    {
+        print(ERROR("VerifyProcessEnumeration: System %p != PsInitialSystemProcess %p"),
+              (void*) System, (void*) ExpectedSystem);
+        Ok = false;
+    }
+
+    const address Ntos = GetNtoskrnl();
+    if (!Ntos)
+    {
+        print(ERROR("VerifyProcessEnumeration: no ntoskrnl base"));
+        Ok = false;
+    }
+    else
+    {
+        const address Found = EnumerateKProcess(L"ntoskrnl.exe");
+        if (!Found || Found != Ntos)
+        {
+            print(ERROR("VerifyProcessEnumeration: ntoskrnl %p != expected %p"),
+                  (void*) (uintptr_t) Found, (void*) (uintptr_t) Ntos);
+            Ok = false;
+        }
+    }
+
+    if (EnumerateEProcess(L"__kf_no_such_process__", 0xFFFFFFF0) != nullptr)
+    {
+        print(ERROR("VerifyProcessEnumeration: missing process was found"));
+        Ok = false;
+    }
+
+    // The System process has no PEB; the module-base walk must fail cleanly.
+    if (System && EnumerateModuleBaseAddress(System, L"ntdll.dll") != nullptr)
+    {
+        print(ERROR("VerifyProcessEnumeration: System PEB walk returned a base"));
+        Ok = false;
+    }
+
+    return Ok;
+}
+#endif

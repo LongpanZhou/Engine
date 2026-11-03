@@ -55,22 +55,29 @@ struct Pattern
 {
     std::array<char, N> Bytes;
     size_t Length;
+    bool Valid;
 
     const char *data() const { return Bytes.data(); }
 };
 
-// Encode/decode a whole pattern, preserving the length that PatternToBytes computed. The byte array
-// is XORed exactly like a string; only the length is carried separately.
+// Compile-time check used by Strings.h: a pattern with an invalid hex token must
+// fail the build instead of silently becoming a 0xFF byte at scan time.
+template<size_t N>
+constexpr bool PatternIsValid(const Pattern<N> &P) { return P.Valid; }
+
+// Encode/decode a whole pattern, preserving the length and validity that
+// PatternToBytes computed. The byte array is XORed exactly like a string; only
+// the length/validity are carried separately.
 template<size_t N>
 constexpr Pattern<N> EncodeBytes(const Pattern<N> &In)
 {
-    return {XorSeed(In.Bytes), In.Length};
+    return {XorSeed(In.Bytes), In.Length, In.Valid};
 }
 
 template<size_t N>
 constexpr Pattern<N> Decode(const Pattern<N> &In)
 {
-    return {XorSeed(In.Bytes), In.Length};
+    return {XorSeed(In.Bytes), In.Length, In.Valid};
 }
 
 // Hex to bytes
@@ -89,17 +96,25 @@ constexpr Pattern<N> PatternToBytes(const char (&Signature)[N])
     std::array<char, N> Bytes{};
     size_t i = 0;
     size_t len = 0;
+    bool valid = true;
 
     while (i < N - 1)
     {
         if (Signature[i] == ' ') { ++i; continue; }
         if (Signature[i] == '?') { Bytes[len++] = '?'; i += 2; continue; }
-        Bytes[len++] = static_cast<char>(HexToByte(Signature[i]) << 4 | HexToByte(Signature[i + 1]));
+
+        // A hex token must have two valid digits. 0xFF is the invalid sentinel;
+        // accepting it silently would turn a typo into a real 0xFF byte.
+        const uint8_t hi = HexToByte(Signature[i]);
+        const uint8_t lo = HexToByte(Signature[i + 1]);
+        if (hi == 0xFF || lo == 0xFF) valid = false;
+
+        Bytes[len++] = static_cast<char>(hi << 4 | lo);
         i += 2;
     }
 
     Bytes[len] = '\0';
-    return {Bytes, len};
+    return {Bytes, len, valid};
 }
 
 // True if the signature matches at Current ('?' matches any byte)
@@ -255,3 +270,57 @@ void FindFuncExportsBatch(address BaseAddress, const char *const *Names, address
         }
     }
 }
+
+#ifdef DEBUG
+// Debug-only self-test (DriverEntry step 0.9): the lazy export walk must agree
+// with the loader's import slots for data exports, return null for a missing
+// name, and fill a batch with the same results.
+bool VerifyFindFuncExports(address NtoskrnlBase)
+{
+    if (!NtoskrnlBase)
+    {
+        print(ERROR("VerifyFindFuncExports: no ntoskrnl base"));
+        return false;
+    }
+
+    bool Ok = true;
+    const address ExpectedInitial = (address) (uintptr_t) __imp_PsInitialSystemProcess;
+    const address ExpectedLoaded = (address) (uintptr_t) __imp_PsLoadedModuleList;
+
+    const address Initial = FindFuncExports(NtoskrnlBase, "PsInitialSystemProcess");
+    if (!Initial || Initial != ExpectedInitial)
+    {
+        print(ERROR("VerifyFindFuncExports: PsInitialSystemProcess %p != import %p"),
+              (void*) (uintptr_t) Initial, (void*) (uintptr_t) ExpectedInitial);
+        Ok = false;
+    }
+
+    const address Loaded = FindFuncExports(NtoskrnlBase, "PsLoadedModuleList");
+    if (!Loaded || Loaded != ExpectedLoaded)
+    {
+        print(ERROR("VerifyFindFuncExports: PsLoadedModuleList %p != import %p"),
+              (void*) (uintptr_t) Loaded, (void*) (uintptr_t) ExpectedLoaded);
+        Ok = false;
+    }
+
+    if (FindFuncExports(NtoskrnlBase, "__kf_missing_export__") != nullptr)
+    {
+        print(ERROR("VerifyFindFuncExports: missing name resolved"));
+        Ok = false;
+    }
+
+    const char* Wanted[3] = {
+        "PsInitialSystemProcess", "__kf_missing_export__", "PsLoadedModuleList",
+    };
+    address Results[3] = {};
+    FindFuncExportsBatch(NtoskrnlBase, Wanted, Results, 3);
+    if (Results[0] != ExpectedInitial || Results[1] != nullptr ||
+        Results[2] != ExpectedLoaded)
+    {
+        print(ERROR("VerifyFindFuncExports: batch result mismatch"));
+        Ok = false;
+    }
+
+    return Ok;
+}
+#endif

@@ -200,7 +200,7 @@ struct PostboxNmiImports
 
 #ifdef E3_DPC_PROBE
 // Test-only E3 result block. Appended to PostboxState so the shipped layout is
-// unchanged; KD reads it at state+0x348. Magic is "E3TLB001".
+// unchanged; KD reads it at state+0x308. Magic is "E3TLB001".
 struct PostboxE3Result
 {
     uint64_t Magic;
@@ -306,17 +306,21 @@ struct PostboxState
     // pre-protection path uses Mem.cpp's transient statics; PostboxStart adopts
     // them into this field and zeroes the statics.
     PostboxMemCaches Caches;
-    PostboxNmiImports NmiImports;
 #ifdef E3_DPC_PROBE
     PostboxE3Result E3;
 #endif
 #ifdef NMI_SANITIZE
     PostboxNmiSanitizeState NmiSanitize;
 #endif
+#ifdef POSTBOX_NMI
+    // Gate imports are only touched by POSTBOX_NMI. Kept last so growing them
+    // cannot shift the E3 probe result's fixed KD offset (0x308).
+    PostboxNmiImports NmiImports;
+#endif
 };
 static_assert(sizeof(PostboxState) <= 0x800, "PostboxState overlaps the fake NMI stack");
 #ifdef E3_DPC_PROBE
-static_assert(offsetof(PostboxState, E3) == 0x348, "E3 result offset changed");
+static_assert(offsetof(PostboxState, E3) == 0x308, "E3 result offset changed");
 #endif
 static PostboxState* PostboxStatePtr = nullptr;
 static uint32_t PostboxPollRefs = 0;
@@ -438,6 +442,25 @@ static bool SetPageProtection(address Va, bool Write, bool Execute)
     return true;
 }
 
+#ifdef DEBUG
+// Debug-only self-test for the image-section protection pass: re-read the PTE
+// that SetPageProtection just wrote and require Present + the requested W/NX
+// bits. A wrong page/section merge (or a write that silently missed) fails here
+// before the image is used.
+static bool VerifyPageProtection(address Va, bool Write, bool Execute)
+{
+    uint64_t* Entry = nullptr;
+    if (!GetPteForVa(Va, Entry) || !Entry) return false;
+
+    const uint64_t Value = __atomic_load_n(Entry, __ATOMIC_ACQUIRE);
+    if (!(Value & 1)) return false;                     // present
+    if (((Value & 2) != 0) != Write) return false;      // RW bit
+    const bool Nx = ((Value >> 63) & 1) != 0;
+    if (Nx == Execute) return false;                    // X => NX clear
+    return true;
+}
+#endif
+
 struct PostboxTlbRange
 {
     uint64_t Start;
@@ -487,7 +510,7 @@ static void T2Probe(uint64_t Base, uint64_t Ipi, uint32_t Phase)
 // rewritten to B's PFN while CPU 1 still holds the A translation. A DPC targeted
 // at CPU 1 records the read before the product KeIpiGenericCall+invlpg flush
 // (P1: stale 0x41) and after it (P2: 0x42). The result block lives in the state
-// page at +0x348 for KD.
+// page at +0x308 for KD.
 using FnKeSetTargetProcessorDpc = void (*)(PostboxDpc*, uint8_t);
 using FnKeInsertQueueDpc = uint8_t (*)(PostboxDpc*, void*, void*);
 using FnKeGetCurrentProcessorNumberEx = void (*)(void*);
@@ -1657,10 +1680,7 @@ bool ProtectImageSections(const PostboxConfig* Config)
                 Va >= ((SecEnd + 0xFFF) & ~0xFFFull))
                 continue;
 
-            if (S.Flags == PostboxPageRx)
-                Flags = PostboxPageRx;
-            else if (S.Flags == PostboxPageRwNx && Flags != PostboxPageRx)
-                Flags = PostboxPageRwNx;
+            Flags = PostboxMergePageFlags(Flags, S.Flags);
         }
 
         const bool Write = (Flags == PostboxPageRwNx);
@@ -1671,6 +1691,15 @@ bool ProtectImageSections(const PostboxConfig* Config)
             PostboxStartFailure = 25;
             return false;
         }
+#ifdef DEBUG
+        if (!VerifyPageProtection(address(Va), Write, Execute))
+        {
+            print(ERROR("Postbox: PTE verify failed at %p (W=%u X=%u)"),
+                  (void*) (uintptr_t) Va, (uint32_t) Write, (uint32_t) Execute);
+            PostboxStartFailure = 25;
+            return false;
+        }
+#endif
         ++Pages;
     }
 
@@ -2439,15 +2468,18 @@ static void PostboxFreeShadow()
 static void PostboxFreeState()
 {
     if (!PostboxStatePtr) return;
-#ifdef STACK_SPOOF
-    PostboxFreeShadow();
-#endif
-    // Every caller has already run KeCancelTimer + KeFlushQueuedDpcs, so the
-    // cancelled timer and its DPC can be wiped. This removes their pointers back
-    // into the image from the resident state page. The WORK_QUEUE_ITEM is left
-    // alone: the worker may still be executing on top of it.
-    PostboxWipe(&PostboxStatePtr->Timer, sizeof(PostboxTimer));
-    PostboxWipe(&PostboxStatePtr->Dpc, sizeof(PostboxDpc));
+    // Do NOT free the stack-spoof shadow here. The watchdog and pb_stop callers
+    // run INSIDE PostboxPollSpoof; freeing the shadow (or zeroing its return
+    // trampoline) under the active spoof frame makes the worker's epilogue jump
+    // to RIP=0. The reaper frees it after PostboxInFlight has quiesced, and the
+    // failed-start path frees it through PostboxFreeStatePage.
+    // Do NOT wipe the timer/DPC objects here. KeCancelTimer + KeFlushQueuedDpcs
+    // leaves a narrow window where a timer that fired just before the cancel can
+    // queue one more DPC after the flush; wiping the DPC's DeferredRoutine would
+    // turn that late DPC into a RIP=0 call. Keep the objects valid through the
+    // reaper's 500 ms grace period; the reaper wipes the whole state page only
+    // after it has quiesced. The WORK_QUEUE_ITEM is likewise left alone.
+
     pb::WipePostboxKeys(&PostboxStatePtr->Keys);
     PostboxWipe(&PostboxStatePtr->Cfg, sizeof(PostboxConfig));
     // C-01 cache residue: no worker can use the memory caches after the caller
@@ -2525,17 +2557,20 @@ extern "C" uint64_t PostboxReaperPrepare(PostboxState* State, PostboxReaperPlan*
     if (!Base || !Size || !Free)
         return 0;
 
-    // T2: the worker is quiescent and the reaper only needs the locals above.
-    // Wipe the import/cache/reaper residue before the 500 ms grace period, so
-    // the state page does not expose 21 ntoskrnl pointers or the image range.
-    PostboxWipe(&State->Imports, sizeof(PostboxImports));
-    PostboxWipe(&State->Caches, sizeof(PostboxMemCaches));
-    State->ReaperBase = 0;
-    State->ReaperSize = 0;
-
+    // Keep the import/cache table and the timer/DPC objects valid through the
+    // grace period: a late DPC (queued in the cancel/flush race window) must be
+    // able to run with a valid DeferredRoutine and import table. Running is
+    // already 0, so it returns without re-arming or queueing.
     _LARGE_INTEGER Delay{};
     Delay.QuadPart = -5000000;        // 500 ms
     ((FnKeDelayExecutionThread) DelayThread)(0, 0, &Delay);
+
+#ifdef STACK_SPOOF
+    // The worker has returned (PostboxInFlight == 0) and the grace period has
+    // elapsed, so no spoof frame is active. Free the shadow pool here, never
+    // from PostboxFreeState (which runs inside the spoofed worker).
+    PostboxFreeShadow();
+#endif
 
     // Exchange first so a concurrent stop cannot free the same page twice. If a
     // new state page replaced this one, leave the old page alone.
@@ -2545,6 +2580,8 @@ extern "C" uint64_t PostboxReaperPrepare(PostboxState* State, PostboxReaperPlan*
                                      __ATOMIC_ACQUIRE))
         return 0;
 
+    // No timer/DPC can be queued now (Running == 0 and the grace period has
+    // elapsed); wipe the whole page, including the timer/DPC/import residue.
     PostboxWipe(State, 0x1000);
     ((FnMmFreeIndependentPages) Free)(State, 0x1000);
 
@@ -2749,12 +2786,14 @@ static void PostboxPollAttached(void* MailboxProcess)
     }
 
     const uint32_t Seq = __atomic_load_n(&Sealed.Seq, __ATOMIC_ACQUIRE);
-    const int32_t Ahead = (int32_t) (Seq - PostboxStatePtr->LastSeq);
-    const bool SameSeq = (Ahead == 0);
-    // Accept the next sequence for a normal request. A same-Seq request is only considered
-    // for an authenticated pb_stop: after a lost response the client reuses the last Seq, so
-    // the stop must work whether the driver processed the original request or not.
-    if (Ahead != 1 && !SameSeq)
+    const bool SameSeq = (static_cast<int32_t>(Seq - PostboxStatePtr->LastSeq) == 0);
+    // Sequence/session/nonce/idle rules live in Common/Postbox.h
+    // (PostboxSequenceVerdict) and are host-unit-tested.
+    const PostboxSeqVerdict SeqVerdict = PostboxSequenceVerdict(
+        Seq, PostboxStatePtr->LastSeq, Sealed.SessionId, PostboxStatePtr->SessionId,
+        Sealed.Nonce, PostboxStatePtr->LastNonce, Sealed.Ack);
+
+    if (SeqVerdict == PostboxSeqVerdict::Reject)
     {
         PostboxDeadTick();
         PostboxIdleTick();
@@ -2762,11 +2801,7 @@ static void PostboxPollAttached(void* MailboxProcess)
         return;
     }
 
-    // A valid idle header is the only unauthenticated state that keeps the watchdog
-    // alive: same session, same nonce, acknowledged sequence. A wrong-session or
-    // far-ahead header must not reset it.
-    if (Ahead == 0 && Sealed.SessionId == PostboxStatePtr->SessionId &&
-        Sealed.Nonce == PostboxStatePtr->LastNonce && Sealed.Ack == Seq)
+    if (SeqVerdict == PostboxSeqVerdict::Idle)
     {
         PostboxDeadReset();
         PostboxIdleTick();
@@ -2774,7 +2809,7 @@ static void PostboxPollAttached(void* MailboxProcess)
         return;
     }
 
-    if (Sealed.SessionId != PostboxStatePtr->SessionId || Sealed.Nonce <= PostboxStatePtr->LastNonce)
+    if (SeqVerdict == PostboxSeqVerdict::AuthFailure)
     {
         if (PostboxStatePtr->AuthFailures != 0xFFFFFFFFu) ++PostboxStatePtr->AuthFailures;
         PostboxDeadTick();
@@ -2813,8 +2848,8 @@ static void PostboxPollAttached(void* MailboxProcess)
                             || Op == pb_stack_probe
 #endif
                             ;
-    const bool SizeOk = Size <= StageBytes && (ZeroBodyOp ? Size == 0 : Size != 0);
-    if (!KnownOp || !SizeOk || (SameSeq && Op != pb_stop))
+    // Op/size/same-Seq rules live in Common/Postbox.h (PostboxRequestShapeOk).
+    if (!PostboxRequestShapeOk(KnownOp, ZeroBodyOp, Op, Size, StageBytes, SameSeq))
     {
         PostboxWipe(&Plain, sizeof(Plain));
         PostboxWipe(&Sealed, sizeof(Sealed));
@@ -2823,7 +2858,7 @@ static void PostboxPollAttached(void* MailboxProcess)
         return;
     }
 
-    const uint32_t BodyLen = (Op == pb_write) ? Size : 0;
+    const uint32_t BodyLen = PostboxRequestBodyLen(Op, Size);
     const uint32_t BodyBytes = (Op == pb_read || Op == pb_write) ? Size :
                                (Op == pb_nmi) ? (uint32_t) sizeof(uint64_t) :
 #ifdef NMI_PROBE
@@ -2881,16 +2916,9 @@ static void PostboxPollAttached(void* MailboxProcess)
     {
         // The prototype is self-process only: the target is the mailbox owner. This keeps
         // the channel from becoming an arbitrary-process R/W primitive for anyone who can
-        // write the mailbox. Cross-process access needs an allowlist.
-        const bool InRange = Address && Address < PostboxUserLimit && Size <= StageBytes &&
-                             Address <= (PostboxUserLimit - 1 - Size);
-        // A write into the mailbox's own 0x40-byte header can clobber Seq/Ack/Status
-        // mid-request; reject any write range that overlaps it.
-        const bool OverlapsHeader = InRange && Op == pb_write && Size != 0 &&
-                                    Address < MailboxVa + PostboxDataAt &&
-                                    Address + Size > MailboxVa;
-
-        if (!InRange || OverlapsHeader)
+        // write the mailbox. Cross-process access needs an allowlist. The range and
+        // header-overlap rules live in Common/Postbox.h (PostboxRequestRangeOk).
+        if (!PostboxRequestRangeOk(Op, Size, Address, MailboxVa, StageBytes))
         {
             Status = (int32_t) 0xC000000D;          // STATUS_INVALID_PARAMETER
         }
@@ -3549,5 +3577,454 @@ void PostboxStop()
     print(INFO("Postbox: stopped"));
     __atomic_store_n(&PostboxTeardown, 0, __ATOMIC_RELEASE);
 }
+
+#ifdef DEBUG
+// ---------------------------------------------------------------------------
+// Debug-only kernel self-tests (DriverEntry step 6.5, after PostboxStart).
+// Release builds compile these out; both the calls and the functions vanish.
+//
+// These cover the kernel-only state/auth paths the host suite cannot execute:
+//   * VerifyPostboxStateWipe   - start consumed and wiped the config copy, the
+//                                derived keys are live, the state page owns the
+//                                stage/imports, and PostboxWipe is an all-byte
+//                                volatile wipe.
+//   * VerifyPostboxRequestAuth - the live keys/session accept a correctly
+//                                sealed request and reject every tamper, using
+//                                the same MacRequestTag/OpenRequestHeader path
+//                                PostboxPollAttached uses.
+//   * VerifyPostboxRespondTag  - a response tag built the way PostboxRespond
+//                                builds it verifies client-side, and covers
+//                                status/ack/body.
+// ---------------------------------------------------------------------------
+
+static bool PostboxSelfTestBytesZero(const void* Data, size_t Size)
+{
+    const volatile uint8_t* p = (const volatile uint8_t*) Data;
+    while (Size--)
+        if (*p++) return false;
+    return true;
+}
+
+static bool PostboxSelfTestBytesEqual(const void* A, const void* B, size_t Size)
+{
+    const uint8_t* a = (const uint8_t*) A;
+    const uint8_t* b = (const uint8_t*) B;
+    for (size_t i = 0; i < Size; ++i)
+        if (a[i] != b[i]) return false;
+    return true;
+}
+
+bool VerifyPostboxStateWipe()
+{
+    if (!PostboxStatePtr)
+    {
+        print(ERROR("VerifyPostboxStateWipe: no state page"));
+        return false;
+    }
+
+    bool Ok = true;
+
+    // PostboxStart consumed Pid/CreateTime and wiped the whole config copy.
+    if (!PostboxSelfTestBytesZero(&PostboxStatePtr->Cfg, sizeof(PostboxConfig)))
+    {
+        print(ERROR("VerifyPostboxStateWipe: config copy is still resident"));
+        Ok = false;
+    }
+
+    // Live key material must be present: an all-zero key would make every MAC
+    // forgeable, and DerivePostboxKeys must have wiped its master.
+    bool KeyNonZero = false;
+    const uint8_t* Keys = (const uint8_t*) &PostboxStatePtr->Keys;
+    for (uint32_t i = 0; i < sizeof(PostboxStatePtr->Keys); ++i)
+        KeyNonZero |= (Keys[i] != 0);
+    if (!KeyNonZero)
+    {
+        print(ERROR("VerifyPostboxStateWipe: derived keys are all zero"));
+        Ok = false;
+    }
+
+    if (!PostboxStatePtr->SessionId || !PostboxStatePtr->MailboxVa ||
+        !PostboxStatePtr->Stage || !PostboxStatePtr->Process)
+    {
+        print(ERROR("VerifyPostboxStateWipe: start state incomplete"));
+        Ok = false;
+    }
+    if (!PostboxStatePtr->Imports.MmCopyVirtualMemory ||
+        !PostboxStatePtr->Imports.PsLookupProcessByProcessId ||
+        !PostboxStatePtr->Imports.ExAllocatePoolWithTag ||
+        !PostboxStatePtr->Imports.ExFreePool ||
+        !PostboxStatePtr->Imports.MmFreeIndependentPages)
+    {
+        print(ERROR("VerifyPostboxStateWipe: import table incomplete"));
+        Ok = false;
+    }
+
+    // PostboxWipe must zero every byte (volatile; not elidable) and accept null.
+    uint8_t Scratch[64];
+    for (uint32_t i = 0; i < sizeof(Scratch); ++i)
+        Scratch[i] = 0xA5;
+    PostboxWipe(Scratch, sizeof(Scratch));
+    if (!PostboxSelfTestBytesZero(Scratch, sizeof(Scratch)))
+    {
+        print(ERROR("VerifyPostboxStateWipe: PostboxWipe left bytes"));
+        Ok = false;
+    }
+    PostboxWipe(nullptr, sizeof(Scratch));       // must be a no-op
+
+    return Ok;
+}
+
+bool VerifyPostboxRequestAuth()
+{
+    if (!PostboxStatePtr) return false;
+
+    bool Ok = true;
+    pb::PostboxKeys Keys = PostboxStatePtr->Keys;      // stack copy, wiped below
+    const uint64_t SessionId = PostboxStatePtr->SessionId;
+    const uint64_t Nonce = 0x1122334455667788ull;
+    const uint32_t Seq = 1;
+
+    uint8_t Body[0x40];
+    uint8_t PlainBody[sizeof(Body)];
+    for (uint32_t i = 0; i < sizeof(Body); ++i)
+        Body[i] = PlainBody[i] = (uint8_t) (i * 7 + 1);
+
+    if (!pb::SealRequestBody(Body, sizeof(Body), Keys, SessionId, Nonce))
+    {
+        print(ERROR("VerifyPostboxRequestAuth: body seal failed"));
+        PostboxWipe(&Keys, sizeof(Keys));
+        return false;
+    }
+
+    PostboxHeader Header{};
+    pb::HeaderSetSeq((uint8_t*) &Header, Seq);
+    Header.Op = pb_write;
+    Header.Pid = 1234;
+    Header.Size = sizeof(Body);
+    Header.Address = 0x700000001000ull;
+    pb::HeaderSetNonce64((uint8_t*) &Header, Nonce);
+    pb::HeaderSetSessionId((uint8_t*) &Header, SessionId);
+    if (!pb::SealRequestHeader((uint8_t*) &Header, Keys, SessionId, Nonce))
+    {
+        print(ERROR("VerifyPostboxRequestAuth: header seal failed"));
+        PostboxWipe(&Keys, sizeof(Keys));
+        PostboxWipe(Body, sizeof(Body));
+        return false;
+    }
+
+    uint8_t Tag[16];
+    pb::MacRequestTag(Tag, Keys, SessionId, Seq, Nonce, pb_write,
+                      (const uint8_t*) &Header, Body, sizeof(Body));
+
+    // The poll recomputes exactly this tag and compares with Mac128Equal.
+    uint8_t Check[16];
+    pb::MacRequestTag(Check, Keys, SessionId, Seq, Nonce, pb_write,
+                      (const uint8_t*) &Header, Body, sizeof(Body));
+    if (!pb::Mac128Equal(Tag, Check))
+    {
+        print(ERROR("VerifyPostboxRequestAuth: request tag not stable"));
+        Ok = false;
+    }
+
+    // The sealed header opens back to the wire values the poll acts on.
+    PostboxHeader Opened = Header;
+    if (!pb::OpenRequestHeader((uint8_t*) &Opened, Keys, SessionId, Nonce) ||
+        Opened.Op != pb_write || Opened.Pid != 1234 ||
+        Opened.Size != sizeof(Body) || Opened.Address != 0x700000001000ull)
+    {
+        print(ERROR("VerifyPostboxRequestAuth: header open mismatch"));
+        Ok = false;
+    }
+    uint8_t OpenedBody[sizeof(Body)];
+    for (uint32_t i = 0; i < sizeof(Body); ++i)
+        OpenedBody[i] = Body[i];
+    if (!pb::OpenRequestBody(OpenedBody, sizeof(OpenedBody), Keys, SessionId, Nonce) ||
+        !PostboxSelfTestBytesEqual(OpenedBody, PlainBody, sizeof(Body)))
+    {
+        print(ERROR("VerifyPostboxRequestAuth: body open mismatch"));
+        Ok = false;
+    }
+
+    // Tampered body ciphertext -> different tag.
+    uint8_t Tampered[sizeof(Body)];
+    for (uint32_t i = 0; i < sizeof(Body); ++i)
+        Tampered[i] = Body[i];
+    Tampered[3] ^= 0x01;
+    pb::MacRequestTag(Check, Keys, SessionId, Seq, Nonce, pb_write,
+                      (const uint8_t*) &Header, Tampered, sizeof(Tampered));
+    if (pb::Mac128Equal(Check, Tag))
+    {
+        print(ERROR("VerifyPostboxRequestAuth: tampered body accepted"));
+        Ok = false;
+    }
+
+    // Tampered sealed header -> different tag.
+    PostboxHeader TamperedHeader = Header;
+    ((uint8_t*) &TamperedHeader)[pb::kHeaderCipherOffset + 4] ^= 0x80;
+    pb::MacRequestTag(Check, Keys, SessionId, Seq, Nonce, pb_write,
+                      (const uint8_t*) &TamperedHeader, Body, sizeof(Body));
+    if (pb::Mac128Equal(Check, Tag))
+    {
+        print(ERROR("VerifyPostboxRequestAuth: tampered header accepted"));
+        Ok = false;
+    }
+
+    // Wrong session / sequence / nonce -> different tag.
+    pb::MacRequestTag(Check, Keys, SessionId + 1, Seq, Nonce, pb_write,
+                      (const uint8_t*) &Header, Body, sizeof(Body));
+    if (pb::Mac128Equal(Check, Tag))
+    {
+        print(ERROR("VerifyPostboxRequestAuth: wrong session accepted"));
+        Ok = false;
+    }
+    pb::MacRequestTag(Check, Keys, SessionId, Seq + 1, Nonce, pb_write,
+                      (const uint8_t*) &Header, Body, sizeof(Body));
+    if (pb::Mac128Equal(Check, Tag))
+    {
+        print(ERROR("VerifyPostboxRequestAuth: wrong sequence accepted"));
+        Ok = false;
+    }
+    pb::MacRequestTag(Check, Keys, SessionId, Seq, Nonce + 1, pb_write,
+                      (const uint8_t*) &Header, Body, sizeof(Body));
+    if (pb::Mac128Equal(Check, Tag))
+    {
+        print(ERROR("VerifyPostboxRequestAuth: wrong nonce accepted"));
+        Ok = false;
+    }
+
+    // A read request does not cover the body: a different body yields the same
+    // tag, and the read tag differs from the write tag.
+    uint8_t ReadA[16];
+    uint8_t ReadB[16];
+    pb::MacRequestTag(ReadA, Keys, SessionId, Seq, Nonce, pb_read,
+                      (const uint8_t*) &Header, Body, sizeof(Body));
+    pb::MacRequestTag(ReadB, Keys, SessionId, Seq, Nonce, pb_read,
+                      (const uint8_t*) &Header, Tampered, sizeof(Tampered));
+    if (!pb::Mac128Equal(ReadA, ReadB))
+    {
+        print(ERROR("VerifyPostboxRequestAuth: read tag covers the body"));
+        Ok = false;
+    }
+    if (pb::Mac128Equal(ReadA, Tag))
+    {
+        print(ERROR("VerifyPostboxRequestAuth: read and write tags collide"));
+        Ok = false;
+    }
+
+    // Poll sequence arithmetic: accept only Ahead == 1, and the uint32
+    // subtraction must wrap (LastSeq = 0xFFFFFFFF, Seq = 0 -> ahead 1).
+    if ((int32_t) (1u - 0u) != 1 || (int32_t) (0u - 0xFFFFFFFFu) != 1 ||
+        (int32_t) (2u - 0u) == 1)
+    {
+        print(ERROR("VerifyPostboxRequestAuth: sequence arithmetic changed"));
+        Ok = false;
+    }
+
+    PostboxWipe(&Keys, sizeof(Keys));
+    PostboxWipe(&Header, sizeof(Header));
+    PostboxWipe(&Opened, sizeof(Opened));
+    PostboxWipe(&TamperedHeader, sizeof(TamperedHeader));
+    PostboxWipe(Body, sizeof(Body));
+    PostboxWipe(PlainBody, sizeof(PlainBody));
+    PostboxWipe(OpenedBody, sizeof(OpenedBody));
+    PostboxWipe(Tampered, sizeof(Tampered));
+    PostboxWipe(Tag, sizeof(Tag));
+    PostboxWipe(Check, sizeof(Check));
+    PostboxWipe(ReadA, sizeof(ReadA));
+    PostboxWipe(ReadB, sizeof(ReadB));
+    return Ok;
+}
+
+bool VerifyPostboxRespondTag()
+{
+    if (!PostboxStatePtr) return false;
+
+    bool Ok = true;
+    pb::PostboxKeys Keys = PostboxStatePtr->Keys;      // stack copy, wiped below
+    const uint64_t SessionId = PostboxStatePtr->SessionId;
+    const uint64_t Nonce = 0x8877665544332211ull;
+    const uint32_t Seq = 2;
+    const int32_t Status = 0;
+    const uint32_t RequestOp = pb_read;
+    uint8_t Body[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+
+    // PostboxRespond publishes Seq/Ack/Status/Nonce/Mac/SessionId; the tag is
+    // MacResponseTag over (Seq, Seq, Status, Nonce, RequestOp, Body).
+    PostboxHeader Response{};
+    pb::HeaderSetSeq((uint8_t*) &Response, Seq);
+    pb::HeaderSetAck((uint8_t*) &Response, Seq);
+    pb::HeaderSetStatus((uint8_t*) &Response, Status);
+    pb::HeaderSetNonce64((uint8_t*) &Response, Nonce);
+    pb::HeaderSetSessionId((uint8_t*) &Response, SessionId);
+
+    uint8_t Tag[16];
+    pb::MacResponseTag(Tag, Keys, SessionId, Seq, Seq, Status, Nonce, RequestOp,
+                       Body, sizeof(Body));
+    pb::HeaderSetMac((uint8_t*) &Response, Tag);
+
+    // Client-side verification recomputes from the published header fields.
+    uint8_t Client[16];
+    pb::MacResponseTag(Client, Keys, SessionId,
+                       pb::HeaderSeq((const uint8_t*) &Response),
+                       pb::HeaderAck((const uint8_t*) &Response),
+                       pb::HeaderStatus((const uint8_t*) &Response),
+                       pb::HeaderNonce64((const uint8_t*) &Response),
+                       RequestOp, Body, sizeof(Body));
+    if (!pb::Mac128Equal(Tag, Client))
+    {
+        print(ERROR("VerifyPostboxRespondTag: response tag does not verify"));
+        Ok = false;
+    }
+    if (pb::HeaderAck((const uint8_t*) &Response) != Seq)
+    {
+        print(ERROR("VerifyPostboxRespondTag: Ack != Seq"));
+        Ok = false;
+    }
+
+    // Status, Ack and the body are covered.
+    uint8_t Check[16];
+    pb::MacResponseTag(Check, Keys, SessionId, Seq, Seq, (int32_t) 0xC0000005,
+                       Nonce, RequestOp, Body, sizeof(Body));
+    if (pb::Mac128Equal(Check, Tag))
+    {
+        print(ERROR("VerifyPostboxRespondTag: status not covered"));
+        Ok = false;
+    }
+    pb::MacResponseTag(Check, Keys, SessionId, Seq, Seq + 1, Status, Nonce,
+                       RequestOp, Body, sizeof(Body));
+    if (pb::Mac128Equal(Check, Tag))
+    {
+        print(ERROR("VerifyPostboxRespondTag: ack not covered"));
+        Ok = false;
+    }
+    uint8_t Tampered[sizeof(Body)];
+    for (uint32_t i = 0; i < sizeof(Body); ++i)
+        Tampered[i] = Body[i];
+    Tampered[0] ^= 0x01;
+    pb::MacResponseTag(Check, Keys, SessionId, Seq, Seq, Status, Nonce, RequestOp,
+                       Tampered, sizeof(Tampered));
+    if (pb::Mac128Equal(Check, Tag))
+    {
+        print(ERROR("VerifyPostboxRespondTag: body not covered"));
+        Ok = false;
+    }
+
+    // Request/response domain separation: the same numeric inputs must not
+    // produce the same tag in the two directions.
+    uint8_t Request[16];
+    pb::MacRequestTag(Request, Keys, SessionId, Seq, Nonce, RequestOp,
+                      (const uint8_t*) &Response, nullptr, 0);
+    if (pb::Mac128Equal(Request, Tag))
+    {
+        print(ERROR("VerifyPostboxRespondTag: request/response domains collide"));
+        Ok = false;
+    }
+
+    PostboxWipe(&Keys, sizeof(Keys));
+    PostboxWipe(&Response, sizeof(Response));
+    PostboxWipe(Body, sizeof(Body));
+    PostboxWipe(Tampered, sizeof(Tampered));
+    PostboxWipe(Tag, sizeof(Tag));
+    PostboxWipe(Client, sizeof(Client));
+    PostboxWipe(Check, sizeof(Check));
+    PostboxWipe(Request, sizeof(Request));
+    return Ok;
+}
+
+bool VerifyPostboxResolveNames()
+{
+    if (!PostboxStatePtr)
+    {
+        print(ERROR("VerifyPostboxResolveNames: no state page"));
+        return false;
+    }
+
+    bool Ok = true;
+    const PostboxImports& I = PostboxStatePtr->Imports;
+    const struct { const char* Name; address Value; } Slots[] = {
+        {"KeInitializeTimerEx", I.KeInitializeTimerEx},
+        {"KeInitializeDpc", I.KeInitializeDpc},
+        {"KeSetCoalescableTimer", I.KeSetCoalescableTimer},
+        {"KeCancelTimer", I.KeCancelTimer},
+        {"KeFlushQueuedDpcs", I.KeFlushQueuedDpcs},
+        {"ExQueueWorkItem", I.ExQueueWorkItem},
+        {"PsLookupProcessByProcessId", I.PsLookupProcessByProcessId},
+        {"ObDereferenceObject", I.ObDereferenceObject},
+        {"KeDelayExecutionThread", I.KeDelayExecutionThread},
+        {"PsGetProcessCreateTimeQuadPart", I.PsGetProcessCreateTimeQuadPart},
+        {"ExAllocatePoolWithTag", I.ExAllocatePoolWithTag},
+        {"ExFreePool", I.ExFreePool},
+        {"MmCopyVirtualMemory", I.MmCopyVirtualMemory},
+        {"PsGetCurrentProcess", I.PsGetCurrentProcess},
+        {"PsAcquireProcessExitSynchronization", I.PsAcquireProcessExitSynchronization},
+        {"PsReleaseProcessExitSynchronization", I.PsReleaseProcessExitSynchronization},
+        {"PsCreateSystemThread", I.PsCreateSystemThread},
+        {"ZwClose", I.ZwClose},
+        {"MmAllocateIndependentPages", I.MmAllocateIndependentPages},
+        {"MmSetPageProtection", I.MmSetPageProtection},
+        {"MmFreeIndependentPages", I.MmFreeIndependentPages},
+    };
+    for (const auto& S : Slots)
+    {
+        if (static_cast<uintptr_t>(S.Value) == 0)
+        {
+            print(ERROR("VerifyPostboxResolveNames: %s unresolved"), S.Name);
+            Ok = false;
+        }
+    }
+
+    // PostboxResolve decodes each name into a stack buffer and wipes it; a
+    // non-null import slot is the proof that every name decoded and resolved.
+    return Ok;
+}
+
+bool VerifyPostboxStage()
+{
+    if (!PostboxStatePtr)
+    {
+        print(ERROR("VerifyPostboxStage: no state page"));
+        return false;
+    }
+
+    bool Ok = true;
+    if (!PostboxStatePtr->Stage)
+    {
+        print(ERROR("VerifyPostboxStage: stage is null"));
+        Ok = false;
+    }
+    if (!PostboxStatePtr->StageIndependent)
+    {
+        print(ERROR("VerifyPostboxStage: stage is not an independent allocation"));
+        Ok = false;
+    }
+    if (!PostboxStatePtr->ReaperBase || !PostboxStatePtr->ReaperSize)
+    {
+        print(ERROR("VerifyPostboxStage: reaper range is empty"));
+        Ok = false;
+    }
+    if (StageBytes != PostboxDataMax || StageAllocBytes != 0x10000)
+    {
+        print(ERROR("VerifyPostboxStage: stage size constants changed"));
+        Ok = false;
+    }
+    return Ok;
+}
+
+bool VerifyPostboxSelfTest()
+{
+    bool Ok = true;
+    if (!VerifyPostboxStateWipe()) Ok = false;
+    if (!VerifyPostboxResolveNames()) Ok = false;
+    if (!VerifyPostboxStage()) Ok = false;
+    if (!VerifyPostboxRequestAuth()) Ok = false;
+    if (!VerifyPostboxRespondTag()) Ok = false;
+
+    if (Ok)
+        print(INFO("Postbox: DEBUG self-tests passed"));
+    else
+        print(ERROR("Postbox: DEBUG self-tests failed"));
+    return Ok;
+}
+#endif
 
 #endif // POSTBOX_CHANNEL

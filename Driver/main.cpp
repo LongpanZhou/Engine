@@ -2,6 +2,7 @@
 // is the definition order, so each file may only use what the files above it provide
 #include "Lib/structs.h"   // kernel struct layouts and the vendor's arch types (address, cr3, ...)
 #include "Lib/utils.h"     // print() and the INFO/OK/WARN/ERROR macros
+#include "Lib/pure.h"      // host-testable helpers: WideEqualsIgnoreCase, IsObjectKernelPointer
 
 // arch and intrin names are used unqualified in every file below
 using namespace arch;
@@ -172,6 +173,29 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
     if (!VerifyMemory()) print(WARN("DriverEntry: VerifyMemory() reported failures (see output above)"));
 #endif
 
+    // Debug-only self-test: the pre-start ntoskrnl data-export cache must match the
+    // import slots, and the SEED-XOR name decode must recover the plaintext.
+#ifdef DEBUG
+    print(INFO("DriverEntry: step 0.7 VerifyMemSetPreStartNtoskrnl()"));
+    if (!VerifyMemSetPreStartNtoskrnl((uint64_t) (uintptr_t) GetNtoskrnl()))
+        print(ERROR("DriverEntry: VerifyMemSetPreStartNtoskrnl() failed"));
+#endif
+
+    // Debug-only self-test: EPROCESS/module enumeration against the kernel anchors.
+#ifdef DEBUG
+    print(INFO("DriverEntry: step 0.8 VerifyProcessEnumeration()"));
+    if (!VerifyProcessEnumeration())
+        print(ERROR("DriverEntry: VerifyProcessEnumeration() failed"));
+#endif
+
+    // Debug-only self-test: the lazy export walk against the real ntoskrnl
+    // export table and the loader's import slots.
+#ifdef DEBUG
+    print(INFO("DriverEntry: step 0.9 VerifyFindFuncExports()"));
+    if (!VerifyFindFuncExports(GetNtoskrnl()))
+        print(ERROR("DriverEntry: VerifyFindFuncExports() failed"));
+#endif
+
     // Step 1: start the command channel. The default build uses the shared-memory section;
     // Step 1: the default shared-memory channel starts here. The POSTBOX_CHANNEL build
     // starts its timer at the end of the entry, after the image and the loader state are
@@ -184,6 +208,11 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
         return static_cast<win::ntstatus>(0xC0000001);
     }
     print(INFO("DriverEntry: step 1 ChannelStart() ok"));
+#ifdef DEBUG
+    print(INFO("DriverEntry: step 1.5 VerifyChannelHeader/Loopback()"));
+    if (!VerifyChannelHeader() || !VerifyChannelLoopback())
+        print(ERROR("DriverEntry: channel self-test failed"));
+#endif
 #endif
 
     // The dedicated mapping table (compile-time switch in Mem.cpp). If linking fails at runtime the
@@ -194,6 +223,27 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
         bool Linked = LinkMapTable();
         print(INFO("DriverEntry: step 2 LinkMapTable() returned %u"), (uint32_t) Linked);
     }
+
+#ifndef MANUAL_MAP_ONLY
+#ifdef DEBUG
+    // Debug-only self-tests for the SCM/default-channel profile. The manual-map
+    // Postbox build excludes Hide.cpp/Traces.cpp and has no loader entry.
+    if (DriverObject)
+    {
+        print(INFO("DriverEntry: step 2.5 VerifyModuleListRoundTrip()"));
+        if (!VerifyModuleListRoundTrip(DriverObject))
+            print(ERROR("DriverEntry: VerifyModuleListRoundTrip() failed"));
+
+        print(INFO("DriverEntry: step 2.6 VerifyPeHeaderRoundTrip()"));
+        if (!VerifyPeHeaderRoundTrip(DriverObject))
+            print(ERROR("DriverEntry: VerifyPeHeaderRoundTrip() failed"));
+
+        print(INFO("DriverEntry: step 2.7 VerifyEmptyTraceState()"));
+        if (!VerifyEmptyTraceState(DriverObject))
+            print(ERROR("DriverEntry: VerifyEmptyTraceState() failed"));
+    }
+#endif
+#endif
 
 #ifndef MANUAL_MAP_ONLY
     // Set before the unlink, so an unload only undoes what DriverEntry actually did. A manually mapped driver
@@ -249,6 +299,14 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
             0xC0000000u | (PostboxStartFailure ? PostboxStartFailure : 30u));
     }
     print(INFO("DriverEntry: step 6 PostboxStart() ok"));
+
+    // Debug-only self-test: the live state page, the request-auth path and the
+    // response tag, all against the keys PostboxStart derived.
+#ifdef DEBUG
+    print(INFO("DriverEntry: step 6.5 VerifyPostboxSelfTest()"));
+    if (!VerifyPostboxSelfTest())
+        print(ERROR("DriverEntry: VerifyPostboxSelfTest() failed"));
+#endif
 #endif
 
     print(INFO("DriverEntry: success"));

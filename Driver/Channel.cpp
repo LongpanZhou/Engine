@@ -68,6 +68,12 @@ static constexpr uint32_t kThreadAllAccess = 0x001FFFFF;
 static constexpr uint32_t kObjCaseInsensitive = 0x00000040;
 static constexpr uint32_t kObjKernelHandle = 0x00000200;
 
+// Request validation. PID 4 is the System process: its CR3 maps the kernel half,
+// so accepting it turns a user R/W request into a kernel R/W primitive. The user
+// range ends below 0x00007FFFFFFF0000 on x64; anything at or above it is kernel.
+static constexpr uint32_t kSystemProcessId = 4;
+static constexpr uint64_t kUserAddressLimit = 0x00007FFFFFFF0000ull;
+
 // Runs one request that is already visible in the section
 static void ChannelProcess(ChannelHeader* Header)
 {
@@ -86,6 +92,17 @@ static void ChannelProcess(ChannelHeader* Header)
     }
 
     if (!Header->RemoteAddress || !Header->TargetPid || Header->Size > ChannelDataMax)
+    {
+        Header->Status = (int32_t) 0xC000000D;   // STATUS_INVALID_PARAMETER
+        return;
+    }
+
+    // Refuse the kernel half and the System process. The channel is a user-memory
+    // service; a request that names PID 4 or a kernel VA is not a valid client
+    // request and must not reach AccessVirtualMemory.
+    if (Header->TargetPid == kSystemProcessId ||
+        Header->RemoteAddress >= kUserAddressLimit ||
+        Header->Size > kUserAddressLimit - Header->RemoteAddress)
     {
         Header->Status = (int32_t) 0xC000000D;   // STATUS_INVALID_PARAMETER
         return;
@@ -277,6 +294,62 @@ bool ChannelStart()
 // Stops the worker, then releases the view and the section object. Only the SCM
 // path reaches this today; a manually mapped image has no unload callback, so
 // its thread lives until the machine goes down.
+#ifdef DEBUG
+// Debug-only self-tests: the section header is live and a ping completes
+// through the worker thread (header -> ChannelProcess -> Ack/Heartbeat).
+bool VerifyChannelHeader()
+{
+    if (!ChannelBase)
+    {
+        print(ERROR("VerifyChannel: no section mapping"));
+        return false;
+    }
+    auto* Header = (ChannelHeader*) ChannelBase;
+    if (Header->Magic != ChannelMagic)
+    {
+        print(ERROR("VerifyChannel: magic 0x%X != 0x%X"),
+              Header->Magic, ChannelMagic);
+        return false;
+    }
+    print(OK("VerifyChannel: header magic 0x%X"), Header->Magic);
+    return true;
+}
+
+bool VerifyChannelLoopback()
+{
+    if (!ChannelBase) return false;
+    auto* Header = (ChannelHeader*) ChannelBase;
+
+    const uint64_t Before = __atomic_load_n(&Header->Heartbeat, __ATOMIC_ACQUIRE);
+    const uint32_t Seq = __atomic_load_n(&Header->Sequence, __ATOMIC_ACQUIRE) + 1;
+    Header->Op = op_ping;
+    Header->Status = 0;
+    __atomic_store_n(&Header->Sequence, Seq, __ATOMIC_RELEASE);
+
+    for (uint32_t i = 0; i < 100; ++i)
+    {
+        if (__atomic_load_n(&Header->Ack, __ATOMIC_ACQUIRE) == Seq)
+        {
+            const uint64_t After = __atomic_load_n(&Header->Heartbeat, __ATOMIC_ACQUIRE);
+            if (Header->Status != 0 || After != Before + 1)
+            {
+                print(ERROR("VerifyChannel: ping ack mismatch (status 0x%X, heartbeat %llu -> %llu)"),
+                      Header->Status, (unsigned long long) Before,
+                      (unsigned long long) After);
+                return false;
+            }
+            print(OK("VerifyChannel: ping loopback passed"));
+            return true;
+        }
+        int64_t Interval = -10000;                  // 1 ms
+        ((FnKeDelayExecutionThread) ChannelDelayThread)(0, 0, &Interval);
+    }
+
+    print(ERROR("VerifyChannel: ping timed out"));
+    return false;
+}
+#endif
+
 void ChannelStop()
 {
     if (__atomic_load_n(&ChannelRunning, __ATOMIC_ACQUIRE))

@@ -39,5 +39,13 @@ address ScanModuleImage(address Base, const char *Sig, size_t Size)
 template<size_t N>
 address ScanModuleImage(address Base, const Pattern<N> &Sig)
 {
+    // A malformed signature must never scan as a real byte pattern. The
+    // constexpr check in Strings.h catches it at build time; this is the
+    // runtime guard for a pattern built from non-constant input.
+    if (!Sig.Valid)
+    {
+        print(ERROR("ScanModuleImage: invalid signature"));
+        return nullptr;
+    }
     return ScanModuleImage(Base, Sig.data(), Sig.Length);
 }
