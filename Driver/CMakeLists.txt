@@ -38,10 +38,10 @@ if(MAPPED_SAFE)
     list(APPEND VARIANT_DEFINES NO_MAP_TABLE)
 endif()
 
-# Channel selection: the default is the named-section/system-thread channel in Channel.cpp.
-# POSTBOX_CHANNEL replaces it with the timer/work-item mailbox (AC-25). The Postbox build is
-# manual-map only: the entry's second argument is a PostboxConfig, not a provider image name.
-option(POSTBOX_CHANNEL "Use the timer/work-item Postbox channel instead of the named section" OFF)
+# Channel selection: the default is the stealth Postbox build (timer/work-item
+# mailbox). Set POSTBOX_CHANNEL=OFF for the legacy named-section/system-thread
+# channel in Channel.cpp (then also set MANUAL_MAP_ONLY=OFF).
+option(POSTBOX_CHANNEL "Use the timer/work-item Postbox channel instead of the named section" ON)
 if(POSTBOX_CHANNEL)
     list(APPEND VARIANT_DEFINES POSTBOX_CHANNEL)
 endif()
@@ -50,7 +50,7 @@ endif()
 # loader trace cleaners (Traces.cpp) and the hide/relink code (Hide.cpp), and stub
 # DriverExit to stop the timer and unlink the map table only. This removes dead
 # cleaner/lineage code from the mapped image.
-option(MANUAL_MAP_ONLY "Build a manual-map-only driver (requires POSTBOX_CHANNEL)" OFF)
+option(MANUAL_MAP_ONLY "Build a manual-map-only driver (requires POSTBOX_CHANNEL)" ON)
 if(MANUAL_MAP_ONLY)
     if(NOT POSTBOX_CHANNEL)
         message(FATAL_ERROR "MANUAL_MAP_ONLY requires POSTBOX_CHANNEL=ON")
@@ -215,7 +215,7 @@ target_link_options(Driver
 # environment instead of storing it in this file. Signing is skipped (with a warning) when either is missing.
 # The lab PFX subject names the developer ("WDKTestCert <user>,..."), which is a T7 artifact; a manual-map
 # payload does not need a signature, so deployments can configure -DDRIVER_SIGNING=OFF or replace the PFX.
-option(DRIVER_SIGNING "Sign Driver.sys with TestSign.pfx when the password is set" ON)
+option(DRIVER_SIGNING "Sign Driver.sys with TestSign.pfx when the password is set" OFF)
 find_program(SIGNTOOL signtool
         PATHS "C:/Program Files (x86)/Windows Kits/10/bin/x86"
               "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x86"
@@ -236,7 +236,7 @@ endif()
 # Deployment guard: STEALTH_PROFILE=ON fails the configure unless every switch that
 # scans back is in its shipped state, so a lab variant can never be mistaken for a
 # deployment build. Lab experiments leave it off and configure normally.
-option(STEALTH_PROFILE "Fail the configure unless this is a stealth deployment build" OFF)
+option(STEALTH_PROFILE "Fail the configure unless this is a stealth deployment build" ON)
 if(STEALTH_PROFILE)
     if(DEBUG_BUILD)
         message(FATAL_ERROR "STEALTH_PROFILE=ON requires DEBUG_BUILD=OFF (print() is a shipped-image giveaway)")
