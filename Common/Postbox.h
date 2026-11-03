@@ -252,3 +252,291 @@ static_assert(offsetof(PostboxConfig, MmSetPageProtection) == 0x50,
 static_assert(offsetof(PostboxConfig, Layout) == 0x58, "Layout offset changed");
 static_assert(offsetof(PostboxConfig, MmFreeIndependentPages) == 0x108,
               "MmFreeIndependentPages offset changed");
+
+// ---------------------------------------------------------------------------
+// Shared config validation (build fix for the clean HEAD tree).
+//
+// The committed PostboxStart/PostboxCopy paths reference PostboxConfigValid and
+// PostboxUserLimit, but the clean HEAD header does not define them. These are
+// the same pure checks the working tree carries; they run before any kernel
+// work and return the PostboxStartFailure entry code (30) on a bad config.
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t PostboxConfigVersion = 4;
+constexpr uint32_t PostboxConfigReservedIndependent = 1;
+
+// MmCopyMemory's documented user path stops below MmUserProbeAddress, not at
+// 2^47. Use the tighter bound for every mailbox/target range check.
+constexpr uint64_t PostboxUserLimit = 0x00007FFFFFFF0000ull;
+
+// Page-flag precedence when several sections share one page: executable wins
+// (never downgrade a code page), then writable, else read-only/NX.
+inline uint32_t PostboxMergePageFlags(uint32_t Current, uint32_t Incoming)
+{
+    if (Incoming == PostboxPageRx) return PostboxPageRx;
+    if (Incoming == PostboxPageRwNx && Current != PostboxPageRx) return PostboxPageRwNx;
+    return Current;
+}
+
+// Protocol body lengths shared by the driver poll and the client, so the two
+// sides cannot drift. A request carries a body only for pb_write.
+inline uint32_t PostboxRequestBodyLen(uint32_t Op, uint32_t Size)
+{
+    return Op == pb_write ? Size : 0;
+}
+
+// A response carries no body when the request failed; pb_read returns Size,
+// pb_nmi returns 8, and the probe/status ops return their fixed result structs.
+inline uint32_t PostboxResponseBodyLen(int32_t Status, uint32_t Op, uint32_t Size)
+{
+    if (Status != 0) return 0;
+    switch (Op)
+    {
+    case pb_read: return Size;
+    case pb_nmi:  return static_cast<uint32_t>(sizeof(uint64_t));
+#ifdef NMI_PROBE
+    case pb_nmi_probe:  return static_cast<uint32_t>(sizeof(PostboxNmiProbeResult));
+    case pb_nmi_status: return static_cast<uint32_t>(sizeof(PostboxNmiStatus));
+#endif
+#ifdef STACK_PROBE
+    case pb_stack_probe: return static_cast<uint32_t>(sizeof(PostboxStackProbeResult));
+#endif
+    default: return 0;
+    }
+}
+
+enum class PostboxSeqVerdict
+{
+    Reject,        // not the next sequence and not the same sequence
+    Idle,          // same Seq/session/nonce, already acknowledged: keepalive only
+    AuthFailure,   // session mismatch or nonce did not advance
+    Candidate,     // next Seq (or same-Seq stop candidate): open/MAC it
+};
+
+inline PostboxSeqVerdict PostboxSequenceVerdict(uint32_t Seq, uint32_t LastSeq,
+                                                uint64_t SessionId,
+                                                uint64_t ExpectedSessionId,
+                                                uint64_t Nonce, uint64_t LastNonce,
+                                                uint32_t Ack)
+{
+    const int32_t Ahead = static_cast<int32_t>(Seq - LastSeq);
+    const bool SameSeq = (Ahead == 0);
+
+    // Accept the next sequence for a normal request. A same-Seq request is only
+    // considered for an authenticated pb_stop: after a lost response the client
+    // reuses the last Seq, so the stop must work whether the driver processed
+    // the original request or not.
+    if (Ahead != 1 && !SameSeq) return PostboxSeqVerdict::Reject;
+
+    // A valid idle header is the only unauthenticated state that keeps the
+    // watchdog alive: same session, same nonce, acknowledged sequence. A
+    // wrong-session or far-ahead header must not reset it.
+    if (SameSeq && SessionId == ExpectedSessionId && Nonce == LastNonce && Ack == Seq)
+        return PostboxSeqVerdict::Idle;
+
+    if (SessionId != ExpectedSessionId || Nonce <= LastNonce)
+        return PostboxSeqVerdict::AuthFailure;
+
+    return PostboxSeqVerdict::Candidate;
+}
+
+// Pre-MAC shape check: known op, body-size rule (zero-body ops must be Size 0,
+// all others nonzero), and the same-Seq restriction to pb_stop.
+inline bool PostboxRequestShapeOk(bool KnownOp, bool ZeroBodyOp, uint32_t Op,
+                                  uint32_t Size, uint32_t StageBytes, bool SameSeq)
+{
+    const bool SizeOk = Size <= StageBytes && (ZeroBodyOp ? Size == 0 : Size != 0);
+    return KnownOp && SizeOk && !(SameSeq && Op != pb_stop);
+}
+
+// Post-MAC read/write range check: the target must be a user VA below
+// MmUserProbeAddress, the size must fit the stage, and a write must not
+// overlap the mailbox header (it would clobber Seq/Ack/Status mid-request).
+inline bool PostboxRequestRangeOk(uint32_t Op, uint32_t Size, uint64_t Address,
+                                  uint64_t MailboxVa, uint32_t StageBytes)
+{
+    if (Op != pb_read && Op != pb_write) return true;
+
+    const bool InRange = Address && Address < PostboxUserLimit && Size <= StageBytes &&
+                         Address <= (PostboxUserLimit - 1 - Size);
+    const bool OverlapsHeader = InRange && Op == pb_write && Size != 0 &&
+                                Address < MailboxVa + PostboxDataAt &&
+                                Address + Size > MailboxVa;
+    return InRange && !OverlapsHeader;
+}
+
+inline bool PostboxConfigValid(const PostboxConfig& cfg, uint32_t* error = nullptr)
+{
+    auto fail = [&]() { if (error) *error = 30; return false; };
+
+    if (cfg.Magic != PostboxConfigMagic || cfg.Version != PostboxConfigVersion ||
+        !cfg.Pid || !cfg.MailboxVa || !cfg.CreateTime || !cfg.SessionId)
+        return fail();
+    if (!cfg.Layout.NtoskrnlBase) return fail();
+    // The self-free reaper may only call MmFreeIndependentPages on an
+    // independent allocation; a pool image must fail closed.
+    if (!(cfg.Reserved & PostboxConfigReservedIndependent)) return fail();
+    if (cfg.MailboxVa > PostboxUserLimit - PostboxBytes || (cfg.MailboxVa & 7))
+        return fail();
+
+    bool keyNonZero = false;
+    for (uint32_t i = 0; i < sizeof(cfg.Key); ++i)
+        keyNonZero |= (cfg.Key[i] != 0);
+    if (!keyNonZero) return fail();
+
+    if (!cfg.MmAllocateIndependentPages || !cfg.MmSetPageProtection ||
+        !cfg.MmFreeIndependentPages)
+        return fail();
+
+    if (error) *error = 0;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// F1 Job-post ABI (test-only; POSTBOX_JOB builds).
+//
+// One map, one entry, N jobs, one teardown. The loader owns an unnamed
+// pagefile-backed section containing a PostboxJobBatch plus the job data. The
+// driver runs inline in the entry thread (the loader's dummy thread), copies
+// the batch to its stack, executes each job with MmCopyVirtualMemory, writes
+// the result records back, and returns. No timer, DPC, work item, thread, or
+// state page is created. TargetPid == 0 means the current (loader) process.
+// ---------------------------------------------------------------------------
+
+// Non-ASCII tags: the job config/batch must not add a plaintext "PBJ1"/"BJB1"
+// signature to the image or the section.
+constexpr uint32_t PostboxJobConfigMagic = 0x8F3A27C1;
+constexpr uint32_t PostboxJobConfigVersion = 1;
+constexpr uint32_t PostboxJobBatchMagic = 0x9B4D62E5;
+constexpr uint32_t PostboxJobBatchVersion = 1;
+constexpr uint64_t PostboxJobDoneMagic = 0xA7C3E91D5B28F064ull;
+constexpr uint32_t PostboxJobMax = 32;
+constexpr uint32_t PostboxJobMaxBytes = 0x10000;         // per job
+constexpr uint32_t PostboxJobSectionMax = 0x100000;      // 1 MiB
+
+enum PostboxJobOp : uint32_t
+{
+    pb_job_ping = 1,        // no data transfer; proves inline execution
+    pb_job_read = 2,        // target Address -> section DataOffset
+    pb_job_write = 3,       // section DataOffset -> target Address
+};
+
+struct PostboxJobRecord
+{
+    uint32_t Op;            // PostboxJobOp
+    uint32_t Status;        // out: NTSTATUS
+    uint32_t Size;          // in: bytes
+    uint32_t Done;          // out: bytes copied
+    uint64_t Address;       // target VA
+    uint64_t DataOffset;    // section offset for the data
+    uint64_t Reserved;
+};
+static_assert(sizeof(PostboxJobRecord) == 0x28, "job record ABI changed");
+
+struct PostboxJobBatch
+{
+    uint32_t Magic;                 // PostboxJobBatchMagic
+    uint32_t Version;               // PostboxJobBatchVersion
+    uint32_t Count;                 // 1..PostboxJobMax
+    uint32_t Flags;                 // must be 0
+    uint64_t TargetPid;             // 0 = current process
+    uint64_t TargetCreateTime;      // 0 = do not verify
+    uint64_t Nonce;                 // must match the config
+    uint64_t Reserved;
+    PostboxJobRecord Jobs[PostboxJobMax];
+};
+static_assert(sizeof(PostboxJobBatch) == 0x530, "job batch ABI changed");
+static_assert(offsetof(PostboxJobBatch, Jobs) == 0x30, "job batch Jobs offset changed");
+
+// Layout is deliberately at the same offset as PostboxConfig::Layout (0x58),
+// so the image-protection path can consume either config with one helper.
+struct PostboxJobConfig
+{
+    uint32_t Magic;                 // PostboxJobConfigMagic
+    uint32_t Version;               // PostboxJobConfigVersion
+    uint32_t Count;                 // must match the batch
+    uint32_t Reserved;
+    uint64_t SectionVa;             // loader VA of the job section
+    uint64_t SectionSize;           // bytes mapped at SectionVa
+    uint64_t TargetPid;             // 0 = current process
+    uint64_t TargetCreateTime;      // 0 = do not verify
+    uint64_t Nonce;                 // binds this config to the batch
+    uint8_t Key[32];                // reserved for a future batch MAC; zero now
+    PostboxImageLayout Layout;      // loader-built image section map
+    uint64_t Reserved2;
+};
+static_assert(sizeof(PostboxJobConfig) == 0x110, "job config ABI changed");
+static_assert(offsetof(PostboxJobConfig, Layout) == 0x58, "job config Layout offset changed");
+static_assert(offsetof(PostboxJobConfig, Reserved2) == 0x108, "job config tail offset changed");
+
+inline bool PostboxJobConfigValid(const PostboxJobConfig& cfg, uint32_t* error = nullptr)
+{
+    auto fail = [&]() { if (error) *error = 40; return false; };
+
+    if (cfg.Magic != PostboxJobConfigMagic || cfg.Version != PostboxJobConfigVersion)
+        return fail();
+    if (cfg.Reserved != 0 || cfg.Reserved2 != 0) return fail();
+    if (!cfg.SectionVa || !cfg.SectionSize || (cfg.SectionVa & 7)) return fail();
+    if (cfg.SectionSize < sizeof(PostboxJobBatch) || cfg.SectionSize > PostboxJobSectionMax)
+        return fail();
+    if (cfg.SectionVa > PostboxUserLimit - cfg.SectionSize) return fail();
+    if (!cfg.Count || cfg.Count > PostboxJobMax) return fail();
+    if (cfg.TargetPid > 0xFFFFFFFFull) return fail();
+    // A cross-process batch must bind the PID to its create time, otherwise a
+    // recycled PID can redirect the batch to a different process. A same-process
+    // batch (TargetPid == 0) must leave the create time zero.
+    if (cfg.TargetPid && !cfg.TargetCreateTime) return fail();
+    if (!cfg.TargetPid && cfg.TargetCreateTime) return fail();
+    if (cfg.Layout.Magic != PostboxLayoutMagic ||
+        cfg.Layout.Version != PostboxLayoutVersion ||
+        !cfg.Layout.NtoskrnlBase || !cfg.Layout.ImageBase || !cfg.Layout.AllocSize)
+        return fail();
+
+    if (error) *error = 0;
+    return true;
+}
+
+inline bool PostboxJobBatchValid(const PostboxJobBatch& batch,
+                                 const PostboxJobConfig& cfg,
+                                 uint32_t* error = nullptr)
+{
+    auto fail = [&]() { if (error) *error = 41; return false; };
+
+    if (batch.Magic != PostboxJobBatchMagic || batch.Version != PostboxJobBatchVersion)
+        return fail();
+    if (batch.Flags != 0 || batch.Reserved != 0 ||
+        batch.Count != cfg.Count || batch.Count == 0 ||
+        batch.Count > PostboxJobMax)
+        return fail();
+    if (batch.TargetPid != cfg.TargetPid ||
+        batch.TargetCreateTime != cfg.TargetCreateTime ||
+        batch.Nonce != cfg.Nonce)
+        return fail();
+
+    for (uint32_t i = 0; i < batch.Count; ++i)
+    {
+        const PostboxJobRecord& job = batch.Jobs[i];
+        if (job.Reserved != 0) return fail();
+        if (job.Op != pb_job_ping && job.Op != pb_job_read && job.Op != pb_job_write)
+            return fail();
+        if (job.Size > PostboxJobMaxBytes) return fail();
+
+        if (job.Op == pb_job_ping)
+        {
+            if (job.Size != 0 || job.Address != 0 || job.DataOffset != 0) return fail();
+            continue;
+        }
+
+        if (!job.Size || !job.Address || job.Address >= PostboxUserLimit) return fail();
+        if (job.Size > PostboxUserLimit - job.Address) return fail();
+        // Explicit two-sided check: SectionSize - DataOffset must not underflow
+        // when a job is larger than the section.
+        if (job.DataOffset < sizeof(PostboxJobBatch) ||
+            job.DataOffset > cfg.SectionSize ||
+            job.Size > cfg.SectionSize - job.DataOffset)
+            return fail();
+    }
+
+    if (error) *error = 0;
+    return true;
+}

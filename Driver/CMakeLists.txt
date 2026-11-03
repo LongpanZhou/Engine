@@ -73,6 +73,25 @@ if(POSTBOX_NMI)
     list(APPEND POSTBOX_NMI_SOURCES PostboxNmi.S)
 endif()
 
+# F1 Job-post: one map, one entry, N jobs, one teardown. Test-only until the
+# live batch matrix passes; the stealth profile refuses it.
+option(POSTBOX_JOB "Test-only F1 job-post batch mode" OFF)
+if(POSTBOX_JOB)
+    if(NOT POSTBOX_CHANNEL)
+        message(FATAL_ERROR "POSTBOX_JOB requires POSTBOX_CHANNEL=ON")
+    endif()
+    if(NOT MANUAL_MAP_ONLY)
+        message(FATAL_ERROR "POSTBOX_JOB requires MANUAL_MAP_ONLY=ON")
+    endif()
+    # The job build frees the image after the entry. With MAPPED_SAFE=OFF the
+    # image's map table stays linked into the shared page tables and would point
+    # at freed memory after that free.
+    if(NOT MAPPED_SAFE)
+        message(FATAL_ERROR "POSTBOX_JOB requires MAPPED_SAFE=ON (map-table lifetime)")
+    endif()
+    list(APPEND VARIANT_DEFINES POSTBOX_JOB)
+endif()
+
 # Test-only E3 probe: around the product KeIpiGenericCall, write to the .text
 # probe page from CPU 1 and record whether the stale RW TLB entry survived.
 # Never part of the shipped build.
@@ -247,7 +266,7 @@ if(STEALTH_PROFILE)
     if(NOT NMI_SANITIZE OR NOT STACK_SPOOF OR NOT NMI_FRAME_FIRST OR NOT POSTBOX_ONESHOT_TIMER)
         message(FATAL_ERROR "STEALTH_PROFILE=ON requires NMI_SANITIZE=ON, STACK_SPOOF=ON, NMI_FRAME_FIRST=ON and POSTBOX_ONESHOT_TIMER=ON (shipped mitigations)")
     endif()
-    foreach(_Probe T2_PROBE E3_DPC_PROBE NMI_PROBE STACK_PROBE POSTBOX_NMI)
+    foreach(_Probe T2_PROBE E3_DPC_PROBE NMI_PROBE STACK_PROBE POSTBOX_NMI POSTBOX_JOB)
         if(${_Probe})
             message(FATAL_ERROR "STEALTH_PROFILE=ON forbids ${_Probe} (test build)")
         endif()
