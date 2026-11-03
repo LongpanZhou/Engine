@@ -1476,25 +1476,39 @@ static uint64_t PostboxSpoofArg(T Arg)
     return (uint64_t) (uintptr_t) Arg;
 }
 
+template <typename R>
+static R PostboxSpoofResult(uint64_t Value)
+{
+    return (R) Value;
+}
+
+// A bool target returns in al; the upper rax bits are undefined. Convert only
+// the low byte, otherwise a failed call can look true.
+template <>
+bool PostboxSpoofResult<bool>(uint64_t Value)
+{
+    return (Value & 0xFF) != 0;
+}
+
 template <typename R, typename... Args>
 static R PostboxSpoofInvoke(uint64_t Target, Args... args)
 {
     if constexpr (sizeof...(Args) == 0)
-        return (R) PostboxSpoofCall0(Target);
+        return PostboxSpoofResult<R>(PostboxSpoofCall0(Target));
     else if constexpr (sizeof...(Args) == 1)
-        return (R) PostboxSpoofCall1(Target, PostboxSpoofArg(args)...);
+        return PostboxSpoofResult<R>(PostboxSpoofCall1(Target, PostboxSpoofArg(args)...));
     else if constexpr (sizeof...(Args) == 2)
-        return (R) PostboxSpoofCall2(Target, PostboxSpoofArg(args)...);
+        return PostboxSpoofResult<R>(PostboxSpoofCall2(Target, PostboxSpoofArg(args)...));
     else if constexpr (sizeof...(Args) == 3)
-        return (R) PostboxSpoofCall3(Target, PostboxSpoofArg(args)...);
+        return PostboxSpoofResult<R>(PostboxSpoofCall3(Target, PostboxSpoofArg(args)...));
     else if constexpr (sizeof...(Args) == 4)
-        return (R) PostboxSpoofCall4(Target, PostboxSpoofArg(args)...);
+        return PostboxSpoofResult<R>(PostboxSpoofCall4(Target, PostboxSpoofArg(args)...));
     else if constexpr (sizeof...(Args) == 5)
-        return (R) PostboxSpoofCall5(Target, PostboxSpoofArg(args)...);
+        return PostboxSpoofResult<R>(PostboxSpoofCall5(Target, PostboxSpoofArg(args)...));
     else if constexpr (sizeof...(Args) == 6)
-        return (R) PostboxSpoofCall6(Target, PostboxSpoofArg(args)...);
+        return PostboxSpoofResult<R>(PostboxSpoofCall6(Target, PostboxSpoofArg(args)...));
     else
-        return (R) PostboxSpoofCall7(Target, PostboxSpoofArg(args)...);
+        return PostboxSpoofResult<R>(PostboxSpoofCall7(Target, PostboxSpoofArg(args)...));
 }
 #endif
 
@@ -1768,14 +1782,51 @@ static bool PostboxCopy(void* MailboxProcess, address UserVa, void* Buffer,
     return Status >= 0 && Done == Size;
 }
 
+// Intra-image copy call through the generic trampoline. The mapped PostboxCopy
+// return address is replaced by the nt gadget while PostboxCopy runs, so a
+// stack walk inside the copy path does not see the caller's mapped return.
+static bool PostboxCopySpoof(void* MailboxProcess, address UserVa, void* Buffer,
+                             size_t Size, bool Write)
+{
+#ifdef STACK_SPOOF
+    if (g_PostboxPopRspRetSkip)
+        return PostboxSpoofInvoke<bool>((uint64_t) (uintptr_t) &PostboxCopy,
+                                        MailboxProcess, UserVa, Buffer, Size, Write);
+#endif
+    return PostboxCopy(MailboxProcess, UserVa, Buffer, Size, Write);
+}
+
 #ifdef STACK_SPOOF
 static bool PostboxStackProbeRun(void* MailboxProcess, address DataVa,
                                  PostboxStackProbeResult* Out)
 {
     if (!Out) return false;
+    // Scan the immediate worker stack before writing any mapped value into Out.
+    // A mapped hit here is a mapped-image return address or code pointer.
+    uint64_t Rsp = 0;
+    __asm__ __volatile__("movq %%rsp, %0" : "=r"(Rsp));
+    const uint64_t ScanBase = PostboxStatePtr->NmiSanitize.ImageBase;
+    const uint64_t ScanEnd = ScanBase + PostboxStatePtr->NmiSanitize.ImageSize;
+    uint64_t Hits = 0;
+    uint64_t HitValues[4] = {};
+    for (uint64_t Off = 0; Off < 0x600; Off += 8)
+    {
+        const uint64_t Value = *(const uint64_t*) (uintptr_t) (Rsp + Off);
+        if (Value >= ScanBase && Value < ScanEnd)
+        {
+            if (Hits < 4) HitValues[Hits] = Value;
+            ++Hits;
+        }
+    }
     uint8_t Buf[8] = {};
-    const bool Ok = PostboxCopy(MailboxProcess, DataVa, Buf, sizeof(Buf), false);
+    const bool Ok = PostboxCopySpoof(MailboxProcess, DataVa, Buf, sizeof(Buf), false);
     Out->Magic = PostboxStackProbeMagic;
+    Out->MappedHits = Hits;
+    Out->StackScanned = 0x600;
+    Out->Hit0 = HitValues[0];
+    Out->Hit1 = HitValues[1];
+    Out->Hit2 = HitValues[2];
+    Out->Hit3 = HitValues[3];
     Out->Gadget = g_PostboxLastGadget;
     Out->RealRsp = g_PostboxLastRealRsp;
     Out->FakeTop = g_PostboxLastFakeTop;
@@ -1845,21 +1896,21 @@ static bool PostboxRespond(uint64_t MailboxVa, void* MailboxProcess, uint32_t Se
                        RequestOp, Body, BodyLen);
 
     if (BodyLen != 0 &&
-        !PostboxCopy(MailboxProcess, (address) (MailboxVa + PostboxDataAt),
+        !PostboxCopySpoof(MailboxProcess, (address) (MailboxVa + PostboxDataAt),
                      (void*) Body, BodyLen, true))
         return false;
 
-    if (!PostboxCopy(MailboxProcess, (address) (MailboxVa + offsetof(PostboxHeader, Mac)),
+    if (!PostboxCopySpoof(MailboxProcess, (address) (MailboxVa + offsetof(PostboxHeader, Mac)),
                      Tag, sizeof(Tag), true))
         return false;
 
     __atomic_thread_fence(__ATOMIC_RELEASE);
-    if (!PostboxCopy(MailboxProcess, (address) (MailboxVa + offsetof(PostboxHeader, Status)),
+    if (!PostboxCopySpoof(MailboxProcess, (address) (MailboxVa + offsetof(PostboxHeader, Status)),
                      &Status, sizeof(Status), true))
         return false;
 
     __atomic_thread_fence(__ATOMIC_RELEASE);
-    return PostboxCopy(MailboxProcess, (address) (MailboxVa + offsetof(PostboxHeader, Ack)),
+    return PostboxCopySpoof(MailboxProcess, (address) (MailboxVa + offsetof(PostboxHeader, Ack)),
                        &Seq, sizeof(Seq), true);
 }
 
@@ -2099,6 +2150,20 @@ static void PostboxDpcRoutine(void*, void*, void*, void*)
 // Runs at PASSIVE_LEVEL in an existing system worker thread. The assembly
 // PostboxWorkEntry wrapper calls this and clears PostboxInFlight only after it
 // returns; do not clear InFlight here.
+// Worker poll call through the generic trampoline. PostboxPoll's mapped return
+// address is replaced by the nt gadget while it runs.
+static void PostboxPollSpoof()
+{
+#ifdef STACK_SPOOF
+    if (g_PostboxPopRspRetSkip)
+    {
+        PostboxSpoofInvoke<void>((uint64_t) (uintptr_t) &PostboxPoll);
+        return;
+    }
+#endif
+    PostboxPoll();
+}
+
 extern "C" void PostboxWorkRoutine(void*)
 {
     PostboxState* State = PostboxStatePtr;
@@ -2109,7 +2174,7 @@ extern "C" void PostboxWorkRoutine(void*)
         if (__atomic_exchange_n(&E3Started, 1, __ATOMIC_ACQ_REL) == 0)
             E3RunProbe();
 #endif
-        PostboxPoll();
+        PostboxPollSpoof();
     }
 
     // Terminal work item: running is clear and the timer is cancelled, so no DPC
@@ -2134,7 +2199,7 @@ static void PostboxPollAttached(void* MailboxProcess)
     if (!MailboxVa) return;
 
     PostboxHeader Sealed{};
-    if (!PostboxCopy(MailboxProcess, (address) MailboxVa, &Sealed, sizeof(Sealed), false))
+    if (!PostboxCopySpoof(MailboxProcess, (address) MailboxVa, &Sealed, sizeof(Sealed), false))
     {
         PostboxWipe(&Sealed, sizeof(Sealed));
         PostboxDeadTick();
@@ -2228,7 +2293,7 @@ static void PostboxPollAttached(void* MailboxProcess)
 
     const address DataVa = (address) (MailboxVa + PostboxDataAt);
     if (BodyLen != 0 &&
-        !PostboxCopy(MailboxProcess, DataVa, PostboxStatePtr->Stage, BodyLen, false))
+        !PostboxCopySpoof(MailboxProcess, DataVa, PostboxStatePtr->Stage, BodyLen, false))
     {
         PostboxWipe(&Plain, sizeof(Plain));
         PostboxWipe(&Sealed, sizeof(Sealed));
@@ -2288,14 +2353,14 @@ static void PostboxPollAttached(void* MailboxProcess)
         else if (Op == pb_write)
         {
             pb::OpenRequestBody(PostboxStatePtr->Stage, Size, PostboxStatePtr->Keys, PostboxStatePtr->SessionId, Sealed.Nonce);
-            const bool Ok = PostboxCopy(MailboxProcess, (address) Address,
+            const bool Ok = PostboxCopySpoof(MailboxProcess, (address) Address,
                                         PostboxStatePtr->Stage, Size, true);
             Status = Ok ? 0 : (int32_t) 0xC0000005;
             PostboxWipe(PostboxStatePtr->Stage, Size);
         }
         else
         {
-            const bool Ok = PostboxCopy(MailboxProcess, (address) Address,
+            const bool Ok = PostboxCopySpoof(MailboxProcess, (address) Address,
                                         PostboxStatePtr->Stage, Size, false);
             if (Ok)
             {
@@ -2385,7 +2450,11 @@ static void PostboxPollAttached(void* MailboxProcess)
     else if (Op == pb_stack_probe)
     {
         PostboxStackProbeResult Result{};
-        if (!PostboxStackProbeRun(MailboxProcess, DataVa, &Result))
+        const bool ProbeOk = g_PostboxPopRspRetSkip
+            ? PostboxSpoofInvoke<bool>((uint64_t) (uintptr_t) &PostboxStackProbeRun,
+                                       MailboxProcess, DataVa, &Result)
+            : PostboxStackProbeRun(MailboxProcess, DataVa, &Result);
+        if (!ProbeOk)
         {
             Status = (int32_t) 0xC0000001;      // STATUS_UNSUCCESSFUL
         }
@@ -2405,8 +2474,8 @@ static void PostboxPollAttached(void* MailboxProcess)
     // timeout/body-overwrite race; the stage keeps the MAC and the published bytes identical.
     uint32_t CurrentSeq = 0;
     uint64_t CurrentNonce = 0;
-    if (!PostboxCopy(MailboxProcess, (address) MailboxVa, &CurrentSeq, sizeof(CurrentSeq), false) ||
-        !PostboxCopy(MailboxProcess, (address) (MailboxVa + offsetof(PostboxHeader, Nonce)),
+    if (!PostboxCopySpoof(MailboxProcess, (address) MailboxVa, &CurrentSeq, sizeof(CurrentSeq), false) ||
+        !PostboxCopySpoof(MailboxProcess, (address) (MailboxVa + offsetof(PostboxHeader, Nonce)),
                      &CurrentNonce, sizeof(CurrentNonce), false) ||
         CurrentSeq != Seq || CurrentNonce != Sealed.Nonce)
     {
@@ -2434,6 +2503,21 @@ static void PostboxPollAttached(void* MailboxProcess)
 
     PostboxWipe(&Plain, sizeof(Plain));
     PostboxWipe(&Sealed, sizeof(Sealed));
+}
+
+// Poll body call through the generic trampoline. PostboxPollAttached's mapped
+// return address is replaced by the nt gadget while it runs.
+static void PostboxPollAttachedSpoof(void* MailboxProcess)
+{
+#ifdef STACK_SPOOF
+    if (g_PostboxPopRspRetSkip)
+    {
+        PostboxSpoofInvoke<void>((uint64_t) (uintptr_t) &PostboxPollAttached,
+                                 MailboxProcess);
+        return;
+    }
+#endif
+    PostboxPollAttached(MailboxProcess);
 }
 
 // Poll entry: the worker holds the cached client EPROCESS and the process exit
@@ -2492,7 +2576,7 @@ static void PostboxPoll()
         PostboxMaybeReleaseProcess();
         return;
     }
-    PostboxPollAttached(Process);
+    PostboxPollAttachedSpoof(Process);
     PostboxReleaseProcessExit(Process);
     __atomic_sub_fetch(&PostboxPollRefs, 1, __ATOMIC_ACQ_REL);
     PostboxMaybeReleaseProcess();

@@ -76,8 +76,14 @@ struct PostboxStackProbeResult
     uint64_t RealRet;
     uint64_t SpoofGadget;
     uint64_t SpoofRet;
+    uint64_t MappedHits;
+    uint64_t StackScanned;
+    uint64_t Hit0;
+    uint64_t Hit1;
+    uint64_t Hit2;
+    uint64_t Hit3;
 };
-static_assert(sizeof(PostboxStackProbeResult) == 0x38, "stack probe result ABI changed");
+static_assert(sizeof(PostboxStackProbeResult) == 0x68, "stack probe result ABI changed");
 
 // Naturally aligned: the atomic fields are 4-byte aligned and the 8-byte fields are
 // 8-byte aligned. Packing this struct would make the atomic accesses unaligned.
