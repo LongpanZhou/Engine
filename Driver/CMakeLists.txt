@@ -115,6 +115,18 @@ if(NMI_SANITIZE)
     list(APPEND VARIANT_DEFINES NMI_SANITIZE)
 endif()
 
+# One-shot + jittered timer: the timer is armed with a due time of PeriodMs plus an
+# rdtsc-derived jitter and re-armed from the DPC with an explicit running/generation
+# double-check, so _KTIMER.Period stays 0 and the timer table carries no fixed
+# polling-period signature. OFF keeps the stock periodic arm.
+option(POSTBOX_ONESHOT_TIMER "Arm the Postbox timer one-shot with jitter, re-armed from the DPC" OFF)
+if(POSTBOX_ONESHOT_TIMER)
+    if(NOT POSTBOX_CHANNEL)
+        message(FATAL_ERROR "POSTBOX_ONESHOT_TIMER requires POSTBOX_CHANNEL=ON")
+    endif()
+    list(APPEND VARIANT_DEFINES POSTBOX_ONESHOT_TIMER)
+endif()
+
 # Self-free reaper: the terminal work routine creates a system thread whose entry
 # is an assembly stub in the image. The stub tail-jumps to MmFreeIndependentPages,
 # so the free returns to PspSystemThreadStartup and no image instruction is fetched
@@ -123,6 +135,9 @@ set(POSTBOX_REAPER_SOURCES)
 if(POSTBOX_CHANNEL)
     enable_language(ASM)
     list(APPEND POSTBOX_REAPER_SOURCES PostboxReaper.S)
+    if(NMI_SANITIZE)
+        list(APPEND POSTBOX_REAPER_SOURCES PostboxNmiEntry.S)
+    endif()
 endif()
 
 # Driver entry point
