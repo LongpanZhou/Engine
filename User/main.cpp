@@ -11,8 +11,6 @@
 static ChannelHeader* g_Header = nullptr;
 static uint8_t* g_Data = nullptr;
 
-int PostboxClientMain(int argc, char** argv);
-
 static bool Connect()
 {
     const wchar_t* Names[3] = { L"Global\\EngineCiShared", L"EngineCiShared", L"Local\\EngineCiShared" };
@@ -135,11 +133,8 @@ static void Request(uint32_t Op, uint32_t Pid, uint64_t Remote, uint32_t Size)
     g_Header->Size = Size;
 }
 
-int main(int argc, char** argv)
+int main()
 {
-    if (argc > 1 && std::strcmp(argv[1], "--postbox") == 0)
-        return PostboxClientMain(argc, argv);
-
     if (!Connect())
     {
         std::cout << "channel: driver not reachable (mapped and running?)" << std::endl;

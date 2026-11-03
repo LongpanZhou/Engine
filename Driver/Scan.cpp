@@ -255,3 +255,57 @@ void FindFuncExportsBatch(address BaseAddress, const char *const *Names, address
         }
     }
 }
+
+#ifdef DEBUG
+// Debug-only self-test (DriverEntry step 0.9): the lazy export walk must agree
+// with the loader's import slots for data exports, return null for a missing
+// name, and fill a batch with the same results.
+bool VerifyFindFuncExports(address NtoskrnlBase)
+{
+    if (!NtoskrnlBase)
+    {
+        print(ERROR("VerifyFindFuncExports: no ntoskrnl base"));
+        return false;
+    }
+
+    bool Ok = true;
+    const address ExpectedInitial = (address) (uintptr_t) __imp_PsInitialSystemProcess;
+    const address ExpectedLoaded = (address) (uintptr_t) __imp_PsLoadedModuleList;
+
+    const address Initial = FindFuncExports(NtoskrnlBase, "PsInitialSystemProcess");
+    if (!Initial || Initial != ExpectedInitial)
+    {
+        print(ERROR("VerifyFindFuncExports: PsInitialSystemProcess %p != import %p"),
+              (void*) (uintptr_t) Initial, (void*) (uintptr_t) ExpectedInitial);
+        Ok = false;
+    }
+
+    const address Loaded = FindFuncExports(NtoskrnlBase, "PsLoadedModuleList");
+    if (!Loaded || Loaded != ExpectedLoaded)
+    {
+        print(ERROR("VerifyFindFuncExports: PsLoadedModuleList %p != import %p"),
+              (void*) (uintptr_t) Loaded, (void*) (uintptr_t) ExpectedLoaded);
+        Ok = false;
+    }
+
+    if (FindFuncExports(NtoskrnlBase, "__kf_missing_export__") != nullptr)
+    {
+        print(ERROR("VerifyFindFuncExports: missing name resolved"));
+        Ok = false;
+    }
+
+    const char* Wanted[3] = {
+        "PsInitialSystemProcess", "__kf_missing_export__", "PsLoadedModuleList",
+    };
+    address Results[3] = {};
+    FindFuncExportsBatch(NtoskrnlBase, Wanted, Results, 3);
+    if (Results[0] != ExpectedInitial || Results[1] != nullptr ||
+        Results[2] != ExpectedLoaded)
+    {
+        print(ERROR("VerifyFindFuncExports: batch result mismatch"));
+        Ok = false;
+    }
+
+    return Ok;
+}
+#endif

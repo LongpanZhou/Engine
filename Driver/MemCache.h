@@ -11,6 +11,10 @@ struct PostboxMemCaches
     uint64_t Ntoskrnl;
     uint64_t PteBase;
     uint64_t PfnPteAddressBase;
+    // Data-export addresses resolved from the loader-provided ntoskrnl base.
+    // Kept here so the mapped image has no __imp_ IAT slots for them.
+    uint64_t PsInitialSystemProcess;
+    uint64_t PsLoadedModuleList;
 };
 
 #ifdef POSTBOX_CHANNEL
@@ -21,3 +25,8 @@ inline PostboxMemCaches* PostboxGetMemCaches() { return nullptr; }
 
 // Copies the transient cache into Dst (when non-null) and clears the statics.
 void MemAdoptCaches(PostboxMemCaches* Dst);
+
+// Postbox pre-start bootstrap: the loader supplies the ntoskrnl base before
+// ProtectImageSections calls PostboxResolve. This removes the need for the
+// driver's PsInitialSystemProcess/PsLoadedModuleList imports.
+void MemSetPreStartNtoskrnl(uint64_t Base);

@@ -1,9 +1,9 @@
 // Postbox client: the user side of the timer/work-item channel. The mailbox is a normal
 // private page owned by this process; the request loop does not touch the section or any
-// cross-process API. Bootstrap uses one pagefile-backed named section that carries
-// {pid, VA, key, session, create time} to the loader, so the loader needs no process
-// handle and no cross-process read. Run this first, note the printed section name, then
-// run mapload with --postbox-section <name>; the client pings automatically.
+// cross-process API. Bootstrap uses one unnamed pagefile-backed section that carries
+// {pid, VA, key, session, create time} to the loader. The client spawns the loader as a
+// child with only that section handle inherited; there is no named Local\ object and no
+// loader-side OpenFileMapping. The client pings automatically after the handshake.
 #include <windows.h>
 #include <bcrypt.h>
 #include <cstddef>
@@ -12,6 +12,7 @@
 #include <cstring>
 #include "../Common/Postbox.h"
 #include "../Common/PostboxCrypto.h"
+#include "pure.h"
 
 struct ClientSession
 {
@@ -21,24 +22,24 @@ struct ClientSession
     uint32_t Sequence;
     uint32_t Pid;
     int32_t Status;
+    // Master key held only on this stack session until the loader is ready.
+    // Keeping it out of a fixed .data global removes the V-06 static offset.
+    uint8_t HandoffKey[32];
+    bool HandoffKeyPending;
 
     ~ClientSession()
     {
         pb::WipePostboxKeys(&Keys);
+        SecureZeroMemory(HandoffKey, sizeof(HandoffKey));
+        HandoffKeyPending = false;
         SessionId = 0;
         Nonce = 0;
         Sequence = 0;
     }
 };
 
-// Test-only client modes. Defaults reproduce the original --nmi-less behavior exactly.
-struct ClientOptions
-{
-    bool Nmi;
-    bool Kill;
-    uint32_t HoldMs;
-    uint32_t HoldPingMs;
-};
+// ClientOptions / ParseMilliseconds / ParseArguments / PlanStopBestEffort live in
+// pure.h (host-unit-tested).
 
 static bool RandomBytes(void* Buffer, size_t Size)
 {
@@ -47,102 +48,39 @@ static bool RandomBytes(void* Buffer, size_t Size)
 }
 
 // The master key must stay readable until the loader copies it. It lives in a
-// one-page, pagefile-backed named section: the loader opens the section read-only
-// before any provider work, copies the record, and closes it. There is no process
-// handle and no cross-process read. The name is random per run and is the only
-// thing printed on stdout.
+// one-page, pagefile-backed unnamed section. The client spawns the loader with
+// only this handle inherited; the loader maps the inherited handle before any
+// provider work, copies the record, and unmaps it. There is no name, no DACL
+// to widen, and no process handle to the client.
 //
 // Cap the worst-case exposure at 60 s (the ping timeout): after that the first
 // ping's wait loop wipes the section even if the loader never arrives. The working
 // session keys are already derived, so the client keeps working if the loader was
 // fast.
 static HANDLE g_HandoffSection = nullptr;
+static HANDLE g_LoaderProcess = nullptr;
 static void* g_HandoffView = nullptr;
 static ULONGLONG g_HandoffWipeAt = 0;
-static uint8_t g_HandoffKey[32] = {};
-static bool g_HandoffKeyPending = false;
 static ULONGLONG g_HandoffPublishedAt = 0;
 constexpr ULONGLONG HandoffKeyGraceMs = 60000;
 
-// Explicit DACL: Administrators and SYSTEM only. The client keeps the handle it
-// receives at creation, so it does not need a DACL ACE for itself; the elevated
-// loader opens through Administrators. This removes the same-user (non-admin)
-// read/write capability on the handoff section. The mandatory label stays at the
-// token default; an elevated loader can still read it (NO_WRITE_UP, not
-// NO_READ_UP).
-struct HandoffSectionSecurity
+// The section is intentionally unnamed. The client keeps the creation handle and
+// marks only that handle inheritable; the spawned loader receives it through the
+// inherited handle table. There is no DACL to widen and no Local\ name for a
+// same-user process to enumerate or open.
+static bool CreateHandoffSection(const PostboxSectionHandoff& Handoff)
 {
-    SECURITY_DESCRIPTOR Sd;
-    SECURITY_ATTRIBUTES Sa;
-    ACL* Acl;
-    BYTE AclStorage[512];
-
-    bool Build()
-    {
-        BYTE AdminSid[SECURITY_MAX_SID_SIZE];
-        BYTE SystemSid[SECURITY_MAX_SID_SIZE];
-        DWORD AdminLen = sizeof(AdminSid);
-        DWORD SystemLen = sizeof(SystemSid);
-        if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, AdminSid, &AdminLen) ||
-            !CreateWellKnownSid(WinLocalSystemSid, nullptr, SystemSid, &SystemLen))
-            return false;
-
-        const DWORD AclSize = sizeof(ACL) +
-            2 * (sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD)) +
-            AdminLen + SystemLen;
-        if (AclSize > sizeof(AclStorage))
-            return false;
-
-        Acl = reinterpret_cast<ACL*>(AclStorage);
-        const DWORD SectionAccess = SECTION_MAP_READ | SECTION_MAP_WRITE | READ_CONTROL;
-        if (!InitializeAcl(Acl, AclSize, ACL_REVISION) ||
-            !AddAccessAllowedAce(Acl, ACL_REVISION, SectionAccess, AdminSid) ||
-            !AddAccessAllowedAce(Acl, ACL_REVISION, SectionAccess, SystemSid))
-            return false;
-        if (!InitializeSecurityDescriptor(&Sd, SECURITY_DESCRIPTOR_REVISION) ||
-            !SetSecurityDescriptorDacl(&Sd, TRUE, Acl, FALSE))
-            return false;
-
-        Sa.nLength = sizeof(Sa);
-        Sa.lpSecurityDescriptor = &Sd;
-        Sa.bInheritHandle = FALSE;
-        return true;
-    }
-};
-
-// Local\ + 32 hex chars. No product prefix: there is no static name string for a
-// T0 file/string scan to key on, and the loader receives the whole name.
-static bool CreateHandoffSection(const PostboxSectionHandoff& Handoff, wchar_t* Name,
-                                 size_t NameChars)
-{
-    uint8_t Id[16];
-    if (!RandomBytes(Id, sizeof(Id)))
-        return false;
-
-    static const wchar_t Hex[] = L"0123456789abcdef";
-    static const wchar_t Prefix[] = L"Local\\";
-    const size_t PrefixChars = sizeof(Prefix) / sizeof(Prefix[0]) - 1;
-    if (NameChars < PrefixChars + 2 * sizeof(Id) + 1)
-        return false;
-
-    size_t At = 0;
-    for (size_t i = 0; i < PrefixChars; ++i)
-        Name[At++] = Prefix[i];
-    for (size_t i = 0; i < sizeof(Id); ++i)
-    {
-        Name[At++] = Hex[Id[i] >> 4];
-        Name[At++] = Hex[Id[i] & 0xF];
-    }
-    Name[At] = 0;
-
-    HandoffSectionSecurity Security;
-    if (!Security.Build())
-        return false;
-
-    HANDLE Section = CreateFileMappingW(INVALID_HANDLE_VALUE, &Security.Sa,
-                                        PAGE_READWRITE, 0, PostboxSectionBytes, Name);
+    HANDLE Section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
+                                        PAGE_READWRITE, 0, PostboxSectionBytes, nullptr);
     if (!Section)
         return false;
+
+    if (!SetHandleInformation(Section, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT))
+    {
+        CloseHandle(Section);
+        return false;
+    }
+
     void* View = MapViewOfFile(Section, FILE_MAP_WRITE, 0, 0, PostboxSectionBytes);
     if (!View)
     {
@@ -157,10 +95,121 @@ static bool CreateHandoffSection(const PostboxSectionHandoff& Handoff, wchar_t* 
     return true;
 }
 
-static void WipeHandoffSection()
+// Spawn the loader with the section handle inherited. The handle value is only
+// meaningful inside the child's inherited handle table; the command line does
+// not carry a name or a capability that another process can use.
+//
+// Std-handle plumbing (0x3B-before-main fix, see README "unusable console handle"):
+// the restricted handle list used to hand the child nothing but the section, which
+// leaves the console-subsystem loader without valid std handles and with a broken
+// console attach state, faulting 0x3B in KiRestoreDebugRegisterState/KiSystemServiceExit
+// before or around main(). The client's own redirected std handles (valid file or
+// console handles under any parent) are marked inheritable, added to the handle-list
+// restriction, and passed via STARTF_USESTDHANDLES so the CRT init is grounded. The
+// GUI loader needs no console, so this is transparent for it; its evidence lines
+// simply start reaching the redirected stdout as well.
+static bool StartLoader(HANDLE Section, const ClientOptions& Options)
 {
-    SecureZeroMemory(g_HandoffKey, sizeof(g_HandoffKey));
-    g_HandoffKeyPending = false;
+    if (!Section || !Options.LoaderPath || !Options.LoaderArgs)
+        return false;
+
+    char CommandLine[2048] = {};
+    const int Written = std::snprintf(
+        CommandLine, sizeof(CommandLine),
+        "\"%s\" %s --postbox-handle 0x%llX",
+        Options.LoaderPath, Options.LoaderArgs,
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Section)));
+    if (Written < 0 || Written >= static_cast<int>(sizeof(CommandLine)))
+    {
+        std::printf("postbox: loader command line is too long\n");
+        return false;
+    }
+
+    // Gather the client's own std handles. Under cmd's `> log` redirection these are
+    // real file handles; a NULL on any side falls back to the pre-fix behaviour, which
+    // is safe for the GUI loader and must not regress it.
+    HANDLE Std[3];
+    Std[0] = GetStdHandle(STD_INPUT_HANDLE);
+    Std[1] = GetStdHandle(STD_OUTPUT_HANDLE);
+    Std[2] = GetStdHandle(STD_ERROR_HANDLE);
+    bool HaveStd = true;
+    for (int i = 0; i < 3; ++i)
+    {
+        if (Std[i])
+        {
+            // cmd's redirect targets are not inheritable by default; the child link
+            // needs the flag so the handle-list entry is honoured.
+            if (!SetHandleInformation(Std[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT))
+                HaveStd = false;
+        }
+        else
+        {
+            HaveStd = false;
+        }
+    }
+
+    // Restrict inheritance to the handoff section plus, when valid, the std handles.
+    // Without the handle list, bInheritHandles=TRUE hands the child every inheritable
+    // handle in the client.
+    STARTUPINFOEXA Si{};
+    Si.StartupInfo.cb = sizeof(Si);
+    SIZE_T AttrSize = 0;
+    InitializeProcThreadAttributeList(nullptr, 2, 0, &AttrSize);
+    alignas(16) uint8_t AttrBuf[256] = {};
+    if (AttrSize == 0 || AttrSize > sizeof(AttrBuf))
+    {
+        std::printf("postbox: attribute-list sizing failed\n");
+        return false;
+    }
+    Si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(AttrBuf);
+    if (!InitializeProcThreadAttributeList(Si.lpAttributeList, 2, 0, &AttrSize))
+    {
+        std::printf("postbox: attribute-list init failed, error %lu\n", GetLastError());
+        return false;
+    }
+    HANDLE Inherit[4] = { Section, nullptr, nullptr, nullptr };
+    DWORD InheritCount = 1;
+    if (HaveStd)
+    {
+        Si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+        Si.StartupInfo.hStdInput = Std[0];
+        Si.StartupInfo.hStdOutput = Std[1];
+        Si.StartupInfo.hStdError = Std[2];
+        InheritCount = 4;   // section + the three std handles
+        for (int i = 0; i < 3; ++i)
+            Inherit[1 + i] = Std[i];
+    }
+    if (!UpdateProcThreadAttribute(Si.lpAttributeList, 0,
+                                   PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   Inherit, InheritCount * sizeof(Inherit[0]),
+                                   nullptr, nullptr))
+    {
+        std::printf("postbox: handle-list setup failed, error %lu\n", GetLastError());
+        DeleteProcThreadAttributeList(Si.lpAttributeList);
+        return false;
+    }
+
+    PROCESS_INFORMATION Pi{};
+    const BOOL Created = CreateProcessA(
+        nullptr, CommandLine, nullptr, nullptr, TRUE, EXTENDED_STARTUPINFO_PRESENT,
+        nullptr, nullptr, &Si.StartupInfo, &Pi);
+    DeleteProcThreadAttributeList(Si.lpAttributeList);
+    if (!Created)
+    {
+        std::printf("postbox: CreateProcess(%s) failed, error %lu\n",
+                    Options.LoaderPath, GetLastError());
+        return false;
+    }
+
+    CloseHandle(Pi.hThread);
+    g_LoaderProcess = Pi.hProcess;
+    return true;
+}
+
+static void WipeHandoffSection(ClientSession& S)
+{
+    SecureZeroMemory(S.HandoffKey, sizeof(S.HandoffKey));
+    S.HandoffKeyPending = false;
     g_HandoffPublishedAt = 0;
     if (g_HandoffView)
         SecureZeroMemory(g_HandoffView, PostboxSectionBytes);
@@ -170,13 +219,13 @@ static void WipeHandoffSection()
 // and set LOADER_READY. The CAS claims PUBLISHING so the loader's withdrawal
 // (timeout) wins cleanly. If the loader withdraws, the client wipes instead of
 // leaving a key behind.
-static void PublishHandoffKey()
+static void PublishHandoffKey(ClientSession& S)
 {
-    if (!g_HandoffView || !g_HandoffKeyPending) return;
+    if (!g_HandoffView || !S.HandoffKeyPending) return;
     auto* Handoff = static_cast<PostboxSectionHandoff*>(g_HandoffView);
     if (Handoff->Reserved == PostboxSectionStateWithdrawn)
     {
-        WipeHandoffSection();
+        WipeHandoffSection(S);
         return;
     }
     if (Handoff->Reserved != PostboxSectionStateLoaderReady) return;
@@ -186,28 +235,28 @@ static void PublishHandoffKey()
         PostboxSectionStateLoaderReady)
     {
         if (Handoff->Reserved == PostboxSectionStateWithdrawn)
-            WipeHandoffSection();
+            WipeHandoffSection(S);
         return;
     }
-    std::memcpy(Handoff->Key, g_HandoffKey, sizeof(Handoff->Key));
+    std::memcpy(Handoff->Key, S.HandoffKey, sizeof(Handoff->Key));
     MemoryBarrier();
     Handoff->Reserved = PostboxSectionStateKeyReady;
-    SecureZeroMemory(g_HandoffKey, sizeof(g_HandoffKey));
-    g_HandoffKeyPending = false;
+    SecureZeroMemory(S.HandoffKey, sizeof(S.HandoffKey));
+    S.HandoffKeyPending = false;
     g_HandoffPublishedAt = GetTickCount64();
     std::printf("handoff: key published after loader-ready\n");
     std::fflush(stdout);
 }
 
-static void ExpireHandoffSection()
+static void ExpireHandoffSection(ClientSession& S)
 {
-    PublishHandoffKey();
-    if (g_HandoffView && !g_HandoffKeyPending)
+    PublishHandoffKey(S);
+    if (g_HandoffView && !S.HandoffKeyPending)
     {
         auto* Handoff = static_cast<PostboxSectionHandoff*>(g_HandoffView);
         if (Handoff->Reserved == PostboxSectionStateWithdrawn)
         {
-            WipeHandoffSection();
+            WipeHandoffSection(S);
             return;
         }
         // If the loader never consumes the published key (timeout/unmap), do
@@ -215,15 +264,15 @@ static void ExpireHandoffSection()
         if (Handoff->Reserved != PostboxSectionStateConsumed &&
             g_HandoffPublishedAt != 0 &&
             GetTickCount64() - g_HandoffPublishedAt > 1000)
-            WipeHandoffSection();
+            WipeHandoffSection(S);
     }
     if (g_HandoffView && GetTickCount64() >= g_HandoffWipeAt)
-        WipeHandoffSection();
+        WipeHandoffSection(S);
 }
 
-static void CloseHandoffSection()
+static void CloseHandoffSection(ClientSession& S)
 {
-    WipeHandoffSection();
+    WipeHandoffSection(S);
     if (g_HandoffView)
     {
         UnmapViewOfFile(g_HandoffView);
@@ -274,7 +323,7 @@ static bool Submit(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
     const ULONGLONG Deadline = GetTickCount64() + TimeoutMs;
     while (GetTickCount64() < Deadline)
     {
-        ExpireHandoffSection();
+        ExpireHandoffSection(S);
         if (Header->Ack == Seq) break;
         Sleep(1);
     }
@@ -287,10 +336,7 @@ static bool Submit(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
     // and decrypt length, then publish it to the caller. A post-MAC change to the mailbox
     // Status cannot alter what the caller trusts.
     const int32_t VerifiedStatus = Header->Status;
-    const uint32_t ResponseBodyLen =
-        VerifiedStatus != 0 ? 0 :
-        (Op == pb_read) ? Size :
-        (Op == pb_nmi) ? static_cast<uint32_t>(sizeof(uint64_t)) : 0;
+    const uint32_t ResponseBodyLen = PostboxResponseBodyLen(VerifiedStatus, Op, Size);
     uint8_t ResponseTag[16];
     pb::MacResponseTag(ResponseTag, S.Keys, S.SessionId, Seq, Header->Ack, VerifiedStatus,
                        Header->Nonce, Op, Data, ResponseBodyLen);
@@ -303,6 +349,19 @@ static bool Submit(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
     {
         if (Op == pb_read && Size != 0)
             pb::OpenResponseBody(Data, Size, S.Keys, S.SessionId, Nonce);
+#ifdef NMI_PROBE
+        else if (Op == pb_nmi_probe)
+            pb::OpenResponseBody(Data, static_cast<uint32_t>(sizeof(PostboxNmiProbeResult)),
+                                 S.Keys, S.SessionId, Nonce);
+        else if (Op == pb_nmi_status)
+            pb::OpenResponseBody(Data, static_cast<uint32_t>(sizeof(PostboxNmiStatus)),
+                                 S.Keys, S.SessionId, Nonce);
+#endif
+#ifdef STACK_PROBE
+        else if (Op == pb_stack_probe)
+            pb::OpenResponseBody(Data, static_cast<uint32_t>(sizeof(PostboxStackProbeResult)),
+                                 S.Keys, S.SessionId, Nonce);
+#endif
         else if (Op == pb_nmi)
             pb::OpenResponseBody(Data, static_cast<uint32_t>(sizeof(uint64_t)), S.Keys,
                                  S.SessionId, Nonce);
@@ -316,69 +375,13 @@ static bool Submit(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
 // LastSeq+1; if it did, it is LastSeq and the driver accepts a same-Seq stop.
 static void StopBestEffort(PostboxHeader* Header, uint8_t* Data, ClientSession& S)
 {
-    const uint32_t Seq = Header->Seq;
-    if (Seq != 0)
-        (void) Submit(Header, Data, S, pb_stop, 0, 0, 1000, Seq);
+    const PostboxStopPlan Plan = PlanStopBestEffort(Header->Seq);
+    if (Plan.Submit)
+        (void) Submit(Header, Data, S, pb_stop, 0, 0, 1000, Plan.Seq);
 }
 
-// Strict non-negative decimal parse; anything strtoul would silently accept
-// (empty string, sign, trailing garbage) is rejected.
-static bool ParseMilliseconds(const char* Text, uint32_t& Out)
-{
-    if (!Text || *Text == '\0')
-        return false;
-    uint64_t Value = 0;
-    for (const char* p = Text; *p; ++p)
-    {
-        if (*p < '0' || *p > '9')
-            return false;
-        Value = Value * 10 + static_cast<uint64_t>(*p - '0');
-        if (Value > 0xFFFFFFFFull)
-            return false;
-    }
-    Out = static_cast<uint32_t>(Value);
-    return true;
-}
-
-// Flags may appear in any order. Unrecognized arguments are ignored, which keeps the
-// User.exe entry point working: it forwards its own "--postbox" as argv[1].
-static bool ParseArguments(int argc, char** argv, ClientOptions& Options)
-{
-    for (int i = 1; i < argc; ++i)
-    {
-        const char* Arg = argv[i];
-        if (std::strcmp(Arg, "--nmi") == 0)
-        {
-            Options.Nmi = true;
-        }
-        else if (std::strcmp(Arg, "--kill") == 0)
-        {
-            Options.Kill = true;
-        }
-        else if (std::strcmp(Arg, "--hold") == 0)
-        {
-            if (i + 1 >= argc || !ParseMilliseconds(argv[i + 1], Options.HoldMs))
-            {
-                std::printf("postbox: --hold requires a millisecond value\n");
-                return false;
-            }
-            ++i;
-        }
-        else if (std::strcmp(Arg, "--hold-ping") == 0)
-        {
-            if (i + 1 >= argc || !ParseMilliseconds(argv[i + 1], Options.HoldPingMs))
-            {
-                std::printf("postbox: --hold-ping requires a millisecond value\n");
-                return false;
-            }
-            ++i;
-        }
-    }
-    return true;
-}
-
-// Keepalive hold: the driver stays on its fast timer and the NMI gate stays active, but
-// no bulk/read requests are issued, so the mailbox is quiet except for pings. Hold runs
+// Keepalive hold: the driver stays on its fast timer, but no bulk/read requests are
+// issued, so the mailbox is quiet except for pings. Hold runs
 // only after the first ping/ACK, i.e. after the loader's bootstrap has already completed.
 // Ping mode is also a liveness probe; a failure tears the session down like any other
 // test failure.
@@ -429,6 +432,10 @@ static bool HoldSession(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
 int PostboxClientMain(int argc, char** argv)
 {
     ClientOptions Options{};
+    Options.LoaderPath = "mapload.exe";
+    // Production default: no loader stdout blueprint. Test harnesses can override
+    // with --loader-args when they need the loader's evidence lines.
+    Options.LoaderArgs = "--sys DriverPlain.sys --provider pte --quiet";
     if (!ParseArguments(argc, argv, Options))
         return 1;
 
@@ -443,13 +450,29 @@ int PostboxClientMain(int argc, char** argv)
     void* Pad = VirtualAlloc(nullptr, PadBytes,
                              MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE);
     (void) Pad;
-    void* Base = VirtualAlloc(nullptr, PostboxBytes,
-                              MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE);
-    if (!Base)
+
+    // D-05: put a PAGE_NOACCESS guard on each side of the mailbox. The driver's
+    // MailboxVa points at the middle page; a client-side overrun or underrun
+    // faults instead of corrupting an adjacent allocation.
+    constexpr SIZE_T MailboxGuard = 0x1000;
+    void* MailboxAlloc = VirtualAlloc(nullptr, PostboxBytes + 2 * MailboxGuard,
+                                      MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN,
+                                      PAGE_READWRITE);
+    if (!MailboxAlloc)
     {
         std::printf("postbox: VirtualAlloc failed, error %lu\n", GetLastError());
         return 1;
     }
+    DWORD OldProtect = 0;
+    if (!VirtualProtect(MailboxAlloc, MailboxGuard, PAGE_NOACCESS, &OldProtect) ||
+        !VirtualProtect(static_cast<uint8_t*>(MailboxAlloc) + MailboxGuard + PostboxBytes,
+                        MailboxGuard, PAGE_NOACCESS, &OldProtect))
+    {
+        std::printf("postbox: mailbox guard setup failed, error %lu\n", GetLastError());
+        VirtualFree(MailboxAlloc, 0, MEM_RELEASE);
+        return 1;
+    }
+    void* Base = static_cast<uint8_t*>(MailboxAlloc) + MailboxGuard;
 
     PostboxHeader* Header = static_cast<PostboxHeader*>(Base);
     std::memset(Base, 0, PostboxBytes);            // fault in all 16 mailbox pages
@@ -476,9 +499,9 @@ int PostboxClientMain(int argc, char** argv)
     const uint64_t CreateTime64 =
         (static_cast<uint64_t>(CreateTime.dwHighDateTime) << 32) | CreateTime.dwLowDateTime;
 
-    // Publish the bootstrap record in a one-page pagefile-backed section before
-    // printing, so the loader can open it as soon as it starts. The mailbox body
-    // stays zeroed: there is no PBX1 signature or master key in the 64 KiB page.
+    // Publish the bootstrap record in one unnamed pagefile-backed section before
+    // spawning the loader. The mailbox body stays zeroed: there is no PBX1
+    // signature or master key in the 64 KiB page.
     PostboxSectionHandoff Handoff{};
     Handoff.Magic = PostboxSectionHandoffMagic;
     Handoff.Version = PostboxSectionHandoffVersion;
@@ -487,20 +510,26 @@ int PostboxClientMain(int argc, char** argv)
     Handoff.SessionId = SessionId;
     Handoff.CreateTime = CreateTime64;
     Handoff.Reserved = PostboxSectionStateWaiting;
-    std::memcpy(g_HandoffKey, Master, sizeof(g_HandoffKey));
-    g_HandoffKeyPending = true;
+    std::memcpy(S.HandoffKey, Master, sizeof(S.HandoffKey));
+    S.HandoffKeyPending = true;
 
-    wchar_t SectionName[64] = {};
-    if (!CreateHandoffSection(Handoff, SectionName, _countof(SectionName)))
+    if (!CreateHandoffSection(Handoff))
     {
         SecureZeroMemory(&Handoff, sizeof(Handoff));
-        SecureZeroMemory(g_HandoffKey, sizeof(g_HandoffKey));
-        g_HandoffKeyPending = false;
+        SecureZeroMemory(S.HandoffKey, sizeof(S.HandoffKey));
+        S.HandoffKeyPending = false;
         SecureZeroMemory(Master, sizeof(Master));
         std::printf("postbox: handoff section creation failed, error %lu\n", GetLastError());
         return 1;
     }
     SecureZeroMemory(&Handoff, sizeof(Handoff));
+
+    if (!StartLoader(g_HandoffSection, Options))
+    {
+        SecureZeroMemory(Master, sizeof(Master));
+        CloseHandoffSection(S);
+        return 1;
+    }
 
     // Derive the working keys from a copy; DerivePostboxKeys wipes its input.
     uint8_t MasterCopy[32];
@@ -510,12 +539,7 @@ int PostboxClientMain(int argc, char** argv)
     SecureZeroMemory(MasterCopy, sizeof(MasterCopy));
     S.SessionId = SessionId;
 
-    std::printf("postbox: pid=%lu va=0x%llX size=0x%X\n",
-                static_cast<unsigned long>(S.Pid),
-                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Base)), PostboxBytes);
-    std::printf("postbox: section=%ls\n", SectionName);
-    std::printf("run: mapload.exe --sys Driver.sys --provider pte --postbox-section \"%ls\"\n",
-                SectionName);
+    std::printf("postbox: unnamed handoff section inherited by loader\n");
     std::printf("waiting up to 60 s for the driver...\n");
     std::fflush(stdout);
 
@@ -525,19 +549,19 @@ int PostboxClientMain(int argc, char** argv)
     {
         std::printf("ping: timeout or auth failure (driver not mapped, wrong pid/VA/CreateTime, "
                     "or key/session mismatch)\n");
-        CloseHandoffSection();
+        CloseHandoffSection(S);
         return 1;
     }
     std::printf("ping: status=0x%X\n", static_cast<unsigned>(S.Status));
     if (S.Status != 0)
     {
-        CloseHandoffSection();
+        CloseHandoffSection(S);
         StopBestEffort(Header, Data, S);
         return 1;
     }
 
     // The loader has copied the handoff; do not leave the master key in the section.
-    CloseHandoffSection();
+    CloseHandoffSection(S);
 
     // Deterministic dead-client test: exit abruptly after a successful ping and the wipe,
     // with no pb_stop, so the driver must notice the client is gone on its own.
@@ -545,7 +569,15 @@ int PostboxClientMain(int argc, char** argv)
     {
         std::printf("kill: terminating without pb_stop\n");
         std::fflush(stdout);
-        TerminateProcess(GetCurrentProcess(), 0xDEAD);
+        // D-05: TerminateProcess skips the ClientSession destructor, so wipe the
+        // working keys and the mailbox explicitly before the abrupt exit.
+        pb::WipePostboxKeys(&S.Keys);
+        SecureZeroMemory(Base, PostboxBytes);
+        // Do not leave a fixed test exit code as a kill-path signature.
+        uint32_t KillExit = 0;
+        if (!RandomBytes(&KillExit, sizeof(KillExit)))
+            KillExit = static_cast<uint32_t>(GetTickCount());
+        TerminateProcess(GetCurrentProcess(), KillExit);
         std::printf("kill: TerminateProcess failed, error %lu\n", GetLastError());
         return 1;
     }
@@ -660,51 +692,193 @@ int PostboxClientMain(int argc, char** argv)
     }
     SecureZeroMemory(Data, PostboxDataMax);
 
-    if (Options.Nmi)
+#ifdef NMI_PROBE
+    // Test-only constructed-IDT gate self-test: install the gate, deliver one
+    // self-NMI, consume it in the stub, restore the Windows IDT, and report the
+    // handled count. Chained hardware NMIs during the gated window are the
+    // historical 0x3B source; run with the detector sending NMIs to reproduce.
+    if (Options.NmiGate)
     {
-        uint64_t NmiBefore = 0;
-        if (!Submit(Header, Data, S, pb_nmi, 0, 0, 3000))
+        // Address=1: quick install/self-test/uninstall. Address=2: hold the gate
+        // ~15 s for external chained NMIs. Address=3|count<<32: chained self-NMI
+        // storm, deterministic and silent (no external NMI source). The hold and
+        // storm modes report the stub's tick count (every NMI seen); the quick
+        // mode reports the consumed self-test count.
+        const bool Hold = Options.NmiGateHoldMs != 0;
+        const bool Storm = Options.NmiGateStorm != 0;
+        const uint64_t GateAddress = Storm
+            ? (3ull | (static_cast<uint64_t>(Options.NmiGateStorm) << 32))
+            : (Hold ? 2ull : 1ull);
+        const uint32_t TimeoutMs = Storm
+            ? Options.NmiGateStorm + 30000
+            : (Hold ? Options.NmiGateHoldMs + 30000 : 30000);
+        const char* Label = Storm ? " (storm)" : (Hold ? " (hold)" : "");
+        const bool TicksMode = Storm || Hold;
+        if (!Submit(Header, Data, S, pb_nmi, GateAddress, 0, TimeoutMs))
         {
-            std::printf("nmi: query timeout or unsupported (driver not built with POSTBOX_NMI)\n");
+            std::printf("nmi gate%s: timeout or auth failure\n", Label);
             StopBestEffort(Header, Data, S);
             return 1;
         }
+        std::printf("nmi gate%s: status=0x%X\n", Label,
+                    static_cast<unsigned>(S.Status));
         if (S.Status != 0)
         {
-            std::printf("nmi: query status=0x%X\n", static_cast<unsigned>(S.Status));
             StopBestEffort(Header, Data, S);
             return 1;
         }
-        std::memcpy(&NmiBefore, Data, sizeof(NmiBefore));
-        std::printf("nmi: count=%llu\n", static_cast<unsigned long long>(NmiBefore));
-
-        if (!Submit(Header, Data, S, pb_nmi, 1, 0, 3000))
-        {
-            std::printf("nmi: self-test timeout or auth failure\n");
-            StopBestEffort(Header, Data, S);
-            return 1;
-        }
-        if (S.Status != 0)
-        {
-            std::printf("nmi: self-test status=0x%X\n", static_cast<unsigned>(S.Status));
-            StopBestEffort(Header, Data, S);
-            return 1;
-        }
-        uint64_t NmiHandled = 0;
-        std::memcpy(&NmiHandled, Data, sizeof(NmiHandled));
-        std::printf("nmi: self-test handled=%llu\n",
-                    static_cast<unsigned long long>(NmiHandled));
+        uint64_t Count = 0;
+        std::memcpy(&Count, Data, sizeof(Count));
+        std::printf("nmi gate%s: %s=%llu\n", Label,
+                    TicksMode ? "ticks" : "handled",
+                    static_cast<unsigned long long>(Count));
+        std::fflush(stdout);
         SecureZeroMemory(Data, PostboxDataMax);
-        if (NmiHandled == 0)
+    }
+
+    // Test-only NMI callback probe. The driver registers KeRegisterNmiCallback,
+    // sends HalSendNMI to each core, and reports the interrupted machine frame.
+    // InModule=0 for the mapped image is the expected detector hit; it proves the
+    // callback saw execution outside PsLoadedModuleList.
+    if (Options.NmiProbe)
+    {
+        if (!Submit(Header, Data, S, pb_nmi_probe, 0, 0, 20000))
         {
-            std::printf("nmi: self-test did not consume an NMI\n");
+            std::printf("nmi probe: timeout or auth failure\n");
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+        std::printf("nmi probe: status=0x%X\n", static_cast<unsigned>(S.Status));
+        if (S.Status != 0)
+        {
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+
+        PostboxNmiProbeResult Result{};
+        std::memcpy(&Result, Data, sizeof(Result));
+        uint32_t Cores = Result.CoreCount;
+        if (Cores > PostboxNmiProbeMaxCores)
+            Cores = PostboxNmiProbeMaxCores;
+        for (uint32_t i = 0; i < Cores; ++i)
+        {
+            const PostboxNmiProbeCore& Core = Result.Core[i];
+            std::printf("nmi core %u: count=%llu rip=%016llx rsp=%016llx user=%llu in_module=%llu\n",
+                        static_cast<unsigned>(i),
+                        static_cast<unsigned long long>(Core.Count),
+                        static_cast<unsigned long long>(Core.Rip),
+                        static_cast<unsigned long long>(Core.Rsp),
+                        static_cast<unsigned long long>(Core.User),
+                        static_cast<unsigned long long>(Core.InModule));
+        }
+        std::fflush(stdout);
+        SecureZeroMemory(Data, PostboxDataMax);
+    }
+
+    // Test-only mapped-code window: hold the driver inside its own image so an
+    // external NMI sampler (donnaskiez/nmi) can catch a RIP outside PsLoadedModuleList.
+    if (Options.NmiSpinMs != 0)
+    {
+        const uint32_t SpinMs = Options.NmiSpinMs;
+        if (!Submit(Header, Data, S, pb_nmi_probe, SpinMs, 0, SpinMs + 10000))
+        {
+            std::printf("nmi spin: timeout or auth failure\n");
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+        std::printf("nmi spin: status=0x%X ms=%u\n",
+                    static_cast<unsigned>(S.Status), static_cast<unsigned>(SpinMs));
+        std::fflush(stdout);
+        if (S.Status != 0)
+        {
             StopBestEffort(Header, Data, S);
             return 1;
         }
     }
 
-    // Test-only hold: run after the functional tests and the optional NMI checks, but
-    // before pb_stop, so the driver keeps its fast timer and NMI gate for the duration.
+    if (Options.NmiStatus)
+    {
+        // Test-only: prove the sanitizer activated (including after a late
+        // detector load) and show the last record it rewrote.
+        if (!Submit(Header, Data, S, pb_nmi_status, 0, 0, 5000))
+        {
+            std::printf("nmi status: timeout or auth failure\n");
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+        std::printf("nmi status: status=0x%X\n", static_cast<unsigned>(S.Status));
+        if (S.Status != 0)
+        {
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+        PostboxNmiStatus St{};
+        std::memcpy(&St, Data, sizeof(St));
+        std::printf("nmi status: magic=0x%X active=%u ready=%u detector=%016llx+%llx writes=%llu last_core=%llu last_count=%llu last_user=%llu last_rip=%016llx last_rsp=%016llx refresh_active=%llu refresh_run=%llu refresh_count=%llu list=%016llx nt=%016llx+%llx pslist=%016llx\n",
+                    St.Magic, St.Active, St.Ready,
+                    static_cast<unsigned long long>(St.DetectorBase),
+                    static_cast<unsigned long long>(St.DetectorSize),
+                    static_cast<unsigned long long>(St.Writes),
+                    static_cast<unsigned long long>(St.LastCore),
+                    static_cast<unsigned long long>(St.LastCount),
+                    static_cast<unsigned long long>(St.LastUser),
+                    static_cast<unsigned long long>(St.LastRip),
+                    static_cast<unsigned long long>(St.LastRsp),
+                    static_cast<unsigned long long>(St.RefreshActive),
+                    static_cast<unsigned long long>(St.RefreshRun),
+                    static_cast<unsigned long long>(St.RefreshCount),
+                    static_cast<unsigned long long>(St.ListHead),
+                    static_cast<unsigned long long>(St.NtBase),
+                    static_cast<unsigned long long>(St.NtSize),
+                    static_cast<unsigned long long>(St.PsLoadedModuleList));
+        std::fflush(stdout);
+        SecureZeroMemory(Data, PostboxDataMax);
+    }
+#endif
+
+#ifdef STACK_PROBE
+    if (Options.StackProbe)
+    {
+        if (!Submit(Header, Data, S, pb_stack_probe, 0, 0, 5000))
+        {
+            std::printf("stack probe: timeout or auth failure\n");
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+        std::printf("stack probe: status=0x%X\n", static_cast<unsigned>(S.Status));
+        if (S.Status != 0)
+        {
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+
+        PostboxStackProbeResult Result{};
+        std::memcpy(&Result, Data, sizeof(Result));
+        std::printf("stack probe: magic=0x%X hidden=%u gadget=%016llx real_rsp=%016llx fake_top=%016llx real_ret=%016llx spoof_gadget=%016llx spoof_ret=%016llx\n",
+                    Result.Magic, Result.Hidden,
+                    static_cast<unsigned long long>(Result.Gadget),
+                    static_cast<unsigned long long>(Result.RealRsp),
+                    static_cast<unsigned long long>(Result.FakeTop),
+                    static_cast<unsigned long long>(Result.RealRet),
+                    static_cast<unsigned long long>(Result.SpoofGadget),
+                    static_cast<unsigned long long>(Result.SpoofRet));
+        std::printf("stack walk: frames=%llu mapped_returns=%llu hits=%016llx %016llx %016llx %016llx\n",
+                    static_cast<unsigned long long>(Result.StackScanned),
+                    static_cast<unsigned long long>(Result.MappedHits),
+                    static_cast<unsigned long long>(Result.Hit0),
+                    static_cast<unsigned long long>(Result.Hit1),
+                    static_cast<unsigned long long>(Result.Hit2),
+                    static_cast<unsigned long long>(Result.Hit3));
+        std::printf("stack raw: hits=%llu scanned=%llu (executable window, informational)\n",
+                    static_cast<unsigned long long>(Result.RawHits),
+                    static_cast<unsigned long long>(Result.RawScanned));
+        std::fflush(stdout);
+        SecureZeroMemory(Data, PostboxDataMax);
+    }
+#endif
+
+    // Test-only hold: run after the functional tests, but before pb_stop, so the
+    // driver keeps its fast timer for the duration.
     if (Options.HoldMs != 0)
     {
         if (!HoldSession(Header, Data, S, Options.HoldMs, Options.HoldPingMs))
@@ -720,5 +894,14 @@ int PostboxClientMain(int argc, char** argv)
                 static_cast<unsigned>(S.Status));
     if (S.Status == 0)
         SecureZeroMemory(Base, PostboxBytes);
+
+    // The loader owns provider cleanup after the channel stops. Wait for it so a
+    // scripted caller that immediately queries services sees the final state.
+    if (g_LoaderProcess)
+    {
+        WaitForSingleObject(g_LoaderProcess, 30000);
+        CloseHandle(g_LoaderProcess);
+        g_LoaderProcess = nullptr;
+    }
     return S.Status == 0 ? 0 : 1;
 }

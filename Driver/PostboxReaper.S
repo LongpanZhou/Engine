@@ -16,17 +16,59 @@
 # and state page leak rather than being freed under a stalled worker.
 
 # Worker entry wrapper. ExpWorkerThread calls this with RCX = the work item
-# parameter. The C worker returns here; only after its epilogue/ret do we clear
-# PostboxInFlight, leaving just this wrapper's add/ret in image code when the
-# reaper observes InFlight == 0. This closes the pre-epilogue free window.
+# parameter. The C worker is entered through an nt `pop rsp; ret` gadget so the
+# return address on its stack is an nt address, not image+offset. The epilogue
+# restores the original stack, clears PostboxInFlight after the C worker's
+# epilogue/ret, and returns to ExpWorkerThread. This keeps the pre-epilogue free
+# window closed and removes the mapped worker return address from the stack.
     .text
     .globl PostboxWorkEntry
 PostboxWorkEntry:
+#ifdef STACK_SPOOF
+    movq g_PostboxPopRspRetSkip(%rip), %rax
+    testq %rax, %rax
+    jz 1f
+    pushq %r12
+    movq %rsp, %r12                 # [r12] = saved r12, [r12+8] = nt return
+    movq g_PostboxShadowJumpGadget(%rip), %rax
+    testq %rax, %rax
+    jz 2f
+    movq $0, g_PostboxShadowDepth(%rip)
+    movl $1, g_PostboxShadowActive(%rip)
+2:
+    leaq -0x60(%r12), %rsp
+    andq $-16, %rsp
+    subq $8, %rsp                   # C entry rsp % 16 == 8
+    movq g_PostboxPopRspRetSkip(%rip), %rax
+    movq %rax, 0(%rsp)              # C return = add-rsp-0x28; ret
+    movq g_PostboxPopRspRet(%rip), %rax
+    movq %rax, 0x30(%rsp)           # add-ret target = pop rsp; ret
+    leaq 0x40(%rsp), %rax
+    movq %rax, 0x38(%rsp)           # pop rsp -> epilogue slot
+    leaq PostboxWorkEpilogue(%rip), %rax
+    movq %rax, 0x40(%rsp)           # epilogue address
+    jmp PostboxWorkRoutine
+1:
     subq $0x28, %rsp
     call PostboxWorkRoutine
     movl $0, PostboxInFlight(%rip)
     addq $0x28, %rsp
     ret
+
+PostboxWorkEpilogue:
+    movl $0, g_PostboxShadowActive(%rip)
+    movq $0, g_PostboxShadowDepth(%rip)
+    movq %r12, %rsp
+    popq %r12
+    movl $0, PostboxInFlight(%rip)
+    ret
+#else
+    subq $0x28, %rsp
+    call PostboxWorkRoutine
+    movl $0, PostboxInFlight(%rip)
+    addq $0x28, %rsp
+    ret
+#endif
 
     .text
     .globl PostboxReaperEntry

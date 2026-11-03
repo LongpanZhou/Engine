@@ -38,10 +38,10 @@ if(MAPPED_SAFE)
     list(APPEND VARIANT_DEFINES NO_MAP_TABLE)
 endif()
 
-# Channel selection: the default is the named-section/system-thread channel in Channel.cpp.
-# POSTBOX_CHANNEL replaces it with the timer/work-item mailbox (AC-25). The Postbox build is
-# manual-map only: the entry's second argument is a PostboxConfig, not a provider image name.
-option(POSTBOX_CHANNEL "Use the timer/work-item Postbox channel instead of the named section" OFF)
+# Channel selection: the default is the stealth Postbox build (timer/work-item
+# mailbox). Set POSTBOX_CHANNEL=OFF for the legacy named-section/system-thread
+# channel in Channel.cpp (then also set MANUAL_MAP_ONLY=OFF).
+option(POSTBOX_CHANNEL "Use the timer/work-item Postbox channel instead of the named section" ON)
 if(POSTBOX_CHANNEL)
     list(APPEND VARIANT_DEFINES POSTBOX_CHANNEL)
 endif()
@@ -50,7 +50,7 @@ endif()
 # loader trace cleaners (Traces.cpp) and the hide/relink code (Hide.cpp), and stub
 # DriverExit to stop the timer and unlink the map table only. This removes dead
 # cleaner/lineage code from the mapped image.
-option(MANUAL_MAP_ONLY "Build a manual-map-only driver (requires POSTBOX_CHANNEL)" OFF)
+option(MANUAL_MAP_ONLY "Build a manual-map-only driver (requires POSTBOX_CHANNEL)" ON)
 if(MANUAL_MAP_ONLY)
     if(NOT POSTBOX_CHANNEL)
         message(FATAL_ERROR "MANUAL_MAP_ONLY requires POSTBOX_CHANNEL=ON")
@@ -58,18 +58,20 @@ if(MANUAL_MAP_ONLY)
     list(APPEND VARIANT_DEFINES MANUAL_MAP_ONLY)
 endif()
 
-# NMI gate: disabled. The constructed-IDT gate (PostboxNmi.S) is retained as
-# historical test code, but it is not a supported build: on Windows 10 19041 its
-# chain path can corrupt the interrupted thread's MXCSR save slot and bugcheck
-# 0x3B (0xC0000005) in KiSystemServiceExit. The default Postbox build keeps the
-# stock Windows IDT and has no NMI/IDT-hook artifact.
-option(POSTBOX_NMI "Unsupported: constructed-IDT NMI gate (disabled)" OFF)
-if(POSTBOX_NMI)
-    message(FATAL_ERROR "POSTBOX_NMI is disabled: the constructed-IDT gate caused "
-                        "0x3B (0xC0000005) stack corruption on 19041; use the plain "
-                        "Postbox build")
-endif()
+# NMI gate: constructed-IDT NMI self-test gate. Test-only, default OFF, never
+# part of the shipped build. The chain path is assembly-only and was validated
+# live: 20,007 chained accounted NMIs under a syscall-dense workload with no
+# bugcheck. It remains an IDT hook (IDTR/constructed table observable, and
+# PatchGuard may check the IDT), so the product keeps the stock Windows IDT.
+option(POSTBOX_NMI "Test-only constructed-IDT NMI gate" OFF)
 set(POSTBOX_NMI_SOURCES)
+if(POSTBOX_NMI)
+    if(NOT POSTBOX_CHANNEL)
+        message(FATAL_ERROR "POSTBOX_NMI requires POSTBOX_CHANNEL=ON")
+    endif()
+    list(APPEND VARIANT_DEFINES POSTBOX_NMI)
+    list(APPEND POSTBOX_NMI_SOURCES PostboxNmi.S)
+endif()
 
 # Test-only E3 probe: around the product KeIpiGenericCall, write to the .text
 # probe page from CPU 1 and record whether the stale RW TLB entry survived.
@@ -82,6 +84,76 @@ if(T2_PROBE)
     list(APPEND VARIANT_DEFINES T2_PROBE)
 endif()
 
+# Test-only E3 DPC probe: a CPU-1-targeted DPC remaps a test page's PTE and
+# records the stale read before the product KeIpiGenericCall flush and the
+# flushed read after it. Never part of the shipped build.
+option(E3_DPC_PROBE "Test-only DPC-based CPU-1 stale-TLB probe" OFF)
+if(E3_DPC_PROBE)
+    if(NOT POSTBOX_CHANNEL)
+        message(FATAL_ERROR "E3_DPC_PROBE requires POSTBOX_CHANNEL=ON")
+    endif()
+    list(APPEND VARIANT_DEFINES E3_DPC_PROBE)
+endif()
+
+# Test-only NMI callback probe: KeRegisterNmiCallback + HalSendNMI to every
+# core, record the interrupted machine frame, and check RIP against
+# PsLoadedModuleList. Never part of the shipped build.
+option(NMI_PROBE "Test-only NMI callback RIP/RSP probe" OFF)
+if(NMI_PROBE)
+    if(NOT POSTBOX_CHANNEL)
+        message(FATAL_ERROR "NMI_PROBE requires POSTBOX_CHANNEL=ON")
+    endif()
+    list(APPEND VARIANT_DEFINES NMI_PROBE)
+endif()
+
+# NMI sample sanitizer: register an NMI callback that runs after an external
+# detector's callback and rewrites the detector's recorded RIP to a valid
+# loaded-module address. Callback-list only: no IDT/TSS/SSDT or code hooks.
+# Shipped NMI-stealth mitigation; forced OFF only when the channel is absent.
+include(CMakeDependentOption)
+cmake_dependent_option(NMI_SANITIZE "Sanitize external NMI detector samples" ON "POSTBOX_CHANNEL" OFF)
+if(NMI_SANITIZE)
+    list(APPEND VARIANT_DEFINES NMI_SANITIZE)
+endif()
+
+# Pre-callback ordering: a PASSIVE monitor re-registers the sanitizer callback
+# at the head of KiNmiCallbackListHead while the detector is active, so the
+# frame trampoline runs before the detector's own callback. Shipped NMI-stealth
+# mitigation; forced OFF when the sanitizer is absent.
+cmake_dependent_option(NMI_FRAME_FIRST "Pre-callback NMI frame ordering" ON "NMI_SANITIZE" OFF)
+if(NMI_FRAME_FIRST)
+    list(APPEND VARIANT_DEFINES NMI_FRAME_FIRST)
+endif()
+
+# Call-site stack spoof: MmCopyVirtualMemory and the intra-image wrappers use a
+# fake/shadow return-address frame whose visible return is an nt gadget. This is
+# a shipped mitigation now; STACK_PROBE is the test-only in-driver probe that
+# exercises it. STACK_SPOOF depends on the NMI sanitizer's nt gadget finder.
+cmake_dependent_option(STACK_SPOOF "Call-site stack spoof (return-address shadow)" ON "NMI_SANITIZE" OFF)
+if(STACK_SPOOF)
+    list(APPEND VARIANT_DEFINES STACK_SPOOF)
+endif()
+
+# Test-only in-driver stack probe: records the visible return slots and the
+# shadow frame for the channel suite. Never part of the shipped build.
+option(STACK_PROBE "Test-only in-driver stack probe" OFF)
+if(STACK_PROBE)
+    if(NOT STACK_SPOOF)
+        message(FATAL_ERROR "STACK_PROBE requires STACK_SPOOF=ON")
+    endif()
+    list(APPEND VARIANT_DEFINES STACK_PROBE)
+endif()
+
+# One-shot + jittered timer: the timer is armed with a due time of PeriodMs plus an
+# rdtsc-derived jitter and re-armed from the DPC with an explicit running/generation
+# double-check, so _KTIMER.Period stays 0 and the timer table carries no fixed
+# polling-period signature. Shipped timer-signature stealth; forced OFF only when
+# the channel is absent.
+cmake_dependent_option(POSTBOX_ONESHOT_TIMER "Arm the Postbox timer one-shot with jitter, re-armed from the DPC" ON "POSTBOX_CHANNEL" OFF)
+if(POSTBOX_ONESHOT_TIMER)
+    list(APPEND VARIANT_DEFINES POSTBOX_ONESHOT_TIMER)
+endif()
+
 # Self-free reaper: the terminal work routine creates a system thread whose entry
 # is an assembly stub in the image. The stub tail-jumps to MmFreeIndependentPages,
 # so the free returns to PspSystemThreadStartup and no image instruction is fetched
@@ -90,6 +162,12 @@ set(POSTBOX_REAPER_SOURCES)
 if(POSTBOX_CHANNEL)
     enable_language(ASM)
     list(APPEND POSTBOX_REAPER_SOURCES PostboxReaper.S)
+    if(NMI_SANITIZE)
+        list(APPEND POSTBOX_REAPER_SOURCES PostboxNmiEntry.S)
+    endif()
+    if(STACK_SPOOF)
+        list(APPEND POSTBOX_REAPER_SOURCES PostboxStackSpoof.S)
+    endif()
 endif()
 
 # Driver entry point
@@ -137,7 +215,7 @@ target_link_options(Driver
 # environment instead of storing it in this file. Signing is skipped (with a warning) when either is missing.
 # The lab PFX subject names the developer ("WDKTestCert <user>,..."), which is a T7 artifact; a manual-map
 # payload does not need a signature, so deployments can configure -DDRIVER_SIGNING=OFF or replace the PFX.
-option(DRIVER_SIGNING "Sign Driver.sys with TestSign.pfx when the password is set" ON)
+option(DRIVER_SIGNING "Sign Driver.sys with TestSign.pfx when the password is set" OFF)
 find_program(SIGNTOOL signtool
         PATHS "C:/Program Files (x86)/Windows Kits/10/bin/x86"
               "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x86"
@@ -153,4 +231,28 @@ if(DRIVER_SIGNING AND SIGNTOOL AND DEFINED ENV{TESTSIGN_PFX_PASSWORD})
         )
 else()
         message(WARNING "Driver.sys will not be signed: needs signtool and the TESTSIGN_PFX_PASSWORD environment variable")
+endif()
+
+# Deployment guard: STEALTH_PROFILE=ON fails the configure unless every switch that
+# scans back is in its shipped state, so a lab variant can never be mistaken for a
+# deployment build. Lab experiments leave it off and configure normally.
+option(STEALTH_PROFILE "Fail the configure unless this is a stealth deployment build" ON)
+if(STEALTH_PROFILE)
+    if(DEBUG_BUILD)
+        message(FATAL_ERROR "STEALTH_PROFILE=ON requires DEBUG_BUILD=OFF (print() is a shipped-image giveaway)")
+    endif()
+    if(NOT POSTBOX_CHANNEL OR NOT MANUAL_MAP_ONLY OR NOT MAPPED_SAFE)
+        message(FATAL_ERROR "STEALTH_PROFILE=ON requires POSTBOX_CHANNEL=ON, MANUAL_MAP_ONLY=ON, MAPPED_SAFE=ON")
+    endif()
+    if(NOT NMI_SANITIZE OR NOT STACK_SPOOF OR NOT NMI_FRAME_FIRST OR NOT POSTBOX_ONESHOT_TIMER)
+        message(FATAL_ERROR "STEALTH_PROFILE=ON requires NMI_SANITIZE=ON, STACK_SPOOF=ON, NMI_FRAME_FIRST=ON and POSTBOX_ONESHOT_TIMER=ON (shipped mitigations)")
+    endif()
+    foreach(_Probe T2_PROBE E3_DPC_PROBE NMI_PROBE STACK_PROBE POSTBOX_NMI)
+        if(${_Probe})
+            message(FATAL_ERROR "STEALTH_PROFILE=ON forbids ${_Probe} (test build)")
+        endif()
+    endforeach()
+    if(DRIVER_SIGNING)
+        message(FATAL_ERROR "STEALTH_PROFILE=ON requires DRIVER_SIGNING=OFF (a manual-map payload carries no signature)")
+    endif()
 endif()

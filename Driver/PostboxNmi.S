@@ -1,15 +1,19 @@
 # Postbox NMI gate: entered directly from the constructed IDT vector 2.
 #
 # The CPU has already pushed the interrupted context (RIP/CS/RFLAGS and, on a
-# privilege change, RSP/SS). Save the general registers, call the C dispatcher,
-# then either:
-#   - consume the NMI (self-test) and iretq, or
-#   - restore the saved registers and jump to the Windows NMI handler with the
+# privilege change, RSP/SS) on the NMI stack. The stub saves all 15 GPRs below
+# the entry RSP, updates the diagnostic counters with lock-prefixed ops, then:
+#   - consumes a self-test NMI and iretq's, or
+#   - restores the saved registers and jumps to the Windows NMI handler with the
 #     original trap frame still at the top of the stack.
 #
-# The jump is memory-indirect so no register is clobbered on the chain path.
-# DF is cleared for the C ABI; the trap frame's RFLAGS (and therefore the
-# interrupted context's DF) is restored by iretq or by the Windows handler.
+# No C call and no stack switch: every write is either below the entry RSP or a
+# RIP-relative global, so the interrupted context and its trap frame cannot be
+# touched. The stub executes no XMM/FP instructions.
+#
+# After the 15 pushes: [rsp+0x78] = interrupted RIP, [rsp+0x80] = interrupted CS.
+# PostboxNmiInFlight / PostboxNmiSelfTestPending are 32-bit longs; the counters
+# and saved RIP/CS are 64-bit.
 
     .text
     .globl PostboxNmiStub
@@ -31,15 +35,44 @@ PostboxNmiStub:
     pushq %r15
 
     cld
-    movq %rsp, %rbp
-    movq %rsp, %rcx
-    andq $-16, %rsp
-    subq $0x20, %rsp
-    call PostboxNmiDispatch
-    movq %rbp, %rsp
+    lock incl PostboxNmiInFlight(%rip)
+    lock incq PostboxNmiTicks(%rip)
+    movq 0x78(%rsp), %rax
+    movq %rax, PostboxNmiLastRip(%rip)
+    movq 0x80(%rsp), %rax
+    movq %rax, PostboxNmiLastCs(%rip)
 
-    testb %al, %al
-    jne 1f
+    # Consume a pending self-test NMI. xchg with memory is implicitly locked.
+    xorl %eax, %eax
+    xchgl %eax, PostboxNmiSelfTestPending(%rip)
+    testl %eax, %eax
+    jz 2f
+
+    lock incq PostboxNmiHandled(%rip)
+    movq 0x78(%rsp), %rax
+    movq %rax, PostboxNmiLastHandledRip(%rip)
+    lock decl PostboxNmiInFlight(%rip)
+
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rbp
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    popq %rbx
+    popq %rax
+    iretq
+
+2:
+    # Chain to the Windows NMI handler with the original trap frame intact.
+    lock decl PostboxNmiInFlight(%rip)
 
     popq %r15
     popq %r14
@@ -57,21 +90,3 @@ PostboxNmiStub:
     popq %rbx
     popq %rax
     jmp *PostboxOriginalNmiHandler(%rip)
-
-1:
-    popq %r15
-    popq %r14
-    popq %r13
-    popq %r12
-    popq %r11
-    popq %r10
-    popq %r9
-    popq %r8
-    popq %rbp
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    popq %rcx
-    popq %rbx
-    popq %rax
-    iretq

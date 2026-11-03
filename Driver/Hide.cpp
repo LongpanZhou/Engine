@@ -21,16 +21,11 @@ constexpr uint32_t ObjectCreatorInfoSize = 0x20;
 // A malformed object-directory chain must not turn a walk into an endless loop
 constexpr uint32_t MaxObjectDirectoryEntries = 0x1000;
 
-constexpr uint64_t ObjectKernelFloor = 0xFFFF800000000000ull;
+// ObjectKernelFloor / IsObjectKernelPointer live in Lib/pure.h (host-unit-tested).
 
 static_assert(sizeof(_OBJECT_HEADER) == 0x30, "unexpected OBJECT_HEADER layout");
 static_assert(sizeof(_OBJECT_HEADER_NAME_INFO) == 0x20, "unexpected OBJECT_HEADER_NAME_INFO layout");
 static_assert(sizeof(_OBJECT_DIRECTORY_ENTRY) == 0x10, "unexpected OBJECT_DIRECTORY_ENTRY layout");
-
-static bool IsObjectKernelPointer(uint64_t Value)
-{
-    return Value >= ObjectKernelFloor;
-}
 
 // Returns the name info only when InfoMask says it exists and the record itself looks sane. The caller
 // still decides whether a missing Directory means "nothing to unlink" or a malformed object
@@ -673,3 +668,89 @@ bool VerifyPeHeaderRemoved(win::DRIVER_OBJECT* DriverObject)
     // MZ is still present: require the NT offset to be gone as well.
     return Dos->e_lfanew == 0;
 }
+
+#ifdef DEBUG
+// Debug-only self-test: the driver's loader entry is in PsLoadedModuleList,
+// unlink removes it, relink restores it. A manual-map build has no loader entry
+// (DriverSection == null) and skips.
+static bool IsDriverInModuleList(win::DRIVER_OBJECT* DriverObject)
+{
+    if (!DriverObject || !DriverObject->DriverSection) return false;
+
+    auto* Entry = (_KLDR_DATA_TABLE_ENTRY*) DriverObject->DriverSection;
+    auto* Head = (_LIST_ENTRY*) __imp_PsLoadedModuleList;
+    if (!Head) return false;
+
+    for (auto* Cur = Head->Flink; Cur && Cur != Head; Cur = Cur->Flink)
+    {
+        if (Cur == &Entry->InLoadOrderLinks) return true;
+    }
+    return false;
+}
+
+bool VerifyModuleListRoundTrip(win::DRIVER_OBJECT* DriverObject)
+{
+    if (!DriverObject || !DriverObject->DriverSection)
+    {
+        print(INFO("VerifyModuleList: no loader entry (manual map), skipped"));
+        return true;
+    }
+    if (!IsDriverInModuleList(DriverObject))
+    {
+        print(ERROR("VerifyModuleList: driver is not in PsLoadedModuleList"));
+        return false;
+    }
+    if (!UnlinkDriverFromModuleList(DriverObject)) return false;
+    if (IsDriverInModuleList(DriverObject))
+    {
+        print(ERROR("VerifyModuleList: unlink left the entry reachable"));
+        return false;
+    }
+    if (!RelinkDriverIntoModuleList(DriverObject)) return false;
+    if (!IsDriverInModuleList(DriverObject))
+    {
+        print(ERROR("VerifyModuleList: relink did not restore the entry"));
+        return false;
+    }
+    print(OK("VerifyModuleList: unlink/relink round trip passed"));
+    return true;
+}
+
+// Debug-only self-test: erase the PE header (saving it), require MZ/PE gone,
+// restore it, require the MZ and NT signature back. Manual-map builds publish
+// headerless and skip.
+bool VerifyPeHeaderRoundTrip(win::DRIVER_OBJECT* DriverObject)
+{
+    if (!DriverObject || !DriverObject->DriverStart)
+    {
+        print(INFO("VerifyPeHeader: no image header (manual map), skipped"));
+        return true;
+    }
+    if (!ErasePeHeader(DriverObject)) return false;
+    if (!VerifyPeHeaderRemoved(DriverObject))
+    {
+        print(ERROR("VerifyPeHeader: header still present after erase"));
+        RestorePeHeader();
+        return false;
+    }
+    if (!RestorePeHeader()) return false;
+
+    const auto* Dos = (const _IMAGE_DOS_HEADER*) DriverObject->DriverStart;
+    if (Dos->e_magic != PeDosMagic)
+    {
+        print(ERROR("VerifyPeHeader: MZ not restored"));
+        return false;
+    }
+    uint32_t Signature = 0;
+    __builtin_memcpy(&Signature,
+                     (const uint8_t*) DriverObject->DriverStart + Dos->e_lfanew,
+                     sizeof(Signature));
+    if (Signature != 0x00004550)
+    {
+        print(ERROR("VerifyPeHeader: PE signature not restored"));
+        return false;
+    }
+    print(OK("VerifyPeHeader: erase/restore round trip passed"));
+    return true;
+}
+#endif

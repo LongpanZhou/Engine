@@ -2,13 +2,11 @@
 #include <cstddef>
 #include <cstdint>
 
-// Build-identity marker. The section name and tag are intentionally not the
-// historical ".pbox"/"PBOXABI" strings. Keep the section name at most 8 bytes
-// (PE section name limit). Both the driver and the loader include this header.
-#define POSTBOX_SECTION_NAME ".pbx7Q2a"
-#define POSTBOX_MARKER_TAG "PBX7Q2A"
-constexpr char PostboxSectionName[] = POSTBOX_SECTION_NAME;
-constexpr char PostboxMarkerTag[] = POSTBOX_MARKER_TAG;
+// Build identity is a 64-bit FNV-1a hash of the driver file. The loader embeds
+// only this value; the driver carries no marker section or ASCII tag.
+#ifndef POSTBOX_BUILD_HASH
+constexpr uint64_t POSTBOX_BUILD_HASH = 0x9061d574d28ac4b2ull;   // FNV-1a of Driver.sys
+#endif
 
 // Postbox: the driver <-> client mailbox described in out/research/AC-25_channel.md.
 //
@@ -39,7 +37,88 @@ enum PostboxOp : uint32_t
     pb_write = 3,
     pb_stop = 4,
     pb_nmi = 5,             // POSTBOX_NMI builds only: query/self-test the NMI gate
+    pb_nmi_probe = 6,       // NMI_PROBE test builds only: callback RIP/RSP probe
+    pb_stack_probe = 7,     // STACK_SPOOF test builds only: call-site stack capture
+    pb_nmi_status = 8,      // NMI_PROBE test builds only: sanitizer activation/rewrite state
 };
+
+// Test-only NMI callback probe result. The driver registers KeRegisterNmiCallback,
+// sends HalSendNMI to each core, and records the interrupted machine frame. The
+// client prints this; the product build never uses it.
+constexpr uint32_t PostboxNmiProbeMaxCores = 16;
+struct PostboxNmiProbeCore
+{
+    uint64_t Rip;
+    uint64_t Rsp;
+    uint64_t Count;
+    uint64_t InModule;
+    uint64_t User;
+};
+static_assert(sizeof(PostboxNmiProbeCore) == 0x28, "NMI probe core ABI changed");
+
+struct PostboxNmiProbeResult
+{
+    uint32_t CoreCount;
+    uint32_t Reserved;
+    PostboxNmiProbeCore Core[PostboxNmiProbeMaxCores];
+};
+static_assert(sizeof(PostboxNmiProbeResult) == 8 + 16 * 0x28, "NMI probe result ABI changed");
+
+#ifdef NMI_PROBE
+// Test-only sanitizer status. Reports whether the NMI sanitizer activated, the
+// detector range it resolved, and the last record it rewrote (preserved count,
+// real user flag, core, sanitized RIP/RSP). Product builds never compile it.
+constexpr uint32_t PostboxNmiStatusMagic = 0x53544E4D;   // "MNTS"
+struct PostboxNmiStatus
+{
+    uint32_t Magic;
+    uint32_t Active;
+    uint32_t Ready;
+    uint32_t Reserved;
+    uint64_t DetectorBase;
+    uint64_t DetectorSize;
+    uint64_t Writes;
+    uint64_t LastCount;
+    uint64_t LastUser;
+    uint64_t LastCore;
+    uint64_t LastRip;
+    uint64_t LastRsp;
+    uint64_t RefreshActive;
+    uint64_t RefreshRun;
+    uint64_t RefreshCount;
+    uint64_t ListHead;
+    uint64_t NtBase;
+    uint64_t NtSize;
+    uint64_t PsLoadedModuleList;
+};
+static_assert(sizeof(PostboxNmiStatus) == 0x88, "NMI status ABI changed");
+#endif
+
+// Test-only call-site stack probe. The MmCopyVirtualMemory trampoline records
+// the fake-stack gadget, the real RSP, and the mapped real return address.
+#ifdef STACK_PROBE
+constexpr uint32_t PostboxStackProbeMagic = 0x4F4F5053;   // "SPOO"
+struct PostboxStackProbeResult
+{
+    uint32_t Magic;
+    uint32_t Hidden;
+    uint64_t Gadget;
+    uint64_t RealRsp;
+    uint64_t FakeTop;
+    uint64_t RealRet;
+    uint64_t SpoofGadget;
+    uint64_t SpoofRet;
+    uint64_t MappedHits;
+    uint64_t StackScanned;
+    uint64_t Hit0;
+    uint64_t Hit1;
+    uint64_t Hit2;
+    uint64_t Hit3;
+    uint64_t RawHits;
+    uint64_t RawScanned;
+};
+static_assert(sizeof(PostboxStackProbeResult) == 0x78, "stack probe result ABI changed");
+#endif
 
 // Naturally aligned: the atomic fields are 4-byte aligned and the 8-byte fields are
 // 8-byte aligned. Packing this struct would make the atomic accesses unaligned.
@@ -61,14 +140,14 @@ static_assert(sizeof(PostboxHeader) == PostboxDataAt, "header must end at the bo
 static_assert((offsetof(PostboxHeader, Seq) % 4) == 0, "Seq must be 4-byte aligned");
 static_assert((offsetof(PostboxHeader, Address) % 8) == 0, "Address must be 8-byte aligned");
 
-constexpr uint32_t PostboxConfigMagic = 0x50424F58;   // "PBOX"
+constexpr uint32_t PostboxConfigMagic = 0x8E2B41D7;   // non-ASCII config tag
 
 // The mapped image is headerless and .pdata/.reloc are zeroed, so the driver cannot
 // parse its own PE section table at runtime. The loader builds this compact layout
 // from the file and passes it in the config. The driver applies it to the image PTE
 // block before the channel starts: .text RX, writable sections RW/NX, everything
 // else (header, .rdata, .pdata, .reloc, .pbox, pool padding) R/NX.
-constexpr uint32_t PostboxLayoutMagic = 0x59414C50;   // "PLAY"
+constexpr uint32_t PostboxLayoutMagic = 0x3C9A6F52;   // non-ASCII layout tag
 constexpr uint32_t PostboxLayoutVersion = 1;
 constexpr uint32_t PostboxMaxSections = 8;
 
@@ -96,7 +175,7 @@ struct PostboxImageLayout
     uint64_t RawBase;               // pool allocation base (may precede ImageBase)
     uint64_t ImageBase;             // aligned mapped image base
     uint64_t AllocSize;             // page-rounded pool allocation size
-    uint64_t Reserved;
+    uint64_t NtoskrnlBase;          // loader-resolved ntoskrnl image base
     PostboxSectionLayout Sections[PostboxMaxSections];
 };
 
@@ -121,12 +200,13 @@ struct PostboxConfig
     uint64_t MmFreeIndependentPages;// loader-resolved stage free routine
 };
 
-// Client -> loader bootstrap handoff, carried in a pagefile-backed named section.
-// The client creates the section (random name, explicit DACL), maps it RW, writes
-// this record, and passes the name on the loader command line. The loader opens
-// the section read-only, copies the
-// record, unmaps/closes, and never touches the client address space. The section
-// is page-granular and is deleted when the last handle closes.
+// Client -> loader bootstrap handoff, carried in an unnamed pagefile-backed
+// section. The client creates the section, keeps the creation handle, and spawns
+// the loader with only that handle inherited. The loader maps the inherited
+// handle, copies the record, unmaps/closes, and never touches the client address
+// space. There is no name or DACL to discover; the handle value is passed on the
+// loader command line. The section is page-granular and is deleted when the last
+// handle closes.
 //
 // CreateTime is not independently verified by the loader any more (that needed a
 // process handle + GetProcessTimes). The driver re-checks it with
@@ -174,3 +254,148 @@ static_assert(offsetof(PostboxConfig, MmSetPageProtection) == 0x50,
 static_assert(offsetof(PostboxConfig, Layout) == 0x58, "Layout offset changed");
 static_assert(offsetof(PostboxConfig, MmFreeIndependentPages) == 0x108,
               "MmFreeIndependentPages offset changed");
+
+// ---------------------------------------------------------------------------
+// Config validation shared by the driver's PostboxStart and the host unit
+// tests. Pure: no kernel calls and no side effects. On failure, *error (when
+// non-null) receives the value PostboxStart reports in PostboxStartFailure for
+// an invalid config (30, the entry value; the loader treats any non-zero as a
+// failure). The checks run BEFORE MemSetPreStartNtoskrnl, so an invalid config
+// does no kernel work.
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t PostboxConfigVersion = 4;
+constexpr uint32_t PostboxConfigReservedIndependent = 1;
+
+// MmCopyMemory's documented user path stops below MmUserProbeAddress, not at
+// 2^47. Use the tighter bound for every mailbox/target range check so a request
+// near the old limit fails cleanly in PostboxCopy instead of inside the API.
+constexpr uint64_t PostboxUserLimit = 0x00007FFFFFFF0000ull;
+
+// Page-flag precedence when several sections share one page: executable wins
+// (never downgrade a code page), then writable, else read-only/NX.
+inline uint32_t PostboxMergePageFlags(uint32_t Current, uint32_t Incoming)
+{
+    if (Incoming == PostboxPageRx) return PostboxPageRx;
+    if (Incoming == PostboxPageRwNx && Current != PostboxPageRx) return PostboxPageRwNx;
+    return Current;
+}
+
+// Protocol body lengths shared by the driver poll and the client, so the two
+// sides cannot drift. A request carries a body only for pb_write.
+inline uint32_t PostboxRequestBodyLen(uint32_t Op, uint32_t Size)
+{
+    return Op == pb_write ? Size : 0;
+}
+
+// A response carries no body when the request failed; pb_read returns Size,
+// pb_nmi returns 8, and the probe/status ops return their fixed result structs.
+inline uint32_t PostboxResponseBodyLen(int32_t Status, uint32_t Op, uint32_t Size)
+{
+    if (Status != 0) return 0;
+    switch (Op)
+    {
+    case pb_read: return Size;
+    case pb_nmi:  return static_cast<uint32_t>(sizeof(uint64_t));
+#ifdef NMI_PROBE
+    case pb_nmi_probe:  return static_cast<uint32_t>(sizeof(PostboxNmiProbeResult));
+    case pb_nmi_status: return static_cast<uint32_t>(sizeof(PostboxNmiStatus));
+#endif
+#ifdef STACK_PROBE
+    case pb_stack_probe: return static_cast<uint32_t>(sizeof(PostboxStackProbeResult));
+#endif
+    default: return 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PostboxPollAttached decision rules, extracted so the host tests can exercise
+// every branch without a live client mailbox.
+// ---------------------------------------------------------------------------
+
+enum class PostboxSeqVerdict
+{
+    Reject,        // not the next sequence and not the same sequence
+    Idle,          // same Seq/session/nonce, already acknowledged: keepalive only
+    AuthFailure,   // session mismatch or nonce did not advance
+    Candidate,     // next Seq (or same-Seq stop candidate): open/MAC it
+};
+
+inline PostboxSeqVerdict PostboxSequenceVerdict(uint32_t Seq, uint32_t LastSeq,
+                                                uint64_t SessionId,
+                                                uint64_t ExpectedSessionId,
+                                                uint64_t Nonce, uint64_t LastNonce,
+                                                uint32_t Ack)
+{
+    const int32_t Ahead = static_cast<int32_t>(Seq - LastSeq);
+    const bool SameSeq = (Ahead == 0);
+
+    // Accept the next sequence for a normal request. A same-Seq request is only
+    // considered for an authenticated pb_stop: after a lost response the client
+    // reuses the last Seq, so the stop must work whether the driver processed
+    // the original request or not.
+    if (Ahead != 1 && !SameSeq) return PostboxSeqVerdict::Reject;
+
+    // A valid idle header is the only unauthenticated state that keeps the
+    // watchdog alive: same session, same nonce, acknowledged sequence. A
+    // wrong-session or far-ahead header must not reset it.
+    if (SameSeq && SessionId == ExpectedSessionId && Nonce == LastNonce && Ack == Seq)
+        return PostboxSeqVerdict::Idle;
+
+    if (SessionId != ExpectedSessionId || Nonce <= LastNonce)
+        return PostboxSeqVerdict::AuthFailure;
+
+    return PostboxSeqVerdict::Candidate;
+}
+
+// Pre-MAC shape check: known op, body-size rule (zero-body ops must be Size 0,
+// all others nonzero), and the same-Seq restriction to pb_stop.
+inline bool PostboxRequestShapeOk(bool KnownOp, bool ZeroBodyOp, uint32_t Op,
+                                  uint32_t Size, uint32_t StageBytes, bool SameSeq)
+{
+    const bool SizeOk = Size <= StageBytes && (ZeroBodyOp ? Size == 0 : Size != 0);
+    return KnownOp && SizeOk && !(SameSeq && Op != pb_stop);
+}
+
+// Post-MAC read/write range check: the target must be a user VA below
+// MmUserProbeAddress, the size must fit the stage, and a write must not
+// overlap the mailbox header (it would clobber Seq/Ack/Status mid-request).
+inline bool PostboxRequestRangeOk(uint32_t Op, uint32_t Size, uint64_t Address,
+                                  uint64_t MailboxVa, uint32_t StageBytes)
+{
+    if (Op != pb_read && Op != pb_write) return true;
+
+    const bool InRange = Address && Address < PostboxUserLimit && Size <= StageBytes &&
+                         Address <= (PostboxUserLimit - 1 - Size);
+    const bool OverlapsHeader = InRange && Op == pb_write && Size != 0 &&
+                                Address < MailboxVa + PostboxDataAt &&
+                                Address + Size > MailboxVa;
+    return InRange && !OverlapsHeader;
+}
+
+inline bool PostboxConfigValid(const PostboxConfig& cfg, uint32_t* error = nullptr)
+{
+    auto fail = [&]() { if (error) *error = 30; return false; };
+
+    if (cfg.Magic != PostboxConfigMagic || cfg.Version != PostboxConfigVersion ||
+        !cfg.Pid || !cfg.MailboxVa || !cfg.CreateTime || !cfg.SessionId)
+        return fail();
+    if (!cfg.Layout.NtoskrnlBase) return fail();
+    // The self-free reaper may only call MmFreeIndependentPages on an
+    // independent allocation; a pool image must fail closed.
+    if (!(cfg.Reserved & PostboxConfigReservedIndependent)) return fail();
+    if (cfg.MailboxVa > PostboxUserLimit - PostboxBytes || (cfg.MailboxVa & 7))
+        return fail();
+
+    bool keyNonZero = false;
+    for (uint32_t i = 0; i < sizeof(cfg.Key); ++i)
+        keyNonZero |= (cfg.Key[i] != 0);
+    if (!keyNonZero) return fail();
+
+    if (!cfg.MmAllocateIndependentPages || !cfg.MmSetPageProtection ||
+        !cfg.MmFreeIndependentPages)
+        return fail();
+
+    if (error) *error = 0;
+    return true;
+}

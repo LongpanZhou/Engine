@@ -1885,6 +1885,39 @@ bool CleanDriverTraces(win::DRIVER_OBJECT* DriverObject)
 // manual-map path uses it to remove the staged provider's records while the provider is still resident.
 // Timestamp 0 keeps the PiDDB match strictly name-based: PiDDBEntryIsTarget only compares timestamps
 // when the value is non-zero, so an unknown timestamp never acts as a wildcard
+#ifdef DEBUG
+// Debug-only self-test: after CleanDriverTraces has run, a second clear pass on
+// the now-empty PiDDB / MmUnloadedDrivers / CI hash-bucket / WdFilter state must
+// succeed, and the verifiers must find no record naming this driver.
+bool VerifyEmptyTraceState(win::DRIVER_OBJECT* DriverObject)
+{
+    if (!DriverObject || !DriverObject->DriverSection)
+    {
+        print(INFO("VerifyEmptyTrace: no loader entry (manual map), skipped"));
+        return true;
+    }
+
+    auto* Kldr = (_KLDR_DATA_TABLE_ENTRY*) DriverObject->DriverSection;
+    const bool PiDDB = ClearPiDDBCache(&Kldr->BaseDllName, Kldr->TimeDateStamp);
+    const bool MmU = ClearMmUnloadedDrivers(&Kldr->BaseDllName, Kldr->TimeDateStamp);
+    const bool Hash = ClearKernelHashBucketList(&Kldr->BaseDllName, Kldr->TimeDateStamp);
+    const bool WdF = ClearWdFilterDriverList(&Kldr->BaseDllName, Kldr->TimeDateStamp);
+
+    VerifyPiDDBCache(&Kldr->BaseDllName, Kldr->TimeDateStamp);
+    VerifyMmUnloadedDrivers(&Kldr->BaseDllName, Kldr->TimeDateStamp);
+    VerifyKernelHashBucketList(&Kldr->BaseDllName, Kldr->TimeDateStamp);
+    VerifyWdFilterDriverList(&Kldr->BaseDllName, Kldr->TimeDateStamp);
+
+    if (!PiDDB || !MmU || !Hash || !WdF)
+    {
+        print(ERROR("VerifyEmptyTrace: second clear pass failed"));
+        return false;
+    }
+    print(OK("VerifyEmptyTrace: empty-state clear/verify passed"));
+    return true;
+}
+#endif
+
 bool CleanExtraTraces(const _UNICODE_STRING* Target)
 {
     // The manual-map second parameter is only a candidate: require the structure itself to be

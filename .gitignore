@@ -63,3 +63,25 @@ Desktop.ini
 
 # Stray file from a broken PowerShell redirect (literally this name)
 System.Management.Automation.Internal.Host.InternalHost
+
+# ---------------------------------------------------------------------------
+# Host test outputs / local verification artifacts (do not publish)
+# ---------------------------------------------------------------------------
+tests/host/out/
+tests/host/**/out/
+*.exe
+*.dll
+*.sys
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.o
+*.obj
+
+# CMake-generated seed (recreated by the configure step)
+Driver/seed.h
+
+# Local agent/tool state and workspace notes
+.codegraph/
+AGENTS.md

@@ -10,8 +10,26 @@ enum pagesize : uint32_t
 // CR3 of the System process: maps all kernel memory and is fixed for the rest of the boot. Filled lazily
 // (the value only exists after boot); every later caller reuses the runtime global
 static uint64_t SystemCr3Value = 0;
+static uint64_t CachedPsInitialSystemProcess = 0;
+static uint64_t CachedPsLoadedModuleList = 0;
+static uint64_t PreStartNtoskrnl = 0;
 cr3 GetSystemCr3()
 {
+#ifdef POSTBOX_CHANNEL
+    uint64_t Value = __atomic_load_n(&SystemCr3Value, __ATOMIC_SEQ_CST);
+    if (!Value)
+    {
+        PostboxMemCaches* Caches = PostboxGetMemCaches();
+        uint64_t PsInitial = Caches ? Caches->PsInitialSystemProcess : 0;
+        if (!PsInitial)
+            PsInitial = __atomic_load_n(&CachedPsInitialSystemProcess, __ATOMIC_SEQ_CST);
+        if (!PsInitial)
+            return cr3{0};
+        Value = ((_KPROCESS *) *(_KPROCESS **) (uintptr_t) PsInitial)->DirectoryTableBase;
+        __atomic_store_n(&SystemCr3Value, Value, __ATOMIC_SEQ_CST);
+    }
+    return cr3{Value};
+#else
     uint64_t Value = __atomic_load_n(&SystemCr3Value, __ATOMIC_SEQ_CST);
     if (!Value)
     {
@@ -19,6 +37,7 @@ cr3 GetSystemCr3()
         __atomic_store_n(&SystemCr3Value, Value, __ATOMIC_SEQ_CST);
     }
     return cr3{Value};
+#endif
 }
 
 // Claims an empty entry (all-zero) for a mapping, atomically, so a live mapping's entry is never taken
@@ -37,6 +56,21 @@ void ReleaseEntry(T *Entry)
 {
     __atomic_store_n((uint64_t *) Entry, 0, __ATOMIC_SEQ_CST);
 }
+
+// Scope guard for one claimed mapping slot. ReleaseEntry runs exactly once, on every
+// exit path between the claim and the callback's return, so a failed lookup or an early
+// return cannot leave a present PTE pointing at arbitrary physical memory. A bugcheck
+// bypasses destructors, so the crash window stays open: the guard closes early returns,
+// not crashes
+template<typename T>
+struct ClaimGuard
+{
+    T *Slot;
+    explicit ClaimGuard(T *Raw) : Slot(Raw) {}
+    ClaimGuard(const ClaimGuard &) = delete;
+    ClaimGuard &operator=(const ClaimGuard &) = delete;
+    ~ClaimGuard() { ReleaseEntry(Slot); }
+};
 
 // The dedicated table: one 4 KB page of 512 slots in the driver image, for 4 KB mappings while linked
 alignas(4096) uint64_t MapTableStorage[512];
@@ -65,9 +99,9 @@ bool MapInDedicatedTable(address PhysicalAddress, T &&Callback)
         Value.execute_disable = 1;
         Value.page_frame_number = PhysicalAddress >> 12;
         if (!ClaimEntry(Entry, Value)) continue;
+        ClaimGuard<pte> Holder(Entry);   // releases the slot on every exit path
 
         Callback(address(MapTableBase + (uint64_t) Slot * 0x1000 + PhysicalAddress.offset));
-        ReleaseEntry(Entry);
         return true;
     }
     return false;
@@ -347,8 +381,100 @@ static uint64_t CachedNtoskrnl = 0;
 static uint64_t CachedPteBase = 0;
 static uint64_t CachedPfnPteAddressBase = 0;
 
+// SEED-XOR decode an export name into a stack buffer. The two data-export names are
+// stored through Crypt.cpp's EncodeName, so the mapped image's .rdata carries neither
+// plaintext nor ROT1-decipherable "PsInitialSystemProcess"/"PsLoadedModuleList"
+// strings: every stored byte sits in 0x80..0xFF, and neither the plain-ASCII scan
+// nor the ROT1 key reads it back. Decode is the same XOR into a stack buffer
+static void MemDecodeName(const char* Encoded, char* Out, uint32_t OutSize)
+{
+    uint32_t i = 0;
+    for (; i + 1 < OutSize && Encoded[i]; ++i)
+        Out[i] = (char) ((unsigned char) Encoded[i] ^ SEED);
+    Out[i] = 0;
+}
+
+// The loader supplies the ntoskrnl base before ProtectImageSections calls
+// PostboxResolve. Resolve the two data exports here and keep them in the
+// transient cache until MemAdoptCaches() moves them to the state page.
+void MemSetPreStartNtoskrnl(uint64_t Base)
+{
+    __atomic_store_n(&PreStartNtoskrnl, Base, __ATOMIC_SEQ_CST);
+    if (!Base) return;
+    __atomic_store_n(&CachedNtoskrnl, Base, __ATOMIC_SEQ_CST);
+
+    static constexpr EncodedName EncodedPsInitial = EncodeName("PsInitialSystemProcess");
+    static constexpr EncodedName EncodedPsLoaded = EncodeName("PsLoadedModuleList");
+    char PsInitialName[32];
+    char PsLoadedName[32];
+    MemDecodeName(EncodedPsInitial.Bytes, PsInitialName, sizeof(PsInitialName));
+    MemDecodeName(EncodedPsLoaded.Bytes, PsLoadedName, sizeof(PsLoadedName));
+
+    if (!CachedPsInitialSystemProcess)
+        CachedPsInitialSystemProcess =
+            (uint64_t) (uintptr_t) FindFuncExports((address) Base, PsInitialName);
+    if (!CachedPsLoadedModuleList)
+        CachedPsLoadedModuleList =
+            (uint64_t) (uintptr_t) FindFuncExports((address) Base, PsLoadedName);
+
+    for (uint32_t i = 0; i < sizeof(PsInitialName); ++i)
+        ((volatile char*) PsInitialName)[i] = 0;
+    for (uint32_t i = 0; i < sizeof(PsLoadedName); ++i)
+        ((volatile char*) PsLoadedName)[i] = 0;
+}
+
+#ifdef DEBUG
+// Debug-only self-test (DriverEntry step 0.7): MemSetPreStartNtoskrnl must
+// resolve the two data exports to the same addresses the import slots carry,
+// and the SEED-XOR name decode must recover the plaintext. Runs before
+// PostboxStart moves the caches into the state page.
+bool VerifyMemSetPreStartNtoskrnl(uint64_t NtoskrnlBase)
+{
+    if (!NtoskrnlBase)
+    {
+        print(ERROR("VerifyMemSetPreStartNtoskrnl: no ntoskrnl base"));
+        return false;
+    }
+    MemSetPreStartNtoskrnl(NtoskrnlBase);
+
+    bool Ok = true;
+    const uint64_t ExpectedInitial = (uint64_t) (uintptr_t) __imp_PsInitialSystemProcess;
+    const uint64_t ExpectedLoaded = (uint64_t) (uintptr_t) __imp_PsLoadedModuleList;
+    const uint64_t GotInitial = __atomic_load_n(&CachedPsInitialSystemProcess, __ATOMIC_SEQ_CST);
+    const uint64_t GotLoaded = __atomic_load_n(&CachedPsLoadedModuleList, __ATOMIC_SEQ_CST);
+
+    if (!GotInitial || GotInitial != ExpectedInitial)
+    {
+        print(ERROR("VerifyMemSetPreStartNtoskrnl: PsInitialSystemProcess %p != import %p"),
+              (void*) (uintptr_t) GotInitial, (void*) (uintptr_t) ExpectedInitial);
+        Ok = false;
+    }
+    if (!GotLoaded || GotLoaded != ExpectedLoaded)
+    {
+        print(ERROR("VerifyMemSetPreStartNtoskrnl: PsLoadedModuleList %p != import %p"),
+              (void*) (uintptr_t) GotLoaded, (void*) (uintptr_t) ExpectedLoaded);
+        Ok = false;
+    }
+
+    static constexpr EncodedName TestName = EncodeName("PsLoadedModuleList");
+    char Decoded[32];
+    MemDecodeName(TestName.Bytes, Decoded, sizeof(Decoded));
+    if (!StringEquals(Decoded, "PsLoadedModuleList"))
+    {
+        print(ERROR("VerifyMemSetPreStartNtoskrnl: name decode mismatch"));
+        Ok = false;
+    }
+    for (uint32_t i = 0; i < sizeof(Decoded); ++i)
+        ((volatile char*) Decoded)[i] = 0;
+
+    return Ok;
+}
+#endif
+
+#ifndef POSTBOX_CHANNEL
 // True when a loader BaseDllName equals Expected (ASCII, case-insensitive). The read is bounded by
-// Name.Length: BaseDllName is a counted string, not necessarily NUL-terminated
+// Name.Length: BaseDllName is a counted string, not necessarily NUL-terminated. Only the
+// non-Postbox GetNtoskrnl list walk consumes it; the Postbox build compiles the whole walk out
 static bool ModuleNameEquals(const _UNICODE_STRING &Name, const char *Expected)
 {
     const size_t Length = Name.Length / sizeof(wchar_t);
@@ -364,6 +490,7 @@ static bool ModuleNameEquals(const _UNICODE_STRING &Name, const char *Expected)
     }
     return true;
 }
+#endif
 
 // ntoskrnl base, from PsLoadedModuleList when possible, else by scanning pages downwards from inside the
 // image. Cached for the boot
@@ -375,6 +502,15 @@ address GetNtoskrnl()
     uint64_t Cached = __atomic_load_n(Slot, __ATOMIC_SEQ_CST);
     if (Cached) return Cached == Failed ? nullptr : (address) Cached;
 
+#ifdef POSTBOX_CHANNEL
+    const uint64_t Pre = __atomic_load_n(&PreStartNtoskrnl, __ATOMIC_SEQ_CST);
+    if (Pre)
+    {
+        __atomic_store_n(Slot, Pre, __ATOMIC_SEQ_CST);
+        return (address) Pre;
+    }
+    return nullptr;
+#else
     // Start inside the image (the import slot of PsInitialSystemProcess lands in its data), page-aligned
     address base = (address) ((uint64_t) (void *) __imp_PsInitialSystemProcess & ~0xFFFull);
 
@@ -461,6 +597,7 @@ address GetNtoskrnl()
     print(ERROR("GetNtoskrnl: NOT FOUND after %llu steps, %llu valid DOS headers"), Steps, MzSeen);
     __atomic_store_n(Slot, Failed, __ATOMIC_SEQ_CST);
     return nullptr;
+#endif
 }
 
 // Shared body of the two extractors below: scans PAGE then .text of ntoskrnl for the instruction
@@ -535,9 +672,15 @@ void MemAdoptCaches(PostboxMemCaches* Dst)
     Dst->Ntoskrnl = __atomic_load_n(&CachedNtoskrnl, __ATOMIC_SEQ_CST);
     Dst->PteBase = __atomic_load_n(&CachedPteBase, __ATOMIC_SEQ_CST);
     Dst->PfnPteAddressBase = __atomic_load_n(&CachedPfnPteAddressBase, __ATOMIC_SEQ_CST);
+    Dst->PsInitialSystemProcess =
+        __atomic_load_n(&CachedPsInitialSystemProcess, __ATOMIC_SEQ_CST);
+    Dst->PsLoadedModuleList =
+        __atomic_load_n(&CachedPsLoadedModuleList, __ATOMIC_SEQ_CST);
     __atomic_store_n(&CachedNtoskrnl, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&CachedPteBase, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&CachedPfnPteAddressBase, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&CachedPsInitialSystemProcess, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&CachedPsLoadedModuleList, 0, __ATOMIC_SEQ_CST);
 }
 
 // PA -> VA through the self-map: read PfnDatabase[PA >> 12].PteAddress, then the PTE's index in the
@@ -611,6 +754,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                 Value.page_size = 1;
                 Value.page_frame_number = PhysicalAddress >> 30;
                 if (!ClaimEntry((pdpe_1gb *) PDPTE, Value)) continue;
+                ClaimGuard<pdpe_1gb> Holder((pdpe_1gb *) PDPTE);   // releases on every exit path
 
                 VA.offset = PhysicalAddress.offset;
                 VA.p1_index = PhysicalAddress.p1_index;
@@ -620,7 +764,6 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                 VA.sign = (PML4_IDX >= 256) ? 0xFFFF : 0;   // kernel-half VAs sign-extend bit 47
 
                 Callback(VA);
-                ReleaseEntry((pdpe_1gb *) PDPTE);
                 return true;
             }
 
@@ -645,6 +788,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                     Value.page_size = 1;
                     Value.page_frame_number = PhysicalAddress >> 21;
                     if (!ClaimEntry((pde_2mb *) PDE, Value)) continue;
+                    ClaimGuard<pde_2mb> Holder((pde_2mb *) PDE);   // releases on every exit path
 
                     VA.offset = PhysicalAddress.offset;
                     VA.p1_index = PhysicalAddress.p1_index;
@@ -654,7 +798,6 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                     VA.sign = (PML4_IDX >= 256) ? 0xFFFF : 0;   // kernel-half VAs sign-extend bit 47
 
                     Callback(VA);
-                    ReleaseEntry((pde_2mb *) PDE);
                     return true;
                 }
 
@@ -676,6 +819,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                     Value.execute_disable = 1;
                     Value.page_frame_number = PhysicalAddress >> 12;
                     if (!ClaimEntry(PTE_4KB, Value)) continue;
+                    ClaimGuard<pte> Holder(PTE_4KB);   // releases on every exit path
 
                     VA.offset = PhysicalAddress.offset;
                     VA.p1_index = PT_IDX;
@@ -685,7 +829,6 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
                     VA.sign = (PML4_IDX >= 256) ? 0xFFFF : 0;   // kernel-half VAs sign-extend bit 47
 
                     Callback(VA);
-                    ReleaseEntry(PTE_4KB);
                     return true;
                 }
             }
