@@ -401,6 +401,18 @@ inline uint64_t SipHashFinal(SipHashState* s)
     return out;
 }
 
+#if defined(POSTBOX_CHANNEL) && defined(STACK_SPOOF)
+extern "C" uint64_t PostboxSpoofCall1(uint64_t Target, uint64_t A1);
+static inline uint64_t PostboxSipHashFinalSpoof(SipHashState* s)
+{
+    return PostboxSpoofCall1((uint64_t) (uintptr_t) &SipHashFinal,
+                             (uint64_t) (uintptr_t) s);
+}
+#define PB_SIPHASH_FINAL(S) PostboxSipHashFinalSpoof(S)
+#else
+#define PB_SIPHASH_FINAL(S) SipHashFinal(S)
+#endif
+
 inline uint64_t SipHash24(const uint8_t key[16], const void* data, size_t len)
 {
     SipHashState s;
@@ -461,8 +473,8 @@ inline void Mac128UpdateU64LE(Mac128State* s, uint64_t v)
 // tag = LE64(SipHash-2-4(key0, message)) || LE64(SipHash-2-4(key1, message)).
 inline void Mac128Final(Mac128State* s, uint8_t tag[16])
 {
-    Store64LE(tag, SipHashFinal(&s->A));
-    Store64LE(tag + 8, SipHashFinal(&s->B));
+    Store64LE(tag, PB_SIPHASH_FINAL(&s->A));
+    Store64LE(tag + 8, PB_SIPHASH_FINAL(&s->B));
     SecureZero(s, sizeof(*s));
 }
 

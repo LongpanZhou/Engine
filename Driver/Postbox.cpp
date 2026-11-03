@@ -234,11 +234,17 @@ struct PostboxNmiSanitizeState
     uint64_t RetGadget;
     uint64_t PopRspRet;
     uint64_t PopRspRetSkip;
+    uint64_t ShadowJumpGadget;
     uint64_t DetectorBase;
     uint64_t DetectorSize;
     uint64_t Register;
     uint64_t Deregister;
     uint64_t GetProc;
+#ifdef NMI_FRAME_FIRST
+    uint64_t ExtraHandles[16];
+    uint32_t ExtraCount;
+    uint32_t MonitorActive;
+#endif
     uint32_t Active;
     uint32_t Reserved;
 };
@@ -998,6 +1004,36 @@ static uint64_t PostboxNmiFindPopRspRetSkip(address Nt, uint64_t NtSize)
     }
     return 0;
 }
+
+// First 41 FF 66 83 (jmp qword ptr [r14+0x83]) in an executable nt section.
+// The shadow thunk points r14 at g_PostboxShadowReturn+0x7d, so this gadget
+// jumps to the mapped return trampoline without putting its address on the
+// visible stack.
+static uint64_t PostboxNmiFindShadowJumpGadget(address Nt, uint64_t NtSize)
+{
+    if (!Nt || NtSize < 0x1000) return 0;
+    auto* Dos = (_IMAGE_DOS_HEADER*) (uintptr_t) Nt;
+    if (Dos->e_magic != 0x5A4D) return 0;
+    if (Dos->e_lfanew < 0x40 ||
+        (uint64_t) Dos->e_lfanew + sizeof(_IMAGE_NT_HEADERS64) > NtSize) return 0;
+    auto* NtHdr = (_IMAGE_NT_HEADERS64*) ((uint8_t*) (uintptr_t) Nt + Dos->e_lfanew);
+    if (NtHdr->Signature != 0x4550) return 0;
+    auto* Sec = (_IMAGE_SECTION_HEADER*)
+        ((uint8_t*) &NtHdr->OptionalHeader + NtHdr->FileHeader.SizeOfOptionalHeader);
+    for (uint16_t i = 0; i < NtHdr->FileHeader.NumberOfSections; ++i)
+    {
+        if (!(Sec[i].Characteristics & 0x20000000u)) continue;
+        const uint64_t Va = (uint64_t) (uintptr_t) Nt + Sec[i].VirtualAddress;
+        const uint64_t Size = Sec[i].Misc.VirtualSize;
+        if (Va < (uint64_t) (uintptr_t) Nt || Va + Size > (uint64_t) (uintptr_t) Nt + NtSize)
+            continue;
+        const uint8_t* P = (const uint8_t*) (uintptr_t) Va;
+        for (uint64_t j = 0; j + 3 < Size; ++j)
+            if (P[j] == 0x41 && P[j + 1] == 0xFF && P[j + 2] == 0x66 && P[j + 3] == 0x83)
+                return Va + j;
+    }
+    return 0;
+}
 #endif
 
 // Redirect a mapped interrupted RIP to an nt ret gadget. The original RIP is
@@ -1121,6 +1157,43 @@ static bool PostboxNmiOrderOk(PostboxState* S, uint64_t Self)
     return true;
 }
 
+#ifdef NMI_FRAME_FIRST
+// Test-only pre-callback ordering. The detector registers its callback per
+// IOCTL, so its entry is newer and normally runs first. This PASSIVE monitor
+// registers a fresh sanitizer entry whenever the list head is not ours, making
+// the frame trampoline run before the detector's callback. It never deregisters
+// under a live callback; the handles are released at stop.
+static void PostboxNmiMonitorThread(void* Context)
+{
+    auto* S = (PostboxState*) Context;
+    if (!S) return;
+    for (;;)
+    {
+        if (!__atomic_load_n(&S->NmiSanitize.Active, __ATOMIC_ACQUIRE)) break;
+        const uint64_t Head = *(uint64_t*) (uintptr_t) S->NmiSanitize.ListHead;
+        if (Head)
+        {
+            const uint64_t Fn = *(uint64_t*) (uintptr_t) (Head + 8);
+            if (Fn != (uint64_t) (uintptr_t) &PostboxNmiSanitizeEntry &&
+                S->NmiSanitize.DetectorBase &&
+                S->NmiSanitize.ExtraCount < 16)
+            {
+                void* H = ((FnNmiRegister) S->NmiSanitize.Register)(
+                    &PostboxNmiSanitizeEntry, S);
+                if (H)
+                {
+                    const uint32_t Idx = S->NmiSanitize.ExtraCount++;
+                    S->NmiSanitize.ExtraHandles[Idx] = (uint64_t) (uintptr_t) H;
+                }
+            }
+        }
+        _LARGE_INTEGER Delay{};
+        Delay.QuadPart = -10000;      // 1 ms
+        PostboxDelayExecutionThread(0, 0, &Delay);
+    }
+}
+#endif
+
 static bool PostboxNmiSanitizeInit(PostboxState* S, uint64_t ImageBase, uint64_t ImageSize)
 {
     if (!S) return false;
@@ -1148,6 +1221,7 @@ static bool PostboxNmiSanitizeInit(PostboxState* S, uint64_t ImageBase, uint64_t
 #ifdef STACK_SPOOF
     N.PopRspRet = PostboxNmiFindPopRspRet(Nt, N.NtSize);
     N.PopRspRetSkip = PostboxNmiFindPopRspRetSkip(Nt, N.NtSize);
+    N.ShadowJumpGadget = PostboxNmiFindShadowJumpGadget(Nt, N.NtSize);
 #endif
     PostboxNmiFindDetector(S);
     // Do not create a KNMI node/ETW event on a system with no detector module.
@@ -1169,6 +1243,13 @@ static bool PostboxNmiSanitizeInit(PostboxState* S, uint64_t ImageBase, uint64_t
         if (PostboxNmiOrderOk(S, (uint64_t) (uintptr_t) &PostboxNmiSanitizeEntry))
         {
             N.Active = 1;
+#ifdef NMI_FRAME_FIRST
+            void* ThreadHandle = nullptr;
+            if (((FnPsCreateSystemThread) g_PsCreateSystemThread)(
+                    &ThreadHandle, 0x1FFFFF, nullptr, nullptr, nullptr,
+                    (void*) &PostboxNmiMonitorThread, S) >= 0 && ThreadHandle)
+                ((FnZwClose) g_ZwClose)(ThreadHandle);
+#endif
             return true;
         }
 
@@ -1181,6 +1262,17 @@ static bool PostboxNmiSanitizeInit(PostboxState* S, uint64_t ImageBase, uint64_t
 static void PostboxNmiSanitizeStop(PostboxState* S)
 {
     if (!S || !S->NmiSanitize.Active) return;
+#ifdef NMI_FRAME_FIRST
+    S->NmiSanitize.Active = 0;
+    _LARGE_INTEGER MonitorDelay{};
+    MonitorDelay.QuadPart = -20 * 10000;
+    PostboxDelayExecutionThread(0, 0, &MonitorDelay);
+    for (uint32_t i = 0; i < S->NmiSanitize.ExtraCount; ++i)
+        if (S->NmiSanitize.ExtraHandles[i] && S->NmiSanitize.Deregister)
+            ((FnNmiDeregister) S->NmiSanitize.Deregister)(
+                (void*) (uintptr_t) S->NmiSanitize.ExtraHandles[i]);
+    S->NmiSanitize.ExtraCount = 0;
+#endif
     if (S->NmiSanitize.Handle && S->NmiSanitize.Deregister)
     {
         const int32_t Status = ((FnNmiDeregister) S->NmiSanitize.Deregister)(
@@ -1432,28 +1524,30 @@ static bool PostboxResolve(address* IpiGenericCallOut)
 // calls KeStackAttachProcess or PsAcquireProcessExitSynchronization. This keeps
 // the user-half supervisor PTE removed and cuts the driver's explicit CR3 churn.
 #ifdef STACK_SPOOF
-extern "C" uint64_t g_PostboxMmCopyTarget = 0;
 extern "C" uint64_t g_PostboxPopRspRet = 0;
 extern "C" uint64_t g_PostboxPopRspRetSkip = 0;
 extern "C" uint64_t g_PostboxLastGadget = 0;
 extern "C" uint64_t g_PostboxLastRealRsp = 0;
 extern "C" uint64_t g_PostboxLastFakeTop = 0;
 extern "C" uint64_t g_PostboxProbeTargetRet = 0;
-extern "C" void PostboxStackProbeTarget();
+extern "C" uint64_t g_PostboxShadowBase = 0;
+extern "C" uint64_t g_PostboxShadowTop = 0;
+extern "C" volatile long g_PostboxShadowActive = 0;
+extern "C" volatile long g_PostboxApiShadow = 0;
+extern "C" uint64_t g_PostboxShadowJumpGadget = 0;
+extern "C" uint64_t g_PostboxShadowRet[64] = {};
+extern "C" uint64_t g_PostboxShadowRsp[64] = {};
+extern "C" uint64_t g_PostboxShadowR14[64] = {};
+extern "C" uint64_t g_PostboxShadowDepth = 0;
+extern "C" uint64_t g_PostboxShadowScratch[4] = {};
+extern "C" uint64_t g_PostboxMmCopyTarget = 0;
 extern "C" int32_t PostboxMmCopySpoof(void* SourceProcess, void* SourceAddress,
                                       void* TargetProcess, void* TargetAddress,
                                       size_t Size, int32_t PreviousMode, size_t* Done);
+extern "C" uint64_t g_PostboxShadowReturn = 0;
 
-static int32_t PostboxMmCopyVirtualMemorySpoof(
-    void* SourceProcess, void* SourceAddress, void* TargetProcess, void* TargetAddress,
-    size_t Size, int32_t PreviousMode, size_t* Done)
-{
-    if (g_PostboxMmCopyTarget && g_PostboxPopRspRet)
-        return PostboxMmCopySpoof(SourceProcess, SourceAddress, TargetProcess,
-                                  TargetAddress, Size, PreviousMode, Done);
-    return ((FnMmCopyVirtualMemory) g_MmCopyVirtualMemory)(
-        SourceProcess, SourceAddress, TargetProcess, TargetAddress, Size, PreviousMode, Done);
-}
+extern "C" void PostboxShadowReturn();
+extern "C" void PostboxStackProbeTarget();
 
 // Generic call-site spoof. The assembly stub takes the target as its first
 // argument, builds an nt-gadget fake stack, and tail-jumps to the target.
@@ -1510,6 +1604,17 @@ static R PostboxSpoofInvoke(uint64_t Target, Args... args)
     else
         return PostboxSpoofResult<R>(PostboxSpoofCall7(Target, PostboxSpoofArg(args)...));
 }
+
+static int32_t PostboxMmCopyVirtualMemorySpoof(
+    void* SourceProcess, void* SourceAddress, void* TargetProcess, void* TargetAddress,
+    size_t Size, int32_t PreviousMode, size_t* Done)
+{
+    if (g_PostboxMmCopyTarget && g_PostboxPopRspRet)
+        return PostboxMmCopySpoof(SourceProcess, SourceAddress, TargetProcess,
+                                  TargetAddress, Size, PreviousMode, Done);
+    return ((FnMmCopyVirtualMemory) g_MmCopyVirtualMemory)(
+        SourceProcess, SourceAddress, TargetProcess, TargetAddress, Size, PreviousMode, Done);
+}
 #endif
 
 // Spoofed wrappers for the worker/DPC/reaper calls. In a non-STACK_SPOOF build
@@ -1519,7 +1624,7 @@ static int32_t PostboxDelayExecutionThread(int32_t Alertable, uint8_t WaitMode,
                                            _LARGE_INTEGER* Interval)
 {
 #ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_KeDelayExecutionThread)
+    if (g_PostboxApiShadow && g_KeDelayExecutionThread)
         return PostboxSpoofInvoke<int32_t>((uint64_t) g_KeDelayExecutionThread,
                                            Alertable, WaitMode, Interval);
 #endif
@@ -1530,7 +1635,7 @@ static uint32_t PostboxSetCoalescableTimer(PostboxTimer* Timer, _LARGE_INTEGER D
                                            uint32_t Period, uint32_t Tolerance, PostboxDpc* Dpc)
 {
 #ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_KeSetCoalescableTimer)
+    if (g_PostboxApiShadow && g_KeSetCoalescableTimer)
         return PostboxSpoofInvoke<uint32_t>((uint64_t) g_KeSetCoalescableTimer,
                                             Timer, Due.QuadPart, Period, Tolerance, Dpc);
 #endif
@@ -1541,7 +1646,7 @@ static uint32_t PostboxSetCoalescableTimer(PostboxTimer* Timer, _LARGE_INTEGER D
 static uint8_t PostboxCancelTimer(PostboxTimer* Timer)
 {
 #ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_KeCancelTimer)
+    if (g_PostboxApiShadow && g_KeCancelTimer)
         return PostboxSpoofInvoke<uint8_t>((uint64_t) g_KeCancelTimer, Timer);
 #endif
     return ((FnKeCancelTimer) g_KeCancelTimer)(Timer);
@@ -1550,7 +1655,7 @@ static uint8_t PostboxCancelTimer(PostboxTimer* Timer)
 static void PostboxFlushQueuedDpcs()
 {
 #ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_KeFlushQueuedDpcs)
+    if (g_PostboxApiShadow && g_KeFlushQueuedDpcs)
     {
         PostboxSpoofInvoke<void>((uint64_t) g_KeFlushQueuedDpcs);
         return;
@@ -1561,20 +1666,14 @@ static void PostboxFlushQueuedDpcs()
 
 static void PostboxQueueWorkItem(PostboxWork* Work, int32_t QueueType)
 {
-#ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_ExQueueWorkItem)
-    {
-        PostboxSpoofInvoke<void>((uint64_t) g_ExQueueWorkItem, Work, QueueType);
-        return;
-    }
-#endif
+    // DPC context does not have the worker's r15 shadow top; keep this direct.
     ((FnExQueueWorkItem) g_ExQueueWorkItem)(Work, QueueType);
 }
 
 static int32_t PostboxLookupProcess(void* ProcessId, void** Process)
 {
 #ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_PsLookupProcessByProcessId)
+    if (g_PostboxApiShadow && g_PsLookupProcessByProcessId)
         return PostboxSpoofInvoke<int32_t>((uint64_t) g_PsLookupProcessByProcessId,
                                            ProcessId, Process);
 #endif
@@ -1584,7 +1683,7 @@ static int32_t PostboxLookupProcess(void* ProcessId, void** Process)
 static int64_t PostboxProcessCreateTime(void* Process)
 {
 #ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_PsGetProcessCreateTimeQuadPart)
+    if (g_PostboxApiShadow && g_PsGetProcessCreateTimeQuadPart)
         return PostboxSpoofInvoke<int64_t>((uint64_t) g_PsGetProcessCreateTimeQuadPart,
                                            Process);
 #endif
@@ -1594,7 +1693,7 @@ static int64_t PostboxProcessCreateTime(void* Process)
 static void PostboxDereferenceObject(void* Object)
 {
 #ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_ObDereferenceObject)
+    if (g_PostboxApiShadow && g_ObDereferenceObject)
     {
         PostboxSpoofInvoke<void>((uint64_t) g_ObDereferenceObject, Object);
         return;
@@ -1606,7 +1705,7 @@ static void PostboxDereferenceObject(void* Object)
 static void* PostboxAllocatePool(uint32_t PoolType, size_t Size, uint32_t Tag)
 {
 #ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_ExAllocatePoolWithTag)
+    if (g_PostboxApiShadow && g_ExAllocatePoolWithTag)
         return (void*) (uintptr_t) PostboxSpoofInvoke<uint64_t>(
             (uint64_t) g_ExAllocatePoolWithTag, PoolType, Size, Tag);
 #endif
@@ -1616,7 +1715,7 @@ static void* PostboxAllocatePool(uint32_t PoolType, size_t Size, uint32_t Tag)
 static void PostboxFreePool(void* Base)
 {
 #ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_ExFreePool)
+    if (g_PostboxApiShadow && g_ExFreePool)
     {
         PostboxSpoofInvoke<void>((uint64_t) g_ExFreePool, Base);
         return;
@@ -1628,7 +1727,7 @@ static void PostboxFreePool(void* Base)
 static int32_t PostboxAcquireProcessExit(void* Process)
 {
 #ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_PsAcquireProcessExitSynchronization)
+    if (g_PostboxApiShadow && g_PsAcquireProcessExitSynchronization)
         return PostboxSpoofInvoke<int32_t>(
             (uint64_t) g_PsAcquireProcessExitSynchronization, Process);
 #endif
@@ -1639,7 +1738,7 @@ static int32_t PostboxAcquireProcessExit(void* Process)
 static void PostboxReleaseProcessExit(void* Process)
 {
 #ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_PsReleaseProcessExitSynchronization)
+    if (g_PostboxApiShadow && g_PsReleaseProcessExitSynchronization)
     {
         PostboxSpoofInvoke<void>((uint64_t) g_PsReleaseProcessExitSynchronization, Process);
         return;
@@ -1662,7 +1761,7 @@ static int32_t PostboxCreateSystemThread(void** ThreadHandle, uint32_t DesiredAc
 static int32_t PostboxCloseHandle(void* Handle)
 {
 #ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_ZwClose)
+    if (g_PostboxApiShadow && g_ZwClose)
         return PostboxSpoofInvoke<int32_t>((uint64_t) g_ZwClose, Handle);
 #endif
     return ((FnZwClose) g_ZwClose)(Handle);
@@ -1671,7 +1770,7 @@ static int32_t PostboxCloseHandle(void* Handle)
 static void PostboxInitializeTimer(PostboxTimer* Timer, int32_t Type)
 {
 #ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_KeInitializeTimerEx)
+    if (g_PostboxApiShadow && g_KeInitializeTimerEx)
     {
         PostboxSpoofInvoke<void>((uint64_t) g_KeInitializeTimerEx, Timer, Type);
         return;
@@ -1684,7 +1783,7 @@ static void PostboxInitializeDpc(PostboxDpc* Dpc, void (*Routine)(void*, void*, 
                                  void* Context)
 {
 #ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_KeInitializeDpc)
+    if (g_PostboxApiShadow && g_KeInitializeDpc)
     {
         PostboxSpoofInvoke<void>((uint64_t) g_KeInitializeDpc, Dpc,
                                  (uint64_t) (uintptr_t) Routine, Context);
@@ -1698,7 +1797,7 @@ static void* PostboxAllocateIndependentPages(size_t Size, uint32_t Arg2, uint32_
                                              uint32_t Arg4)
 {
 #ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_MmAllocateIndependentPages)
+    if (g_PostboxApiShadow && g_MmAllocateIndependentPages)
         return (void*) (uintptr_t) PostboxSpoofInvoke<uint64_t>(
             (uint64_t) g_MmAllocateIndependentPages, Size, Arg2, Arg3, Arg4);
 #endif
@@ -1709,7 +1808,7 @@ static void* PostboxAllocateIndependentPages(size_t Size, uint32_t Arg2, uint32_
 static uint8_t PostboxSetPageProtection(void* Addr, size_t Size, uint32_t Protect)
 {
 #ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_MmSetPageProtection)
+    if (g_PostboxApiShadow && g_MmSetPageProtection)
         return PostboxSpoofInvoke<uint8_t>((uint64_t) g_MmSetPageProtection,
                                            Addr, Size, Protect);
 #endif
@@ -1719,7 +1818,7 @@ static uint8_t PostboxSetPageProtection(void* Addr, size_t Size, uint32_t Protec
 static void PostboxFreeIndependentPages(void* Addr, size_t Size)
 {
 #ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_MmFreeIndependentPages)
+    if (g_PostboxApiShadow && g_MmFreeIndependentPages)
     {
         PostboxSpoofInvoke<void>((uint64_t) g_MmFreeIndependentPages, Addr, Size);
         return;
@@ -1731,7 +1830,7 @@ static void PostboxFreeIndependentPages(void* Addr, size_t Size)
 static void* PostboxGetCurrentProcess()
 {
 #ifdef STACK_SPOOF
-    if (g_PostboxPopRspRetSkip && g_PsGetCurrentProcess)
+    if (g_PostboxApiShadow && g_PsGetCurrentProcess)
         return (void*) (uintptr_t) PostboxSpoofInvoke<uint64_t>(
             (uint64_t) g_PsGetCurrentProcess);
 #endif
@@ -1801,47 +1900,86 @@ static bool PostboxStackProbeRun(void* MailboxProcess, address DataVa,
                                  PostboxStackProbeResult* Out)
 {
     if (!Out) return false;
-    // Scan the immediate worker stack before writing any mapped value into Out.
-    // A mapped hit here is a mapped-image return address or code pointer.
-    uint64_t Rsp = 0;
-    __asm__ __volatile__("movq %%rsp, %0" : "=r"(Rsp));
-    const uint64_t ScanBase = PostboxStatePtr->NmiSanitize.ImageBase;
-    const uint64_t ScanEnd = ScanBase + PostboxStatePtr->NmiSanitize.ImageSize;
-    uint64_t Hits = 0;
-    uint64_t HitValues[4] = {};
-    for (uint64_t Off = 0; Off < 0x600; Off += 8)
+    // A real kernel stack walk reads the return-address slots of the active
+    // frames, not every qword on the stack. The shadow thunk records each
+    // active frame's post-call RSP in g_PostboxShadowRsp; the visible return
+    // slot for frame i is Rsp[i]-8. Walk every active frame and verify each
+    // slot holds an nt address (the jump gadget). MappedHits counts slots a
+    // stack walker would read as mapped/invalid returns; it must be 0.
+    const uint64_t NtBaseW = PostboxStatePtr->NmiSanitize.NtBase;
+    const uint64_t NtSizeW = PostboxStatePtr->NmiSanitize.NtSize;
+    const uint64_t ImageBaseW = PostboxStatePtr->NmiSanitize.ImageBase;
+    uint64_t WalkHits = 0;
+    uint64_t Frames = 0;
+    uint64_t WalkValues[4] = {};
+    const uint64_t Depth = g_PostboxShadowDepth;
+    for (uint64_t i = 0; i < Depth && i < 64; ++i)
     {
-        const uint64_t Value = *(const uint64_t*) (uintptr_t) (Rsp + Off);
-        if (Value >= ScanBase && Value < ScanEnd)
+        const uint64_t Slot = g_PostboxShadowRsp[i] - 8;
+        if (Slot < 0xFFFF800000000000ull)
         {
-            if (Hits < 4) HitValues[Hits] = Value;
-            ++Hits;
+            if (WalkHits < 4) WalkValues[WalkHits] = Slot;
+            ++WalkHits;
+            ++Frames;
+            continue;
+        }
+        const uint64_t Value = *(const uint64_t*) (uintptr_t) Slot;
+        const bool InNt = NtSizeW && Value >= NtBaseW && Value < NtBaseW + NtSizeW;
+        if (!InNt)
+        {
+            if (WalkHits < 4) WalkValues[WalkHits] = Value;
+            ++WalkHits;
+        }
+        ++Frames;
+    }
+    // Informational raw scan (not the return-slot metric): from this probe's
+    // own entry RSP upward, over the executable window only (image RVA
+    // 0x1000..0x7000). Counts any .text-range qword, including spilled code
+    // pointers in caller locals; a nonzero value here does not by itself mean
+    // a stack walk sees a mapped return.
+    uint64_t RawHits = 0;
+    const uint64_t EntryRsp = Depth ? g_PostboxShadowRsp[Depth - 1] : 0;
+    const uint64_t TextLo = ImageBaseW + 0x1000;
+    const uint64_t TextHi = ImageBaseW + 0x7000;
+    if (EntryRsp >= 0xFFFF800000000000ull)
+    {
+        for (uint64_t Off = 0; Off < 0x600; Off += 8)
+        {
+            const uint64_t Value = *(const uint64_t*) (uintptr_t) (EntryRsp + Off);
+            if (Value >= TextLo && Value < TextHi) ++RawHits;
         }
     }
     uint8_t Buf[8] = {};
     const bool Ok = PostboxCopySpoof(MailboxProcess, DataVa, Buf, sizeof(Buf), false);
     Out->Magic = PostboxStackProbeMagic;
-    Out->MappedHits = Hits;
-    Out->StackScanned = 0x600;
-    Out->Hit0 = HitValues[0];
-    Out->Hit1 = HitValues[1];
-    Out->Hit2 = HitValues[2];
-    Out->Hit3 = HitValues[3];
+    Out->MappedHits = WalkHits;
+    Out->StackScanned = Frames;
+    Out->Hit0 = WalkValues[0];
+    Out->Hit1 = WalkValues[1];
+    Out->Hit2 = WalkValues[2];
+    Out->Hit3 = WalkValues[3];
+    Out->RawHits = RawHits;
+    Out->RawScanned = EntryRsp ? 0x600 : 0;
     Out->Gadget = g_PostboxLastGadget;
     Out->RealRsp = g_PostboxLastRealRsp;
     Out->FakeTop = g_PostboxLastFakeTop;
     Out->RealRet = Out->RealRsp ? *(uint64_t*) (uintptr_t) Out->RealRsp : 0;
     g_PostboxProbeTargetRet = 0;
-    PostboxSpoofInvoke<void>((uint64_t) (uintptr_t) &PostboxStackProbeTarget);
-    Out->SpoofGadget = g_PostboxPopRspRetSkip;
+    if (g_PostboxShadowActive)
+        PostboxSpoofInvoke<void>((uint64_t) (uintptr_t) &PostboxStackProbeTarget);
+    Out->SpoofGadget = g_PostboxShadowJumpGadget;
     Out->SpoofRet = g_PostboxProbeTargetRet;
     const uint64_t NtBase = PostboxStatePtr->NmiSanitize.NtBase;
     const uint64_t NtSize = PostboxStatePtr->NmiSanitize.NtSize;
     const uint64_t ImageBase = PostboxStatePtr->NmiSanitize.ImageBase;
     const uint64_t ImageSize = PostboxStatePtr->NmiSanitize.ImageSize;
-    Out->Hidden = (Ok && NtSize && ImageSize &&
-                   Out->Gadget >= NtBase && Out->Gadget < NtBase + NtSize &&
-                   Out->RealRet >= ImageBase && Out->RealRet < ImageBase + ImageSize) ? 1 : 0;
+    const bool MmHidden = NtSize && ImageSize &&
+        Out->Gadget >= NtBase && Out->Gadget < NtBase + NtSize &&
+        Out->RealRet >= ImageBase && Out->RealRet < ImageBase + ImageSize;
+    const bool SpoofHidden = NtSize &&
+        Out->SpoofGadget >= NtBase && Out->SpoofGadget < NtBase + NtSize &&
+        Out->SpoofRet >= NtBase && Out->SpoofRet < NtBase + NtSize;
+    Out->Hidden = (Ok && MmHidden && SpoofHidden) ? 1 : 0;
     return Ok;
 }
 #endif
@@ -2450,7 +2588,7 @@ static void PostboxPollAttached(void* MailboxProcess)
     else if (Op == pb_stack_probe)
     {
         PostboxStackProbeResult Result{};
-        const bool ProbeOk = g_PostboxPopRspRetSkip
+        const bool ProbeOk = g_PostboxShadowActive
             ? PostboxSpoofInvoke<bool>((uint64_t) (uintptr_t) &PostboxStackProbeRun,
                                        MailboxProcess, DataVa, &Result)
             : PostboxStackProbeRun(MailboxProcess, DataVa, &Result);
@@ -2800,16 +2938,40 @@ bool PostboxStart(const PostboxConfig* Config)
     }
     PostboxWipe(PostboxStatePtr->Stage, StageAllocBytes);
 
+#ifdef STACK_SPOOF
+    // Per-CPU shadow stack for the call-site return trampoline. Allocate it
+    // before any wrapper can use the shadow thunk.
+    {
+        void* Shadow = ((FnExAllocatePoolWithTag) g_ExAllocatePoolWithTag)(
+            0x200 /* NonPagedPoolNx */, 0x10000, 0x78504253 /* SBPx */);
+        if (Shadow)
+        {
+            __builtin_memset(Shadow, 0, 0x10000);
+            g_PostboxShadowBase = (uint64_t) (uintptr_t) Shadow;
+            g_PostboxShadowReturn = (uint64_t) (uintptr_t) &PostboxShadowReturn;
+            const address Nt = GetNtoskrnl();
+            if (Nt)
+            {
+                PostboxNmiFindNt(PostboxStatePtr, Nt);
+                g_PostboxShadowJumpGadget = PostboxNmiFindShadowJumpGadget(
+                    Nt, PostboxStatePtr->NmiSanitize.NtSize);
+            }
+        }
+        if (!g_PostboxShadowBase || !g_PostboxShadowJumpGadget)
+            print(ERROR("Postbox: shadow stack unavailable"));
+    }
+#endif
+
 #ifdef NMI_SANITIZE
     if (!PostboxNmiSanitizeInit(PostboxStatePtr, ImageBase, ImageSize))
         print(WARN("Postbox: NMI sanitizer inactive"));
 #endif
 #ifdef STACK_SPOOF
-    g_PostboxMmCopyTarget = g_MmCopyVirtualMemory;
     g_PostboxPopRspRet = PostboxStatePtr->NmiSanitize.PopRspRet;
-    g_PostboxPopRspRetSkip = (PostboxStatePtr->NmiSanitize.PopRspRet &&
+    g_PostboxPopRspRetSkip = (g_PostboxShadowBase && g_PostboxShadowJumpGadget &&
                               PostboxStatePtr->NmiSanitize.PopRspRetSkip)
                                  ? PostboxStatePtr->NmiSanitize.PopRspRetSkip : 0;
+    g_PostboxMmCopyTarget = g_MmCopyVirtualMemory;
 #endif
 
 #ifdef POSTBOX_NMI
@@ -2862,6 +3024,13 @@ void PostboxStop()
     // under the first one; it returns and lets the owner finish.
     if (__atomic_exchange_n(&PostboxTeardown, 1, __ATOMIC_ACQ_REL) != 0)
         return;
+
+#ifdef STACK_SPOOF
+    // The stop thread has no worker r15 shadow top; use direct wrappers from
+    // here. Any in-flight worker shadow call still returns through its own
+    // trampoline.
+    __atomic_store_n(&g_PostboxShadowActive, 0, __ATOMIC_RELEASE);
+#endif
 
     if (!__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE))
     {

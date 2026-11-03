@@ -115,6 +115,20 @@ if(NMI_SANITIZE)
     list(APPEND VARIANT_DEFINES NMI_SANITIZE)
 endif()
 
+# Test-only pre-callback ordering: a PASSIVE monitor re-registers the sanitizer
+# callback at the head of KiNmiCallbackListHead while the detector is active, so
+# the frame trampoline runs before the detector's own callback. Never shipped.
+option(NMI_FRAME_FIRST "Test-only pre-callback NMI frame ordering" OFF)
+if(NMI_FRAME_FIRST)
+    if(NOT NMI_SANITIZE)
+        message(FATAL_ERROR "NMI_FRAME_FIRST requires NMI_SANITIZE=ON")
+    endif()
+    if(NOT NMI_PROBE)
+        message(FATAL_ERROR "NMI_FRAME_FIRST requires NMI_PROBE=ON (test build)")
+    endif()
+    list(APPEND VARIANT_DEFINES NMI_FRAME_FIRST)
+endif()
+
 # Test-only call-site stack spoof: MmCopyVirtualMemory gets a fake stack whose
 # return address is an nt pop-rsp-ret gadget. Never part of the shipped build.
 option(STACK_SPOOF "Test-only call-site stack spoof" OFF)

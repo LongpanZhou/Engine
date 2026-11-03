@@ -30,9 +30,16 @@ PostboxWorkEntry:
     jz 1f
     pushq %r12
     movq %rsp, %r12                 # [r12] = saved r12, [r12+8] = nt return
+    movq g_PostboxShadowJumpGadget(%rip), %rax
+    testq %rax, %rax
+    jz 2f
+    movq $0, g_PostboxShadowDepth(%rip)
+    movl $1, g_PostboxShadowActive(%rip)
+2:
     leaq -0x60(%r12), %rsp
     andq $-16, %rsp
     subq $8, %rsp                   # C entry rsp % 16 == 8
+    movq g_PostboxPopRspRetSkip(%rip), %rax
     movq %rax, 0(%rsp)              # C return = add-rsp-0x28; ret
     movq g_PostboxPopRspRet(%rip), %rax
     movq %rax, 0x30(%rsp)           # add-ret target = pop rsp; ret
@@ -49,6 +56,8 @@ PostboxWorkEntry:
     ret
 
 PostboxWorkEpilogue:
+    movl $0, g_PostboxShadowActive(%rip)
+    movq $0, g_PostboxShadowDepth(%rip)
     movq %r12, %rsp
     popq %r12
     movl $0, PostboxInFlight(%rip)
