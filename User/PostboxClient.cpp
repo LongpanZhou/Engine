@@ -49,8 +49,11 @@ struct ClientOptions
     bool NmiProbe;
     uint32_t NmiSpinMs;
     bool NmiStatus;
+    bool NmiGate;
+    uint32_t NmiGateHoldMs;
+    uint32_t NmiGateStorm;
 #endif
-#ifdef STACK_SPOOF
+#ifdef STACK_PROBE
     bool StackProbe;
 #endif
 };
@@ -357,7 +360,7 @@ static bool Submit(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
         (Op == pb_nmi_probe) ? static_cast<uint32_t>(sizeof(PostboxNmiProbeResult)) :
         (Op == pb_nmi_status) ? static_cast<uint32_t>(sizeof(PostboxNmiStatus)) :
 #endif
-#ifdef STACK_SPOOF
+#ifdef STACK_PROBE
         (Op == pb_stack_probe) ? static_cast<uint32_t>(sizeof(PostboxStackProbeResult)) :
 #endif
         (Op == pb_nmi) ? static_cast<uint32_t>(sizeof(uint64_t)) : 0;
@@ -381,7 +384,7 @@ static bool Submit(PostboxHeader* Header, uint8_t* Data, ClientSession& S,
             pb::OpenResponseBody(Data, static_cast<uint32_t>(sizeof(PostboxNmiStatus)),
                                  S.Keys, S.SessionId, Nonce);
 #endif
-#ifdef STACK_SPOOF
+#ifdef STACK_PROBE
         else if (Op == pb_stack_probe)
             pb::OpenResponseBody(Data, static_cast<uint32_t>(sizeof(PostboxStackProbeResult)),
                                  S.Keys, S.SessionId, Nonce);
@@ -461,8 +464,32 @@ static bool ParseArguments(int argc, char** argv, ClientOptions& Options)
         {
             Options.NmiStatus = true;
         }
+        else if (std::strcmp(Arg, "--nmi-gate") == 0)
+        {
+            Options.NmiGate = true;
+        }
+        else if (std::strcmp(Arg, "--nmi-gate-hold") == 0)
+        {
+            if (i + 1 >= argc || !ParseMilliseconds(argv[i + 1], Options.NmiGateHoldMs))
+            {
+                std::printf("postbox: --nmi-gate-hold requires a millisecond value\n");
+                return false;
+            }
+            ++i;
+            Options.NmiGate = true;
+        }
+        else if (std::strcmp(Arg, "--nmi-gate-storm") == 0)
+        {
+            if (i + 1 >= argc || !ParseMilliseconds(argv[i + 1], Options.NmiGateStorm))
+            {
+                std::printf("postbox: --nmi-gate-storm requires a count\n");
+                return false;
+            }
+            ++i;
+            Options.NmiGate = true;
+        }
 #endif
-#ifdef STACK_SPOOF
+#ifdef STACK_PROBE
         else if (std::strcmp(Arg, "--stack-probe") == 0)
         {
             Options.StackProbe = true;
@@ -812,6 +839,49 @@ int PostboxClientMain(int argc, char** argv)
     SecureZeroMemory(Data, PostboxDataMax);
 
 #ifdef NMI_PROBE
+    // Test-only constructed-IDT gate self-test: install the gate, deliver one
+    // self-NMI, consume it in the stub, restore the Windows IDT, and report the
+    // handled count. Chained hardware NMIs during the gated window are the
+    // historical 0x3B source; run with the detector sending NMIs to reproduce.
+    if (Options.NmiGate)
+    {
+        // Address=1: quick install/self-test/uninstall. Address=2: hold the gate
+        // ~15 s for external chained NMIs. Address=3|count<<32: chained self-NMI
+        // storm, deterministic and silent (no external NMI source). The hold and
+        // storm modes report the stub's tick count (every NMI seen); the quick
+        // mode reports the consumed self-test count.
+        const bool Hold = Options.NmiGateHoldMs != 0;
+        const bool Storm = Options.NmiGateStorm != 0;
+        const uint64_t GateAddress = Storm
+            ? (3ull | (static_cast<uint64_t>(Options.NmiGateStorm) << 32))
+            : (Hold ? 2ull : 1ull);
+        const uint32_t TimeoutMs = Storm
+            ? Options.NmiGateStorm + 30000
+            : (Hold ? Options.NmiGateHoldMs + 30000 : 30000);
+        const char* Label = Storm ? " (storm)" : (Hold ? " (hold)" : "");
+        const bool TicksMode = Storm || Hold;
+        if (!Submit(Header, Data, S, pb_nmi, GateAddress, 0, TimeoutMs))
+        {
+            std::printf("nmi gate%s: timeout or auth failure\n", Label);
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+        std::printf("nmi gate%s: status=0x%X\n", Label,
+                    static_cast<unsigned>(S.Status));
+        if (S.Status != 0)
+        {
+            StopBestEffort(Header, Data, S);
+            return 1;
+        }
+        uint64_t Count = 0;
+        std::memcpy(&Count, Data, sizeof(Count));
+        std::printf("nmi gate%s: %s=%llu\n", Label,
+                    TicksMode ? "ticks" : "handled",
+                    static_cast<unsigned long long>(Count));
+        std::fflush(stdout);
+        SecureZeroMemory(Data, PostboxDataMax);
+    }
+
     // Test-only NMI callback probe. The driver registers KeRegisterNmiCallback,
     // sends HalSendNMI to each core, and reports the interrupted machine frame.
     // InModule=0 for the mapped image is the expected detector hit; it proves the
@@ -912,7 +982,7 @@ int PostboxClientMain(int argc, char** argv)
     }
 #endif
 
-#ifdef STACK_SPOOF
+#ifdef STACK_PROBE
     if (Options.StackProbe)
     {
         if (!Submit(Header, Data, S, pb_stack_probe, 0, 0, 5000))

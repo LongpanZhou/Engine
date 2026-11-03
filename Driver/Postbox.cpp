@@ -189,6 +189,13 @@ struct PostboxNmiImports
     uint64_t KeStallExecutionProcessor;
     uint64_t MmMapIoSpace;
     uint64_t MmUnmapIoSpace;
+    // Accounted-NMI storm: HalSendNMI marks the NMI so the Windows handler
+    // recognizes it (a raw self-IPI chains into NMI_HARDWARE_FAILURE 0x80).
+    uint64_t HalSendNMI;
+    uint64_t KeInitializeAffinityEx;
+    uint64_t KeAddProcessorAffinityEx;
+    uint64_t KeRegisterNmiCallback;
+    uint64_t KeDeregisterNmiCallback;
 };
 
 #ifdef E3_DPC_PROBE
@@ -372,12 +379,11 @@ bool PostboxNmiInstall();
 void PostboxNmiUninstall();
 bool PostboxNmiSelfTest(uint64_t* Count);
 uint64_t PostboxNmiCount();
+uint32_t PostboxNmiStorm(uint32_t Count);
 #endif
 
-// MmCopyMemory's documented user path stops below MmUserProbeAddress, not at 2^47.
-// Use the tighter bound for every mailbox/target range check so a request near the
-// old limit fails cleanly in PostboxCopy instead of inside the API.
-constexpr uint64_t PostboxUserLimit = 0x00007FFFFFFF0000ull;
+// MmCopyMemory's documented user path bound (PostboxUserLimit) and the config
+// validation live in Common/Postbox.h (PostboxConfigValid, host-unit-tested).
 
 // The linker-defined image base. A RIP-relative reference resolves to the runtime
 // pool base after the loader applies relocations, so this is the mapped image base.
@@ -1356,11 +1362,11 @@ static void PostboxNmiRefreshDetector(PostboxState* S)
 }
 
 #ifdef NMI_FRAME_FIRST
-// Test-only pre-callback ordering. The detector registers its callback per
-// IOCTL, so its entry is newer and normally runs first. This PASSIVE monitor
-// registers a fresh sanitizer entry whenever the list head is not ours, making
-// the frame trampoline run before the detector's callback. It never deregisters
-// under a live callback; the handles are released at stop.
+// Pre-callback ordering. The detector registers its callback per IOCTL, so its
+// entry is newer and normally runs first. This PASSIVE monitor registers a fresh
+// sanitizer entry whenever the list head is not ours, making the frame
+// trampoline run before the detector's callback. It never deregisters under a
+// live callback; the handles are released at stop.
 static void PostboxNmiMonitorThread(void* Context)
 {
     auto* S = (PostboxState*) Context;
@@ -2188,7 +2194,7 @@ static bool PostboxCopySpoof(void* MailboxProcess, address UserVa, void* Buffer,
     return PostboxCopy(MailboxProcess, UserVa, Buffer, Size, Write);
 }
 
-#ifdef STACK_SPOOF
+#ifdef STACK_PROBE
 static bool PostboxStackProbeRun(void* MailboxProcess, address DataVa,
                                  PostboxStackProbeResult* Out)
 {
@@ -2413,9 +2419,29 @@ static void PostboxFreeStage()
 // WORK_QUEUE_ITEM and KTIMER/KDPC live there, and the worker may still touch the
 // item after the routine returns. The page is private RW/NX and no longer holds
 // the keys/config after this call.
+#ifdef STACK_SPOOF
+// Free the nonpaged shadow pool allocated at start. The return-address frames
+// live in .data; the pool only backs the worker's shadow-top marker, so it is
+// safe to release once the caller has quiesced the worker. Idempotent.
+static void PostboxFreeShadow()
+{
+    if (!PostboxStatePtr || !g_PostboxShadowBase || !g_ExFreePool) return;
+    ((FnExFreePool) g_ExFreePool)((void*) (uintptr_t) g_PostboxShadowBase);
+    g_PostboxShadowBase = 0;
+    g_PostboxShadowTop = 0;
+    g_PostboxShadowActive = 0;
+    g_PostboxShadowJumpGadget = 0;
+    g_PostboxShadowReturn = 0;
+    g_PostboxShadowDepth = 0;
+}
+#endif
+
 static void PostboxFreeState()
 {
     if (!PostboxStatePtr) return;
+#ifdef STACK_SPOOF
+    PostboxFreeShadow();
+#endif
     // Every caller has already run KeCancelTimer + KeFlushQueuedDpcs, so the
     // cancelled timer and its DPC can be wiped. This removes their pointers back
     // into the image from the resident state page. The WORK_QUEUE_ITEM is left
@@ -2443,6 +2469,12 @@ static void PostboxFreeState()
 // touch it: failed starts (never armed) and a stopped channel with in-flight clear.
 static void PostboxFreeStatePage()
 {
+    if (!PostboxStatePtr) return;
+#ifdef STACK_SPOOF
+    // The shadow pool is separate from the state page; free it while the page
+    // (and its ExFreePool import) is still valid. Idempotent with PostboxFreeState.
+    PostboxFreeShadow();
+#endif
     // Exchange first so a second teardown cannot free the same page. Wipe the
     // whole 4 KiB, not just sizeof(PostboxState): the tail must not disclose
     // stale kernel memory if the allocator did not zero it.
@@ -2768,7 +2800,7 @@ static void PostboxPollAttached(void* MailboxProcess)
                          || Op == pb_nmi_probe
                          || Op == pb_nmi_status
 #endif
-#ifdef STACK_SPOOF
+#ifdef STACK_PROBE
                          || Op == pb_stack_probe
 #endif
                          ;
@@ -2777,7 +2809,7 @@ static void PostboxPollAttached(void* MailboxProcess)
                             || Op == pb_nmi_probe
                             || Op == pb_nmi_status
 #endif
-#ifdef STACK_SPOOF
+#ifdef STACK_PROBE
                             || Op == pb_stack_probe
 #endif
                             ;
@@ -2798,7 +2830,7 @@ static void PostboxPollAttached(void* MailboxProcess)
                                (Op == pb_nmi_probe) ? (uint32_t) sizeof(PostboxNmiProbeResult) :
                                (Op == pb_nmi_status) ? (uint32_t) sizeof(PostboxNmiStatus) :
 #endif
-#ifdef STACK_SPOOF
+#ifdef STACK_PROBE
                                (Op == pb_stack_probe) ? (uint32_t) sizeof(PostboxStackProbeResult) :
 #endif
                                0;
@@ -2889,18 +2921,24 @@ static void PostboxPollAttached(void* MailboxProcess)
 #ifdef POSTBOX_NMI
     else if (Op == pb_nmi)
     {
-        if (Address > 1)
+        const uint32_t Mode = (uint32_t) (Address & 0xFF);
+        const uint32_t Storm = (uint32_t) (Address >> 32);
+        if (Mode > 3 || (Mode == 3 && Storm > 20000))
         {
             Status = (int32_t) 0xC000000D;          // STATUS_INVALID_PARAMETER
         }
         else
         {
             uint64_t NmiCount = PostboxNmiCount();
-            if (Address == 1)
+            if (Mode >= 1)
             {
                 // Transient gate: install, run the self-IPI test, restore the Windows
                 // IDT in the same work item. No private IDTR survives the request, so
                 // a failed timer/NMI path cannot leave an unremovable gate behind.
+                // Mode 2 holds the gate ~15 s for external chained NMIs; mode 3 sends
+                // a chained self-NMI storm (pending flag clear), so the chain path is
+                // exercised deterministically with no external NMI source. Modes 2/3
+                // return the stub's tick count (every NMI seen, chained or consumed).
                 uint64_t After = 0;
                 if (!PostboxNmiInstall())
                 {
@@ -2908,10 +2946,26 @@ static void PostboxPollAttached(void* MailboxProcess)
                 }
                 else
                 {
+                    if (Mode == 2)
+                    {
+                        _LARGE_INTEGER Hold{};
+                        Hold.QuadPart = -10 * 10000;            // 10 ms
+                        for (uint32_t i = 0; i < 6000; ++i)     // ~60 s
+                            ((FnKeDelayExecutionThread) g_KeDelayExecutionThread)(
+                                0, 0, &Hold);
+                    }
+                    else if (Mode == 3)
+                    {
+                        const uint32_t Count = Storm ? Storm : 500;
+                        PostboxNmiStorm(Count);
+                    }
                     const bool Ok = PostboxNmiSelfTest(&After);
+                    // Snapshot before uninstall: quiesce/zero clears the counters,
+                    // which made the earlier hold response always report 0.
+                    const uint64_t TicksAfter = PostboxNmiCount();
                     PostboxNmiUninstall();
                     if (Ok)
-                        NmiCount = After;
+                        NmiCount = (Mode == 2 || Mode == 3) ? TicksAfter : After;
                     else
                         Status = (int32_t) 0xC0000001;
                 }
@@ -2987,7 +3041,7 @@ static void PostboxPollAttached(void* MailboxProcess)
     }
 #endif
 
-#ifdef STACK_SPOOF
+#ifdef STACK_PROBE
     else if (Op == pb_stack_probe)
     {
         PostboxStackProbeResult Result{};
@@ -3131,29 +3185,19 @@ bool PostboxStart(const PostboxConfig* Config)
     PostboxPollTeardown = false;
 
     if (__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE)) return true;
-    if (!Config || Config->Magic != PostboxConfigMagic || Config->Version != 4 ||
-        !Config->Pid || !Config->MailboxVa || !Config->CreateTime || !Config->SessionId)
+
+    // Validate the whole config BEFORE any kernel work (in particular before
+    // MemSetPreStartNtoskrnl resolves the ntoskrnl exports). PostboxConfigValid
+    // is shared with the host unit tests and preserves the PostboxStartFailure
+    // entry code for an invalid config.
+    if (!Config) return false;
+    uint32_t ConfigError = 0;
+    if (!PostboxConfigValid(*Config, &ConfigError))
+    {
+        if (ConfigError) PostboxStartFailure = ConfigError;
         return false;
-    if (!Config->Layout.NtoskrnlBase) return false;
+    }
     MemSetPreStartNtoskrnl(Config->Layout.NtoskrnlBase);
-    // The self-free reaper may only call MmFreeIndependentPages on an independent
-    // allocation. The loader sets Reserved bit 0 for that layout; fail closed for
-    // a pool image instead of arming a wrong free.
-    if (!(Config->Reserved & 1u)) return false;
-    if (Config->MailboxVa > PostboxUserLimit - PostboxBytes || (Config->MailboxVa & 7)) return false;
-
-    bool KeyNonZero = false;
-    for (uint32_t i = 0; i < sizeof(Config->Key); ++i)
-        KeyNonZero |= (Config->Key[i] != 0);
-    if (!KeyNonZero) return false;
-
-    // The state page needs the independent-page helpers before it can be allocated.
-    // Validate them from the loader config here; they are staged in .data only for
-    // the two calls that create and protect the page, then the page owns them
-    // (Imports below).
-    if (!Config->MmAllocateIndependentPages || !Config->MmSetPageProtection ||
-        !Config->MmFreeIndependentPages)
-        return false;
 
     // A previous start may have left the page resident (watchdog/stop). Never
     // overwrite the only pointer: free it first when no worker is in flight. The

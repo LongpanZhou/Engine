@@ -58,18 +58,20 @@ if(MANUAL_MAP_ONLY)
     list(APPEND VARIANT_DEFINES MANUAL_MAP_ONLY)
 endif()
 
-# NMI gate: disabled. The constructed-IDT gate (PostboxNmi.S) is retained as
-# historical test code, but it is not a supported build: on Windows 10 19041 its
-# chain path can corrupt the interrupted thread's MXCSR save slot and bugcheck
-# 0x3B (0xC0000005) in KiSystemServiceExit. The default Postbox build keeps the
-# stock Windows IDT and has no NMI/IDT-hook artifact.
-option(POSTBOX_NMI "Unsupported: constructed-IDT NMI gate (disabled)" OFF)
-if(POSTBOX_NMI)
-    message(FATAL_ERROR "POSTBOX_NMI is disabled: the constructed-IDT gate caused "
-                        "0x3B (0xC0000005) stack corruption on 19041; use the plain "
-                        "Postbox build")
-endif()
+# NMI gate: constructed-IDT NMI self-test gate. Test-only, default OFF, never
+# part of the shipped build. The chain path is assembly-only and was validated
+# live: 20,007 chained accounted NMIs under a syscall-dense workload with no
+# bugcheck. It remains an IDT hook (IDTR/constructed table observable, and
+# PatchGuard may check the IDT), so the product keeps the stock Windows IDT.
+option(POSTBOX_NMI "Test-only constructed-IDT NMI gate" OFF)
 set(POSTBOX_NMI_SOURCES)
+if(POSTBOX_NMI)
+    if(NOT POSTBOX_CHANNEL)
+        message(FATAL_ERROR "POSTBOX_NMI requires POSTBOX_CHANNEL=ON")
+    endif()
+    list(APPEND VARIANT_DEFINES POSTBOX_NMI)
+    list(APPEND POSTBOX_NMI_SOURCES PostboxNmi.S)
+endif()
 
 # Test-only E3 probe: around the product KeIpiGenericCall, write to the .text
 # probe page from CPU 1 and record whether the stale RW TLB entry survived.
@@ -107,47 +109,48 @@ endif()
 # NMI sample sanitizer: register an NMI callback that runs after an external
 # detector's callback and rewrites the detector's recorded RIP to a valid
 # loaded-module address. Callback-list only: no IDT/TSS/SSDT or code hooks.
-option(NMI_SANITIZE "Sanitize external NMI detector samples" OFF)
+# Shipped NMI-stealth mitigation; forced OFF only when the channel is absent.
+include(CMakeDependentOption)
+cmake_dependent_option(NMI_SANITIZE "Sanitize external NMI detector samples" ON "POSTBOX_CHANNEL" OFF)
 if(NMI_SANITIZE)
-    if(NOT POSTBOX_CHANNEL)
-        message(FATAL_ERROR "NMI_SANITIZE requires POSTBOX_CHANNEL=ON")
-    endif()
     list(APPEND VARIANT_DEFINES NMI_SANITIZE)
 endif()
 
-# Test-only pre-callback ordering: a PASSIVE monitor re-registers the sanitizer
-# callback at the head of KiNmiCallbackListHead while the detector is active, so
-# the frame trampoline runs before the detector's own callback. Never shipped.
-option(NMI_FRAME_FIRST "Test-only pre-callback NMI frame ordering" OFF)
+# Pre-callback ordering: a PASSIVE monitor re-registers the sanitizer callback
+# at the head of KiNmiCallbackListHead while the detector is active, so the
+# frame trampoline runs before the detector's own callback. Shipped NMI-stealth
+# mitigation; forced OFF when the sanitizer is absent.
+cmake_dependent_option(NMI_FRAME_FIRST "Pre-callback NMI frame ordering" ON "NMI_SANITIZE" OFF)
 if(NMI_FRAME_FIRST)
-    if(NOT NMI_SANITIZE)
-        message(FATAL_ERROR "NMI_FRAME_FIRST requires NMI_SANITIZE=ON")
-    endif()
-    if(NOT NMI_PROBE)
-        message(FATAL_ERROR "NMI_FRAME_FIRST requires NMI_PROBE=ON (test build)")
-    endif()
     list(APPEND VARIANT_DEFINES NMI_FRAME_FIRST)
 endif()
 
-# Test-only call-site stack spoof: MmCopyVirtualMemory gets a fake stack whose
-# return address is an nt pop-rsp-ret gadget. Never part of the shipped build.
-option(STACK_SPOOF "Test-only call-site stack spoof" OFF)
+# Call-site stack spoof: MmCopyVirtualMemory and the intra-image wrappers use a
+# fake/shadow return-address frame whose visible return is an nt gadget. This is
+# a shipped mitigation now; STACK_PROBE is the test-only in-driver probe that
+# exercises it. STACK_SPOOF depends on the NMI sanitizer's nt gadget finder.
+cmake_dependent_option(STACK_SPOOF "Call-site stack spoof (return-address shadow)" ON "NMI_SANITIZE" OFF)
 if(STACK_SPOOF)
-    if(NOT NMI_SANITIZE)
-        message(FATAL_ERROR "STACK_SPOOF requires NMI_SANITIZE=ON")
-    endif()
     list(APPEND VARIANT_DEFINES STACK_SPOOF)
+endif()
+
+# Test-only in-driver stack probe: records the visible return slots and the
+# shadow frame for the channel suite. Never part of the shipped build.
+option(STACK_PROBE "Test-only in-driver stack probe" OFF)
+if(STACK_PROBE)
+    if(NOT STACK_SPOOF)
+        message(FATAL_ERROR "STACK_PROBE requires STACK_SPOOF=ON")
+    endif()
+    list(APPEND VARIANT_DEFINES STACK_PROBE)
 endif()
 
 # One-shot + jittered timer: the timer is armed with a due time of PeriodMs plus an
 # rdtsc-derived jitter and re-armed from the DPC with an explicit running/generation
 # double-check, so _KTIMER.Period stays 0 and the timer table carries no fixed
-# polling-period signature. OFF keeps the stock periodic arm.
-option(POSTBOX_ONESHOT_TIMER "Arm the Postbox timer one-shot with jitter, re-armed from the DPC" OFF)
+# polling-period signature. Shipped timer-signature stealth; forced OFF only when
+# the channel is absent.
+cmake_dependent_option(POSTBOX_ONESHOT_TIMER "Arm the Postbox timer one-shot with jitter, re-armed from the DPC" ON "POSTBOX_CHANNEL" OFF)
 if(POSTBOX_ONESHOT_TIMER)
-    if(NOT POSTBOX_CHANNEL)
-        message(FATAL_ERROR "POSTBOX_ONESHOT_TIMER requires POSTBOX_CHANNEL=ON")
-    endif()
     list(APPEND VARIANT_DEFINES POSTBOX_ONESHOT_TIMER)
 endif()
 
@@ -228,4 +231,28 @@ if(DRIVER_SIGNING AND SIGNTOOL AND DEFINED ENV{TESTSIGN_PFX_PASSWORD})
         )
 else()
         message(WARNING "Driver.sys will not be signed: needs signtool and the TESTSIGN_PFX_PASSWORD environment variable")
+endif()
+
+# Deployment guard: STEALTH_PROFILE=ON fails the configure unless every switch that
+# scans back is in its shipped state, so a lab variant can never be mistaken for a
+# deployment build. Lab experiments leave it off and configure normally.
+option(STEALTH_PROFILE "Fail the configure unless this is a stealth deployment build" OFF)
+if(STEALTH_PROFILE)
+    if(DEBUG_BUILD)
+        message(FATAL_ERROR "STEALTH_PROFILE=ON requires DEBUG_BUILD=OFF (print() is a shipped-image giveaway)")
+    endif()
+    if(NOT POSTBOX_CHANNEL OR NOT MANUAL_MAP_ONLY OR NOT MAPPED_SAFE)
+        message(FATAL_ERROR "STEALTH_PROFILE=ON requires POSTBOX_CHANNEL=ON, MANUAL_MAP_ONLY=ON, MAPPED_SAFE=ON")
+    endif()
+    if(NOT NMI_SANITIZE OR NOT STACK_SPOOF OR NOT NMI_FRAME_FIRST OR NOT POSTBOX_ONESHOT_TIMER)
+        message(FATAL_ERROR "STEALTH_PROFILE=ON requires NMI_SANITIZE=ON, STACK_SPOOF=ON, NMI_FRAME_FIRST=ON and POSTBOX_ONESHOT_TIMER=ON (shipped mitigations)")
+    endif()
+    foreach(_Probe T2_PROBE E3_DPC_PROBE NMI_PROBE STACK_PROBE POSTBOX_NMI)
+        if(${_Probe})
+            message(FATAL_ERROR "STEALTH_PROFILE=ON forbids ${_Probe} (test build)")
+        endif()
+    endforeach()
+    if(DRIVER_SIGNING)
+        message(FATAL_ERROR "STEALTH_PROFILE=ON requires DRIVER_SIGNING=OFF (a manual-map payload carries no signature)")
+    endif()
 endif()

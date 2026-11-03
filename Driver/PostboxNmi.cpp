@@ -1,10 +1,18 @@
-// Constructed-IDT NMI gate for the Postbox build.
+// Constructed-IDT NMI gate for the Postbox build (test-only, default OFF).
 //
-// DISABLED / NOT SHIPPED. On Windows 10 19041 the chain path can corrupt the
-// interrupted thread's MXCSR save slot; the next syscall exit executes
-// `ldmxcsr` on a kernel-pointer value and bugchecks 0x3B (0xC0000005). CMake
-// now refuses POSTBOX_NMI=ON; this file is retained only as historical test
-// code. The supported Postbox build keeps the stock IDT.
+// The chain path is assembly-only (PostboxNmi.S): no C call, no stack switch,
+// no XMM/FP use on the NMI path; every write is below the entry RSP or to a
+// RIP-relative global. This removes the interrupted-context corruption class
+// that produced 0x3B (0xC0000005) in KiSystemServiceExit. Validated live:
+// 20,007 chained accounted NMIs (HalSendNMI + a registered callback) under a
+// syscall-dense workload, plus 13 detector NMIs during a 60 s gate hold, with
+// no bugcheck; the self-test consumed its own NMI and reported an in-driver
+// RIP.
+//
+// The gate is still a test-only IDT hook: the IDTR and constructed table are
+// observable, PatchGuard may check the IDT, and CMake keeps POSTBOX_NMI default
+// OFF and forbidden in STEALTH_PROFILE. The product keeps the stock Windows IDT
+// and uses the callback-list sanitizer instead.
 //
 // This follows the physmem_remapper reference: save the Windows NMI gate, install
 // a copy of the IDT with vector 2 pointing at an assembly trampoline, and chain
@@ -56,15 +64,19 @@ static uint64_t PostboxNmiInstalledMask = 0;
 // points that the non-LTO assembly object resolves against.
 extern "C" void PostboxNmiStub();
 extern "C" __attribute__((used)) uint64_t PostboxOriginalNmiHandler = 0;
-static volatile uint64_t PostboxNmiTicks = 0;
-static volatile uint64_t PostboxNmiHandled = 0;
-static volatile uint64_t PostboxNmiLastRip = 0;
-static volatile uint64_t PostboxNmiLastCs = 0;
-static volatile uint64_t PostboxNmiLastHandledRip = 0;
-static volatile long PostboxNmiInFlight = 0;
-static volatile long PostboxNmiActive = 0;
+
+// The stub updates these directly from assembly. They are extern "C" (not
+// static) so the non-LTO .S object can resolve them; every access from C uses
+// the atomic builtins, and the stub uses lock-prefixed ops for the counters.
+extern "C" volatile uint64_t PostboxNmiTicks = 0;
+extern "C" volatile uint64_t PostboxNmiHandled = 0;
+extern "C" volatile uint64_t PostboxNmiLastRip = 0;
+extern "C" volatile uint64_t PostboxNmiLastCs = 0;
+extern "C" volatile uint64_t PostboxNmiLastHandledRip = 0;
+extern "C" volatile long PostboxNmiInFlight = 0;
+extern "C" volatile long PostboxNmiActive = 0;
+extern "C" volatile long PostboxNmiSelfTestPending = 0;
 static bool PostboxNmiQuiesceAndZero();
-static volatile long PostboxNmiSelfTestPending = 0;
 
 // KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS) returns the system-wide count.
 static const uint16_t PostboxAllProcessorGroups = 0xFFFF;
@@ -77,6 +89,11 @@ using FnKeGetCurrentProcessorNumberEx = void (*)(void*);
 using FnKeStallExecutionProcessor = void (*)(uint32_t);
 using FnMmMapIoSpace = void* (*)(int64_t, uint64_t, uint32_t);
 using FnMmUnmapIoSpace = void (*)(void*, uint64_t);
+using FnHalSendNMI = void (*)(void*);
+using FnKeInitializeAffinityEx = void (*)(void*);
+using FnKeAddProcessorAffinityEx = void (*)(void*, int32_t);
+using FnKeRegisterNmiCallback = void* (*)(uint8_t (*)(void*, uint8_t), void*);
+using FnKeDeregisterNmiCallback = int32_t (*)(void*);
 
 // Stored in the independent state page (C-01): .data keeps no ntoskrnl routine
 // pointers for the NMI gate. PostboxNmiInstall runs after PostboxStart created
@@ -89,6 +106,11 @@ using FnMmUnmapIoSpace = void (*)(void*, uint64_t);
 #define g_KeStallExecutionProcessor (PostboxStatePtr->NmiImports.KeStallExecutionProcessor)
 #define g_MmMapIoSpace (PostboxStatePtr->NmiImports.MmMapIoSpace)
 #define g_MmUnmapIoSpace (PostboxStatePtr->NmiImports.MmUnmapIoSpace)
+#define g_HalSendNMI (PostboxStatePtr->NmiImports.HalSendNMI)
+#define g_KeInitializeAffinityEx (PostboxStatePtr->NmiImports.KeInitializeAffinityEx)
+#define g_KeAddProcessorAffinityEx (PostboxStatePtr->NmiImports.KeAddProcessorAffinityEx)
+#define g_KeRegisterNmiCallback (PostboxStatePtr->NmiImports.KeRegisterNmiCallback)
+#define g_KeDeregisterNmiCallback (PostboxStatePtr->NmiImports.KeDeregisterNmiCallback)
 
 struct PostboxProcessorNumber
 {
@@ -97,6 +119,16 @@ struct PostboxProcessorNumber
     uint8_t Reserved;
 };
 static_assert(sizeof(PostboxProcessorNumber) == 4, "PROCESSOR_NUMBER layout changed");
+
+// KAFFINITY_EX-compatible layout for KeInitializeAffinityEx /
+// KeAddProcessorAffinityEx / HalSendNMI. Same definition as the NMI probe.
+struct PostboxAffinityEx
+{
+    uint16_t Count;
+    uint16_t Size;
+    uint32_t Reserved;
+    uint64_t Bitmap[20];
+};
 
 static uint64_t PostboxNmiGateHandler(const PostboxIdtGate& Gate)
 {
@@ -111,35 +143,11 @@ static void PostboxNmiSetGateHandler(PostboxIdtGate* Gate, uint64_t Handler)
     Gate->OffsetHigh = (uint32_t) (Handler >> 32);
 }
 
-// Runs on the NMI stack with interrupts disabled, possibly with user GS. Only
-// RIP-relative globals and lock-free atomics are touched here: no print, no
-// allocation, no locks, no GS-relative access. Context[15]/[16] are the
-// interrupted RIP/CS: the stub pushes 15 registers before the hardware frame.
-extern "C" __attribute__((used, noinline))
-uint8_t PostboxNmiDispatch(uint64_t* Context)
-{
-    __atomic_add_fetch(&PostboxNmiInFlight, 1, __ATOMIC_ACQ_REL);
-
-    if (Context)
-    {
-        PostboxNmiLastRip = Context[15];
-        PostboxNmiLastCs = Context[16];
-    }
-
-    __atomic_add_fetch(&PostboxNmiTicks, 1, __ATOMIC_RELAXED);
-
-    uint8_t Result = 0;
-    // A self-test NMI is consumed; every other NMI is chained to Windows.
-    if (__atomic_exchange_n(&PostboxNmiSelfTestPending, 0, __ATOMIC_ACQ_REL))
-    {
-        if (Context) PostboxNmiLastHandledRip = Context[15];
-        __atomic_add_fetch(&PostboxNmiHandled, 1, __ATOMIC_RELAXED);
-        Result = 1;
-    }
-
-    __atomic_sub_fetch(&PostboxNmiInFlight, 1, __ATOMIC_ACQ_REL);
-    return Result;
-}
+// The NMI dispatch (counter/flag updates, self-test consume decision) is done
+// inline in PostboxNmi.S. There is deliberately no C call on the NMI path: no
+// stack switch, no C ABI shadow space, no XMM/FP use, and every write is below
+// the entry RSP or to a RIP-relative global. The stub updates the extern "C"
+// counters above directly.
 
 uint64_t PostboxNmiCount()
 {
@@ -258,37 +266,104 @@ bool PostboxNmiSelfTest(uint64_t* Count)
     return Handled && InDriver;
 }
 
+// Minimal registered callback for the storm. A chained NMI is accounted for by
+// the HAL only while an NMI callback is registered (the detector's callback is
+// what makes its HalSendNMI NMIs legitimate); without one the chained NMI is
+// treated as an unaccounted hardware NMI and bugchecks 0x80. Returns handled.
+static uint8_t PostboxNmiStormCallback(void* Context, uint8_t Handled)
+{
+    (void) Context;
+    (void) Handled;
+    return 1;
+}
+
+// Send Count accounted NMIs (HalSendNMI) one CPU at a time, with the self-test
+// flag clear, so the stub chains each one to the Windows handler. This is the
+// detector's known-good pattern (registered callback + per-CPU affinity) and
+// exercises the historical 0x3B path. Returns the number sent.
+uint32_t PostboxNmiStorm(uint32_t Count)
+{
+    if (!Count || !__atomic_load_n(&PostboxNmiActive, __ATOMIC_ACQUIRE) ||
+        !g_HalSendNMI || !g_KeInitializeAffinityEx ||
+        !g_KeAddProcessorAffinityEx || !g_KeRegisterNmiCallback ||
+        !g_KeDeregisterNmiCallback || !g_KeStallExecutionProcessor ||
+        !g_KeQueryActiveProcessors)
+        return 0;
+
+    const uint64_t Active =
+        ((FnKeQueryActiveProcessors) g_KeQueryActiveProcessors)();
+    if (!Active) return 0;
+
+    void* Handle = ((FnKeRegisterNmiCallback) g_KeRegisterNmiCallback)(
+        &PostboxNmiStormCallback, nullptr);
+    if (!Handle) return 0;
+
+    uint32_t Sent = 0;
+    for (uint32_t i = 0; i < Count; ++i)
+    {
+        __atomic_store_n(&PostboxNmiSelfTestPending, 0, __ATOMIC_RELEASE);
+        for (uint32_t Cpu = 0; Cpu < 64; ++Cpu)
+        {
+            if (!(Active & (1ull << Cpu))) continue;
+            PostboxAffinityEx Affinity{};
+            ((FnKeInitializeAffinityEx) g_KeInitializeAffinityEx)(&Affinity);
+            ((FnKeAddProcessorAffinityEx) g_KeAddProcessorAffinityEx)(
+                &Affinity, (int32_t) Cpu);
+            ((FnHalSendNMI) g_HalSendNMI)(&Affinity);
+            ++Sent;
+        }
+        ((FnKeStallExecutionProcessor) g_KeStallExecutionProcessor)(1000);   // 1 ms
+    }
+
+    ((FnKeDeregisterNmiCallback) g_KeDeregisterNmiCallback)(Handle);
+    return Sent;
+}
+
 static bool PostboxNmiResolve()
 {
     address Ntoskrnl = GetNtoskrnl();
     if (!Ntoskrnl) return false;
 
-    // ROT1-encoded so the image does not carry the plaintext NMI/affinity export
-    // names. Decoded into a stack buffer and wiped after the resolve.
-    static const char EncodedNames[8][40] = {
-        "LfRvfszBdujwfQspdfttpst",          // KeQueryActiveProcessors
-        "LfTfuTztufnBggjojuzUisfbeFy",      // KeSetSystemAffinityThreadEx
-        "LfSfwfsuUpVtfsBggjojuzUisfbeFy",  // KeRevertToUserAffinityThreadEx
-        "LfHfuDvssfouQspdfttpsOvncfsFy",    // KeGetCurrentProcessorNumberEx
-        "LfTubmmFyfdvujpoQspdfttps",        // KeStallExecutionProcessor
-        "NnNbqJpTqbdf",                     // MmMapIoSpace
-        "NnVonbqJpTqbdf",                   // MmUnmapIoSpace
-        "LfRvfszBdujwfQspdfttpsDpvouFy",    // KeQueryActiveProcessorCountEx
+    // XOR-SEED encoded like the main resolve table (Crypt.cpp's EncodeName), so
+    // the image carries no plaintext and no ROT1-decipherable NMI export names.
+    // This also keeps the loader's legacy ROT1-table wiper from matching this
+    // table (its needle is the ROT1 of "KeInitialize") and zeroing it after the
+    // entry call, which would leave the later pb_nmi resolve with empty names.
+    static constexpr EncodedName EncodedNames[] = {
+        EncodeName("KeQueryActiveProcessors"),
+        EncodeName("KeSetSystemAffinityThreadEx"),
+        EncodeName("KeRevertToUserAffinityThreadEx"),
+        EncodeName("KeGetCurrentProcessorNumberEx"),
+        EncodeName("KeStallExecutionProcessor"),
+        EncodeName("MmMapIoSpace"),
+        EncodeName("MmUnmapIoSpace"),
+        EncodeName("KeQueryActiveProcessorCountEx"),
+        EncodeName("HalSendNMI"),
+        EncodeName("KeInitializeAffinityEx"),
+        EncodeName("KeAddProcessorAffinityEx"),
+        EncodeName("KeRegisterNmiCallback"),
+        EncodeName("KeDeregisterNmiCallback"),
     };
+    static_assert(sizeof(EncodedNames) / sizeof(EncodedNames[0]) == 13,
+                  "NMI name table changed");
 
-    char Decoded[8][40] = {};
-    const char* Names[8] = {};
-    for (uint32_t i = 0; i < 8; ++i)
+    char Decoded[13][40] = {};
+    const char* Names[13] = {};
+    for (uint32_t i = 0; i < 13; ++i)
     {
         uint32_t j = 0;
-        for (; j < 39 && EncodedNames[i][j]; ++j)
-            Decoded[i][j] = (char) (EncodedNames[i][j] - 1);
+        for (; j < 39 && EncodedNames[i].Bytes[j]; ++j)
+            Decoded[i][j] = (char) ((unsigned char) EncodedNames[i].Bytes[j] ^ SEED);
         Decoded[i][j] = 0;
         Names[i] = Decoded[i];
     }
 
-    address Functions[8] = {};
-    FindFuncExportsBatch(Ntoskrnl, Names, Functions, 8);
+    address Functions[13] = {};
+    FindFuncExportsBatch(Ntoskrnl, Names, Functions, 13);
+    print(INFO("PostboxNmi: resolve '%s'=%p '%s'=%p '%s'=%p"),
+          Names[8], (void*) (uintptr_t) Functions[8],
+          Names[9], (void*) (uintptr_t) Functions[9],
+          Names[10], (void*) (uintptr_t) Functions[10]);
 
     bool Ok = true;
     for (uint32_t i = 0; i < 5; ++i)
@@ -308,8 +383,12 @@ static bool PostboxNmiResolve()
     }
     if (!Functions[5] || !Functions[6])
         print(WARN("PostboxNmi: APIC mapping exports missing; self-test unavailable"));
+    if (!Functions[8] || !Functions[9] || !Functions[10])
+        print(WARN("PostboxNmi: HalSendNMI/affinity exports missing; accounted storm unavailable"));
+    if (!Functions[11] || !Functions[12])
+        print(WARN("PostboxNmi: NMI callback exports missing; accounted storm unavailable"));
 
-    for (uint32_t i = 0; i < 8; ++i)
+    for (uint32_t i = 0; i < 13; ++i)
     {
         volatile char* p = Decoded[i];
         for (uint32_t j = 0; j < 40; ++j) p[j] = 0;
@@ -323,6 +402,11 @@ static bool PostboxNmiResolve()
     g_KeStallExecutionProcessor = Functions[4];
     g_MmMapIoSpace = Functions[5];
     g_MmUnmapIoSpace = Functions[6];
+    g_HalSendNMI = Functions[8];
+    g_KeInitializeAffinityEx = Functions[9];
+    g_KeAddProcessorAffinityEx = Functions[10];
+    g_KeRegisterNmiCallback = Functions[11];
+    g_KeDeregisterNmiCallback = Functions[12];
     return Ok && g_KeQueryActiveProcessors && g_KeQueryActiveProcessorCountEx &&
            g_KeSetSystemAffinityThreadEx && g_KeRevertToUserAffinityThreadEx &&
            g_KeGetCurrentProcessorNumberEx && g_KeStallExecutionProcessor;
