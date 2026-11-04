@@ -193,6 +193,7 @@ address SignatureScan(const void *StartAddress, const void *EndAddress, const ch
 address SectionScan(address BaseAddress, const char *SectionName, const char *Signature,
                     size_t Size, const uint8_t *Wildcards = nullptr)
 {
+    (void) Wildcards;   // signature wildcard table is applied by the caller
     // Get section
     auto dosHeader = (_IMAGE_DOS_HEADER *) BaseAddress;
     auto ntHeader = (_IMAGE_NT_HEADERS64 *) (BaseAddress + dosHeader->e_lfanew);
