@@ -1,7 +1,8 @@
 // Postbox command channel: a timer DPC queues a work item; the work item polls a mailbox
 // in the client's own private memory. No section, no handle, no named object, no dedicated
-// thread. Included by main.cpp only when POSTBOX_CHANNEL is defined; the default build
-// keeps the shared-memory channel in Channel.cpp.
+// thread. Included by main.cpp only when POSTBOX_CHANNEL is defined. The legacy
+// shared-memory channel (Channel.cpp) was removed; the job-only build excludes this file
+// entirely and uses PostboxJobShared.cpp + PostboxJob.cpp.
 //
 // See out/research/AC-25_channel.md for the threat model, the alternatives, and the
 // residual artifacts (the armed KTIMER and the transient worker frame).
