@@ -149,7 +149,8 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
         const bool Protected = JobMode
             ? ProtectImageSectionsLayout(
                   &reinterpret_cast<const PostboxJobConfig*>(RegistryPath)->Layout,
-                  false /* F1: loader pre-protected; no global IPI */)
+                  false /* F1: loader pre-protected; no global IPI */,
+                  true  /* F1: verify-only, do not rewrite PTEs */)
             : ProtectImageSections((const PostboxConfig*) RegistryPath);
 #else
         const bool Protected = ProtectImageSections((const PostboxConfig*) RegistryPath);

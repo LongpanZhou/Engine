@@ -1614,7 +1614,8 @@ static void PostboxNmiSanitizeStop(PostboxState* S)
 // (header, .rdata, .pdata, .reloc, .pbox, padding) R/NX. No page is left RWX.
 uint32_t PostboxStartFailure = 0;
 
-bool ProtectImageSectionsLayout(const PostboxImageLayout* Layout, bool FlushAllCpus = true)
+bool ProtectImageSectionsLayout(const PostboxImageLayout* Layout, bool FlushAllCpus = true,
+                                bool VerifyOnly = false)
 {
     PostboxStartFailure = 20;
     if (!Layout || Layout->Magic != PostboxLayoutMagic ||
@@ -1696,14 +1697,19 @@ bool ProtectImageSectionsLayout(const PostboxImageLayout* Layout, bool FlushAllC
 
         const bool Write = (Flags == PostboxPageRwNx);
         const bool Execute = (Flags == PostboxPageRx);
-        if (!SetPageProtection(address(Va), Write, Execute))
+        if (!VerifyOnly)
         {
-            print(ERROR("Postbox: protect page %p failed"), (void*) (uintptr_t) Va);
-            PostboxStartFailure = 25;
-            return false;
+            if (!SetPageProtection(address(Va), Write, Execute))
+            {
+                print(ERROR("Postbox: protect page %p failed"), (void*) (uintptr_t) Va);
+                PostboxStartFailure = 25;
+                return false;
+            }
         }
 
-        // E3: verify the PTE the driver just wrote, not just the API return.
+        // E3: verify the PTE the loader wrote. F1 is verify-only: it does not
+        // rewrite the PTEs or call KeIpiGenericCall; the loader applied the
+        // final protections before entry. A mismatch fails closed.
         // Fail closed if a page is still writable+executable, or if the
         // writable/NX bits do not match the section map. This runs in release
         // too, so the F1 batch and the persistent path both prove the split.
