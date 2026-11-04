@@ -109,6 +109,27 @@ static void TestAbi()
     CHECK(PostboxJobSectionMax == 0x100000);
 }
 
+static void TestSectionHeader()
+{
+    CHECK(sizeof(PostboxJobSectionHeader) == 0x100);
+    CHECK(offsetof(PostboxJobSectionHeader, Magic) == 0x00);
+    CHECK(offsetof(PostboxJobSectionHeader, Version) == 0x04);
+    CHECK(offsetof(PostboxJobSectionHeader, Count) == 0x08);
+    CHECK(offsetof(PostboxJobSectionHeader, Flags) == 0x0C);
+    CHECK(offsetof(PostboxJobSectionHeader, SectionSize) == 0x10);
+    CHECK(offsetof(PostboxJobSectionHeader, TargetPid) == 0x18);
+    CHECK(offsetof(PostboxJobSectionHeader, TargetCreateTime) == 0x20);
+    CHECK(offsetof(PostboxJobSectionHeader, Nonce) == 0x28);
+    CHECK(offsetof(PostboxJobSectionHeader, Key) == 0x30);
+    CHECK(offsetof(PostboxJobSectionHeader, Mac) == 0x50);
+
+    CHECK(PostboxJobSectionMagic == 0x8C4E71B3);
+    CHECK(PostboxJobSectionVersion == 1);
+    CHECK(PostboxJobSectionHeaderBytes == 0x100);
+    CHECK(PostboxJobSectionBatchOffset == 0x100);
+    CHECK(PostboxJobSectionBatchOffset + sizeof(PostboxJobBatch) <= 0x1000);
+}
+
 static void TestConfigValid()
 {
     auto IsInvalid = [](auto mutate) {
@@ -298,6 +319,7 @@ static void TestBatchMac()
 int main()
 {
     TestAbi();
+    TestSectionHeader();
     TestConfigValid();
     TestBatchValid();
     TestBatchMac();
