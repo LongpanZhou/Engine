@@ -56,6 +56,17 @@ option(E3_DPC_PROBE "Test-only DPC-based CPU-1 stale-TLB probe" OFF)
 option(NMI_PROBE "Test-only NMI callback RIP/RSP probe" OFF)
 option(STACK_PROBE "Test-only in-driver stack probe" OFF)
 
+# The job-only image deliberately has no Postbox state page, NMI machinery, or
+# stack-spoof trampolines. Refuse probe/NMI combinations instead of compiling a
+# job-only image that silently depends on the persistent code.
+if(POSTBOX_JOB_ONLY)
+    foreach(_Probe POSTBOX_NMI T2_PROBE E3_DPC_PROBE NMI_PROBE STACK_PROBE)
+        if(${_Probe})
+            message(FATAL_ERROR "POSTBOX_JOB_ONLY cannot be combined with ${_Probe}")
+        endif()
+    endforeach()
+endif()
+
 set(POSTBOX_NMI_SOURCES)
 if(POSTBOX_NMI)
     list(APPEND VARIANT_DEFINES POSTBOX_NMI)
