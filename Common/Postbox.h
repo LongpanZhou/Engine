@@ -414,6 +414,31 @@ constexpr uint32_t PostboxJobMax = 32;
 constexpr uint32_t PostboxJobMaxBytes = 0x10000;         // per job
 constexpr uint32_t PostboxJobSectionMax = 0x100000;      // 1 MiB
 
+// Controller-owned job section. The controller writes this header at offset 0,
+// the PostboxJobBatch at +0x100, and the data regions after +0x1000. The child
+// loader maps the inherited handle and builds the driver config from it.
+constexpr uint32_t PostboxJobSectionMagic = 0x8C4E71B3;
+constexpr uint32_t PostboxJobSectionVersion = 1;
+constexpr uint32_t PostboxJobSectionHeaderBytes = 0x100;
+constexpr uint32_t PostboxJobSectionBatchOffset = 0x100;
+
+struct PostboxJobSectionHeader
+{
+    uint32_t Magic;                 // PostboxJobSectionMagic
+    uint32_t Version;               // PostboxJobSectionVersion
+    uint32_t Count;                 // matches the batch
+    uint32_t Flags;                 // must be 0
+    uint64_t SectionSize;           // total mapped section bytes
+    uint64_t TargetPid;             // nonzero; controller or game process
+    uint64_t TargetCreateTime;      // nonzero
+    uint64_t Nonce;                 // matches the batch/config
+    uint8_t Key[32];                // SipHash-2-4 key in [0..15]
+    uint64_t Mac;                   // SipHash-2-4 over the batch
+    uint8_t Reserved[0x100 - 0x58];
+};
+static_assert(sizeof(PostboxJobSectionHeader) == 0x100,
+              "job section header ABI changed");
+
 enum PostboxJobOp : uint32_t
 {
     pb_job_ping = 1,        // no data transfer; proves inline execution
