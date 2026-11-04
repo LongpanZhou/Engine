@@ -533,12 +533,10 @@ template<size_t N>
 static void CheckStringsPattern(const Pattern<N>& P)
 {
     CHECK(P.Length > 0 && P.Length <= 64);
-    // A literal 0x3F byte would be treated as a wildcard by Matches(); no
-    // current signature may contain one.
-    bool literal3F = false;
-    for (size_t i = 0; i < P.Length; ++i)
-        if (static_cast<unsigned char>(P.Bytes[i]) == 0x3F) literal3F = true;
-    CHECK(!literal3F);
+    // Wildcards are stored as 0x3F, so a literal-0x3F guard would reject every
+    // wildcard signature. The parser's Valid flag is the real malformed-hex
+    // guard; keep that assertion instead.
+    CHECK(P.Valid);
 }
 
 static void TestStringsHeader()
