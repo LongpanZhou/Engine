@@ -1422,6 +1422,37 @@ static uint64_t PostboxNmiFindShadowJumpGadget(address Nt, uint64_t NtSize)
     }
     return 0;
 }
+
+// A dispatch gadget that resolves to KDPC.DeferredContext at DPC entry.
+// At entry RCX = KDPC and RDX = DeferredContext, so FF E2 (jmp rdx) is the
+// smallest usable thunk; prefer the compiler's FF E2 CC (jmp rdx; int3) form
+// over a coincidental byte pair inside another instruction. Memory forms:
+// FF 61 20 (jmp [rcx+0x20]) and 48 8B 41 20 FF E0 (mov rax,[rcx+0x20]; jmp
+// rax). All three leave the dispatcher's return address on the stack, so the
+// real routine returns directly into nt.
+static uint64_t PostboxNmiFindDpcJumpGadget(address Nt, uint64_t NtSize)
+{
+    PostboxNmiSection Sections[16] = {};
+    const uint32_t Count = PostboxNmiExecSections(Nt, NtSize, Sections, 16);
+    for (uint32_t i = 0; i < Count; ++i)
+    {
+        const uint8_t* P = (const uint8_t*) (uintptr_t) Sections[i].Va;
+        for (uint64_t j = 0; j + 2 < Sections[i].Size; ++j)
+            if (P[j] == 0xFF && P[j + 1] == 0xE2 && P[j + 2] == 0xCC)
+                return Sections[i].Va + j;
+        for (uint64_t j = 0; j + 2 < Sections[i].Size; ++j)
+            if (P[j] == 0xFF && P[j + 1] == 0x61 && P[j + 2] == 0x20)
+                return Sections[i].Va + j;
+        for (uint64_t j = 0; j + 5 < Sections[i].Size; ++j)
+            if (P[j] == 0x48 && P[j + 1] == 0x8B && P[j + 2] == 0x41 &&
+                P[j + 3] == 0x20 && P[j + 4] == 0xFF && P[j + 5] == 0xE0)
+                return Sections[i].Va + j;
+        for (uint64_t j = 0; j + 1 < Sections[i].Size; ++j)
+            if (P[j] == 0xFF && P[j + 1] == 0xE2)
+                return Sections[i].Va + j;
+    }
+    return 0;
+}
 #endif
 
 // Redirect a mapped interrupted RIP to an nt ret gadget. The original RIP is
@@ -3164,6 +3195,31 @@ static void PostboxDpcRoutine(void*, void*, void*, void*)
 #endif
 }
 
+#if defined(STACK_SPOOF) && defined(NMI_SANITIZE)
+// DPC entry spoof. Timer-table/DPC-object scanners read KDPC.DeferredRoutine;
+// point it at an nt `jmp rdx` or `jmp [rcx+0x20]` gadget and put the real
+// routine in DeferredContext. At DPC entry RDX = DeferredContext and RCX =
+// KDPC, so either gadget reaches the real routine while the dispatcher's
+// return address stays in nt. The routine ignores its arguments and reads
+// PostboxStatePtr.
+static void PostboxInstallDpcSpoof(PostboxState* S)
+{
+    if (!S) return;
+    const uint64_t Nt = S->NmiSanitize.NtBase;
+    const uint64_t NtSize = S->NmiSanitize.NtSize;
+    if (!Nt || !NtSize) return;
+    const uint64_t Gadget = PostboxNmiFindDpcJumpGadget(Nt, NtSize);
+    if (!Gadget)
+    {
+        print(WARN("Postbox: DPC jump gadget not found"));
+        return;
+    }
+    S->Dpc.DeferredRoutine = (void*) (uintptr_t) Gadget;
+    S->Dpc.DeferredContext = (void*) (uintptr_t) &PostboxDpcRoutine;
+    print(INFO("Postbox: DPC entry spoofed (%p)"), (void*) (uintptr_t) Gadget);
+}
+#endif
+
 // Runs at PASSIVE_LEVEL in an existing system worker thread. The assembly
 // PostboxWorkEntry wrapper calls this and clears PostboxInFlight only after it
 // returns; do not clear InFlight here.
@@ -3929,6 +3985,12 @@ bool PostboxStart(const PostboxConfig* Config)
 
     PostboxInitializeTimer(&PostboxStatePtr->Timer, 0);   // NotificationTimer
     PostboxInitializeDpc(&PostboxStatePtr->Dpc, &PostboxDpcRoutine, nullptr);
+#if defined(STACK_SPOOF) && defined(NMI_SANITIZE)
+    // Must run after KeInitializeDpc: that call overwrites DeferredRoutine and
+    // DeferredContext. The install only rewrites those two fields; the timer is
+    // armed afterwards through the normal path.
+    PostboxInstallDpcSpoof(PostboxStatePtr);
+#endif
 
     PostboxPeriodMs = 4;
     PostboxIdleTicks = 0;
