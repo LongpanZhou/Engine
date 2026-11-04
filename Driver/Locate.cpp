@@ -13,8 +13,11 @@ address ResolveRipRelative(const void *Instruction, uint32_t OffsetOffset, uint3
 }
 
 // Pattern scan over one module image: PAGE first, then .text, like the reference cleaner's FindPatternImage.
-// The section scans are quiet; exactly one result is reported after all attempts are finished
-address ScanModuleImage(address Base, const char *Sig, size_t Size)
+// The section scans are quiet; exactly one result is reported after all attempts are finished.
+// Wildcards is optional: raw string callers keep the legacy '?' convention; Pattern callers pass
+// the explicit mask so a literal 0x3F byte is compared normally.
+static address ScanModuleImageSections(address Base, const char *Sig, size_t Size,
+                                       const uint8_t *Wildcards)
 {
     if (!Base)
     {
@@ -24,9 +27,9 @@ address ScanModuleImage(address Base, const char *Sig, size_t Size)
 
     // DV-60: scan the normal code section first. .PAGE is the paged/rare
     // fallback; putting it first can match a stale paged copy before .text.
-    address Match = SectionScan(Base, Decode(TextSectionName).data(), Sig, Size);
+    address Match = SectionScan(Base, Decode(TextSectionName).data(), Sig, Size, Wildcards);
     if (!Match)
-        Match = SectionScan(Base, Decode(PageSectionName).data(), Sig, Size);
+        Match = SectionScan(Base, Decode(PageSectionName).data(), Sig, Size, Wildcards);
 
     if (Match)
         print(INFO("Signature: %p"), Match);
@@ -34,6 +37,11 @@ address ScanModuleImage(address Base, const char *Sig, size_t Size)
         print(ERROR("SIGNATURE NOT FOUND!"));
 
     return Match;
+}
+
+address ScanModuleImage(address Base, const char *Sig, size_t Size)
+{
+    return ScanModuleImageSections(Base, Sig, Size, nullptr);
 }
 
 // Overload for the length-carrying signatures built by PatternToBytes. Embedded NUL bytes in the
@@ -49,5 +57,5 @@ address ScanModuleImage(address Base, const Pattern<N> &Sig)
         print(ERROR("ScanModuleImage: invalid signature"));
         return nullptr;
     }
-    return ScanModuleImage(Base, Sig.data(), Sig.Length);
+    return ScanModuleImageSections(Base, Sig.data(), Sig.Length, Sig.Wildcards.data());
 }

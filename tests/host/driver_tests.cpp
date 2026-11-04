@@ -530,13 +530,18 @@ static void TestResolveRipRelative()
 }
 
 template<size_t N>
-static void CheckStringsPattern(const Pattern<N>& P)
+static void CheckStringsPattern(const Pattern<N>& Encoded)
 {
+    const Pattern<N> P = Decode(Encoded);
     CHECK(P.Length > 0 && P.Length <= 64);
-    // Wildcards are stored as 0x3F, so a literal-0x3F guard would reject every
-    // wildcard signature. The parser's Valid flag is the real malformed-hex
-    // guard; keep that assertion instead.
     CHECK(P.Valid);
+
+    // Wildcards are carried in the explicit mask, so a literal 0x3F byte is
+    // still a bug: it would silently broaden the signature. Check the decoded
+    // bytes; the stored bytes are SEED-XORed.
+    for (size_t i = 0; i < P.Length; ++i)
+        if (!P.Wildcards[i])
+            CHECK(static_cast<unsigned char>(P.Bytes[i]) != 0x3F);
 }
 
 static void TestStringsHeader()
