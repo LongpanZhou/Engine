@@ -822,7 +822,7 @@ int PostboxClientMain(int argc, char** argv)
         }
         PostboxNmiStatus St{};
         std::memcpy(&St, Data, sizeof(St));
-        std::printf("nmi status: magic=0x%X active=%u ready=%u detector=%016llx+%llx writes=%llu last_core=%llu last_count=%llu last_user=%llu last_rip=%016llx last_rsp=%016llx refresh_active=%llu refresh_run=%llu refresh_count=%llu list=%016llx nt=%016llx+%llx pslist=%016llx\n",
+        std::printf("nmi status: magic=0x%X active=%u ready=%u detector=%016llx+%llx writes=%llu last_core=%llu last_count=%llu last_user=%llu last_rip=%016llx last_rsp=%016llx refresh_active=%llu refresh_run=%llu refresh_count=%llu list=%016llx nt=%016llx+%llx pslist=%016llx apc_neutralized=%llu thread_start_spoofed=%llu\n",
                     St.Magic, St.Active, St.Ready,
                     static_cast<unsigned long long>(St.DetectorBase),
                     static_cast<unsigned long long>(St.DetectorSize),
@@ -838,7 +838,9 @@ int PostboxClientMain(int argc, char** argv)
                     static_cast<unsigned long long>(St.ListHead),
                     static_cast<unsigned long long>(St.NtBase),
                     static_cast<unsigned long long>(St.NtSize),
-                    static_cast<unsigned long long>(St.PsLoadedModuleList));
+                    static_cast<unsigned long long>(St.PsLoadedModuleList),
+                    static_cast<unsigned long long>(St.ApcNeutralized),
+                    static_cast<unsigned long long>(St.ThreadStartSpoofed));
         std::fflush(stdout);
         SecureZeroMemory(Data, PostboxDataMax);
     }
@@ -891,6 +893,24 @@ int PostboxClientMain(int argc, char** argv)
     {
         if (!HoldSession(Header, Data, S, Options.HoldMs, Options.HoldPingMs))
             return 1;
+    }
+
+    if (Options.NmiStatus)
+    {
+        // Post-hold read: proves the APC stackwalk countermeasure ran while the
+        // mapped threads were alive, not just during the short NMI window.
+        if (Submit(Header, Data, S, pb_nmi_status, 0, 0, 5000))
+        {
+            PostboxNmiStatus St{};
+            std::memcpy(&St, Data, sizeof(St));
+            std::printf("apc status: neutralized=%llu active=%u writes=%llu thread_start_spoofed=%llu\n",
+                        static_cast<unsigned long long>(St.ApcNeutralized),
+                        St.Active,
+                        static_cast<unsigned long long>(St.Writes),
+                        static_cast<unsigned long long>(St.ThreadStartSpoofed));
+            std::fflush(stdout);
+            SecureZeroMemory(Data, PostboxDataMax);
+        }
     }
 
     if (!Submit(Header, Data, S, pb_stop, 0, 0, 3000))

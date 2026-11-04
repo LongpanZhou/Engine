@@ -24,6 +24,12 @@
     .text
     .globl PostboxWorkEntry
 PostboxWorkEntry:
+    # Keep kernel APCs disabled for the whole mapped work item. Detector APCs
+    # stay queued until PostboxApcsNeutralizeAndEnable patches and releases
+    # them in the epilogue.
+    subq $8, %rsp
+    call PostboxApcsDisable
+    addq $8, %rsp
 #ifdef STACK_SPOOF
     movq g_PostboxPopRspRetSkip(%rip), %rax
     testq %rax, %rax
@@ -61,6 +67,7 @@ PostboxWorkEpilogue:
     movq %r12, %rsp
     popq %r12
     subq $8, %rsp
+    call PostboxApcsNeutralizeAndEnable
     call PostboxDrainThreadApcs
     addq $8, %rsp
     movl $0, PostboxInFlight(%rip)
@@ -68,6 +75,7 @@ PostboxWorkEpilogue:
 #else
     subq $0x28, %rsp
     call PostboxWorkRoutine
+    call PostboxApcsNeutralizeAndEnable
     call PostboxDrainThreadApcs
     movl $0, PostboxInFlight(%rip)
     addq $0x28, %rsp

@@ -90,8 +90,10 @@ struct PostboxNmiStatus
     uint64_t NtBase;
     uint64_t NtSize;
     uint64_t PsLoadedModuleList;
+    uint64_t ApcNeutralized;
+    uint64_t ThreadStartSpoofed;
 };
-static_assert(sizeof(PostboxNmiStatus) == 0x88, "NMI status ABI changed");
+static_assert(sizeof(PostboxNmiStatus) == 0x98, "NMI status ABI changed");
 #endif
 
 // Test-only call-site stack probe. The MmCopyVirtualMemory trampoline records

