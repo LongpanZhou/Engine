@@ -60,11 +60,15 @@ PostboxWorkEpilogue:
     movq $0, g_PostboxShadowDepth(%rip)
     movq %r12, %rsp
     popq %r12
+    subq $8, %rsp
+    call PostboxDrainThreadApcs
+    addq $8, %rsp
     movl $0, PostboxInFlight(%rip)
     ret
 #else
     subq $0x28, %rsp
     call PostboxWorkRoutine
+    call PostboxDrainThreadApcs
     movl $0, PostboxInFlight(%rip)
     addq $0x28, %rsp
     ret

@@ -166,21 +166,45 @@ PostboxMmCopySpoof:
 # of the caller.
     .globl PostboxCleanWait
 PostboxCleanWait:
+    # Caller convention: rcx = target, rdx = Alertable, r8 = WaitMode,
+    # r9 = Interval. KeDelayExecutionThread wants rcx = WaitMode,
+    # rdx = Alertable, r8 = Interval. Save the target and shuffle the ABI
+    # arguments before entering the target; otherwise r8 is 0/1 and the
+    # target dereferences it as the Interval pointer.
+    movq %rcx, %rax                 # target
+    movq %r8, %rcx                  # WaitMode -> RCX
+    movq %r9, %r8                   # Interval -> R8
     movq %rsp, %r10                 # real RSP (points at caller return slot)
     leaq -0x100(%rsp), %r11
     andq $-16, %r11
     subq $8, %r11                   # fake RSP, 16-byte aligned
-    movq g_PostboxPopRspRet(%rip), %rax
-    testq %rax, %rax
-    jz 1f
-    movq %rax, 0(%r11)              # target return = nt pop rsp; ret
-    movq %r10, 8(%r11)              # pop rsp loads the real RSP
+
+    # Shadow-space-safe chain: target returns to `add rsp,0x28; ret`, which
+    # skips the target return slot and the 0x20-byte shadow space, then jumps
+    # to `pop rsp; ret`; the real RSP is at fake+0x38. A callee spilling its
+    # register arguments at fake+8..0x27 cannot corrupt the restore chain.
+    movq g_PostboxPopRspRetSkip(%rip), %r9
+    testq %r9, %r9
+    jz 2f
+    movq %r9, 0(%r11)               # target return = add rsp,0x28; ret
+    movq g_PostboxPopRspRet(%rip), %r9
+    testq %r9, %r9
+    jz 2f
+    movq %r9, 0x28(%r11)            # return chain = pop rsp; ret
+    movq %r10, 0x38(%r11)           # pop rsp loads the real RSP
     movq %r11, %rsp
-    jmp *%rcx
-1:
-    # Gadget unresolved: keep the wait functional. The caller only selects the
-    # clean-wait loop when g_PostboxPopRspRet is nonzero.
-    jmp *%rcx
+    jmp *%rax
+2:
+    # Legacy fallback if the skip gadget is unavailable.
+    movq g_PostboxPopRspRet(%rip), %r9
+    testq %r9, %r9
+    jz 3f
+    movq %r9, 0(%r11)
+    movq %r10, 8(%r11)
+    movq %r11, %rsp
+    jmp *%rax
+3:
+    jmp *%rax
 
 # APC-stackwalk thread loop. The mapped work is a step function that returns
 # 1 to continue or 0 to stop. APCs are disabled while the step runs, so a
@@ -223,11 +247,10 @@ PostboxThreadLoop:
     jz 2f
     call *%rax
 2:
-    movq 0x10(%rbx), %rcx
-    xorl %edx, %edx
-    xorl %r8d, %r8d
-    leaq 0x18(%rbx), %r9
-    call PostboxCleanWait
+    # Use the verified generic shadow-stack trampoline (PostboxSpoofCall3)
+    # instead of the custom clean-wait fake stack.
+    leaq 0x18(%rbx), %rcx
+    call PostboxSpoofedThreadWait
 
     # Back in mapped code: disable APCs before the next step.
     movq 0x20(%rbx), %rax
@@ -237,6 +260,18 @@ PostboxThreadLoop:
     jmp 1b
 
 9:
+    # The loop enters a critical region before every step and only leaves it on
+    # the continue path. Balance it here: PspExitThread bugchecks 0x20 when the
+    # APC-disable count is nonzero (observed Arg1=0, Arg2=0xFFFF = -1, i.e. no
+    # APC at all, one unbalanced KeEnterCriticalRegion). Leaving the region also
+    # delivers any queued kernel APC before the thread terminates.
+    movq 0x28(%rbx), %rax
+    testq %rax, %rax
+    jz 8f
+    call *%rax
+8:
+    # Drain pending kernel APCs before this system thread exits.
+    call PostboxDrainThreadApcs
     addq $0x30, %rsp
     popq %r13
     popq %r12
