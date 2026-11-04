@@ -45,6 +45,8 @@ static PostboxJobConfig MakeValidConfig()
     for (uint32_t i = 0; i < 16; ++i)
         cfg.Key[i] = static_cast<uint8_t>(i + 1);
     cfg.Mac = 0x123456789ABCDEF0ull;
+    for (uint32_t i = 0; i < 7; ++i)
+        cfg.Imports[i] = 0xFFFFF80000001000ull + i * 0x10;
     cfg.Layout.Magic = PostboxLayoutMagic;
     cfg.Layout.Version = PostboxLayoutVersion;
     cfg.Layout.ImageSize = 0xB000;
@@ -90,13 +92,14 @@ static void TestAbi()
     CHECK(offsetof(PostboxJobBatch, Jobs) == 0x30);
     CHECK(sizeof(PostboxJobBatch::Jobs) / sizeof(PostboxJobRecord) == PostboxJobMax);
 
-    CHECK(sizeof(PostboxJobConfig) == 0x110);
+    CHECK(sizeof(PostboxJobConfig) == 0x148);
     CHECK(offsetof(PostboxJobConfig, SectionVa) == 0x10);
     CHECK(offsetof(PostboxJobConfig, TargetPid) == 0x20);
     CHECK(offsetof(PostboxJobConfig, Nonce) == 0x30);
     CHECK(offsetof(PostboxJobConfig, Layout) == 0x58);
     CHECK(offsetof(PostboxJobConfig, Layout) == offsetof(PostboxConfig, Layout));
     CHECK(offsetof(PostboxJobConfig, Mac) == 0x108);
+    CHECK(offsetof(PostboxJobConfig, Imports) == 0x110);
 
     CHECK(PostboxJobConfigMagic == 0x8F3A27C1);
     CHECK(PostboxJobBatchMagic == 0x9B4D62E5);
@@ -129,6 +132,7 @@ static void TestConfigValid()
     CHECK(IsInvalid([](PostboxJobConfig& c) { c.Version = PostboxJobConfigVersion - 1; }));
     CHECK(IsInvalid([](PostboxJobConfig& c) { c.Reserved = 1; }));
     CHECK(IsInvalid([](PostboxJobConfig& c) { memset(c.Key, 0, sizeof(c.Key)); }));
+    CHECK(IsInvalid([](PostboxJobConfig& c) { c.Imports[3] = 0; }));
     CHECK(IsInvalid([](PostboxJobConfig& c) { c.SectionVa = 0; }));
     CHECK(IsInvalid([](PostboxJobConfig& c) { c.SectionVa = 0x1004; }));   // unaligned
     CHECK(IsInvalid([](PostboxJobConfig& c) { c.SectionSize = 0; }));

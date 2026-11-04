@@ -22,9 +22,11 @@ address ScanModuleImage(address Base, const char *Sig, size_t Size)
         return nullptr;
     }
 
-    address Match = SectionScan(Base, Decode(PageSectionName).data(), Sig, Size);
+    // DV-60: scan the normal code section first. .PAGE is the paged/rare
+    // fallback; putting it first can match a stale paged copy before .text.
+    address Match = SectionScan(Base, Decode(TextSectionName).data(), Sig, Size);
     if (!Match)
-        Match = SectionScan(Base, Decode(TextSectionName).data(), Sig, Size);
+        Match = SectionScan(Base, Decode(PageSectionName).data(), Sig, Size);
 
     if (Match)
         print(INFO("Signature: %p"), Match);

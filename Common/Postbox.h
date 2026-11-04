@@ -497,10 +497,17 @@ struct PostboxJobConfig
     uint8_t Key[32];                // SipHash-2-4 key in [0..15]; [16..31] zero
     PostboxImageLayout Layout;      // loader-built image section map
     uint64_t Mac;                   // SipHash-2-4(Key, input PostboxJobBatch)
+    // DV-17: the loader resolves these seven nt exports and passes their
+    // addresses. The job-only driver has no export-name table/resolver.
+    uint64_t Imports[7];            // PsGetCurrentProcess, PsLookupProcessByProcessId,
+                                    // ObDereferenceObject, MmCopyVirtualMemory,
+                                    // PsAcquire/ReleaseProcessExitSynchronization,
+                                    // PsGetProcessCreateTimeQuadPart
 };
-static_assert(sizeof(PostboxJobConfig) == 0x110, "job config ABI changed");
+static_assert(sizeof(PostboxJobConfig) == 0x148, "job config ABI changed");
 static_assert(offsetof(PostboxJobConfig, Layout) == 0x58, "job config Layout offset changed");
 static_assert(offsetof(PostboxJobConfig, Mac) == 0x108, "job config tail offset changed");
+static_assert(offsetof(PostboxJobConfig, Imports) == 0x110, "job config imports offset changed");
 
 inline bool PostboxJobConfigValid(const PostboxJobConfig& cfg, uint32_t* error = nullptr)
 {
@@ -530,6 +537,9 @@ inline bool PostboxJobConfigValid(const PostboxJobConfig& cfg, uint32_t* error =
         cfg.Layout.Version != PostboxLayoutVersion ||
         !cfg.Layout.NtoskrnlBase || !cfg.Layout.ImageBase || !cfg.Layout.AllocSize)
         return fail();
+
+    for (uint32_t i = 0; i < 7; ++i)
+        if (!cfg.Imports[i]) return fail();
 
     if (error) *error = 0;
     return true;

@@ -238,6 +238,14 @@ static void TestPatternToBytes()
     auto p4 = PatternToBytes("0?");
     CHECK(p4.Length == 1);
     CHECK(static_cast<unsigned char>(p4.Bytes[0]) == 0xFF);
+    CHECK(!p4.Valid);                              // '?' is not a hex nibble
+
+    // DV-60: invalid hex and a short token must set Valid=false, and the
+    // ScanModuleImage runtime guard must reject them.
+    auto bad = PatternToBytes("GG");
+    CHECK(!bad.Valid);
+    auto shortToken = PatternToBytes("A");
+    CHECK(!shortToken.Valid);
 
     // mixed-case nibbles
     auto p5 = PatternToBytes("4a fF");

@@ -130,8 +130,8 @@ static bool Matches(const char *Current, const char *Signature, size_t size)
 // the exact range that was searched
 constexpr bool VerboseScan = false;
 
-// Signature scan over a range. This is intentionally quiet: ScanModuleImage tries .PAGE and then
-// .text and logs one result after all section attempts are done
+// Signature scan over a range. This is intentionally quiet: ScanModuleImage tries .text and then
+// .PAGE and logs one result after all section attempts are done
 address SignatureScan(const void *StartAddress, const void *EndAddress, const char *Signature, size_t Size)
 {
     if constexpr (VerboseScan)

@@ -31,40 +31,15 @@ struct PostboxJobImports
     FnPsGetProcessCreateTimeQuadPart CreateTime;
 };
 
-static void PostboxJobTakeImports(PostboxJobImports* I)
+static void PostboxJobTakeImports(const PostboxJobConfig& Cfg, PostboxJobImports* I)
 {
-    I->PsGetCurrentProcess = (FnPsGetCurrentProcess) g_PsGetCurrentProcess_Raw;
-    I->PsLookupProcessByProcessId =
-        (FnPsLookupProcessByProcessId) g_PsLookupProcessByProcessId_Raw;
-    I->ObDereferenceObject = (FnObDereferenceObject) g_ObDereferenceObject_Raw;
-    I->MmCopyVirtualMemory = (FnMmCopyVirtualMemory) g_MmCopyVirtualMemory_Raw;
-    I->AcquireExitSync =
-        (FnPsAcquireProcessExitSynchronization) g_PsAcquireProcessExitSynchronization_Raw;
-    I->ReleaseExitSync =
-        (FnPsReleaseProcessExitSynchronization) g_PsReleaseProcessExitSynchronization_Raw;
-    I->CreateTime =
-        (FnPsGetProcessCreateTimeQuadPart) g_PsGetProcessCreateTimeQuadPart_Raw;
-
-    // The persistent path normally moves these into the state page; job mode
-    // has no state page, so clear the raw .data slots after the stack copy.
-    g_KeInitializeTimerEx_Raw = 0;
-    g_KeInitializeDpc_Raw = 0;
-    g_KeSetCoalescableTimer_Raw = 0;
-    g_KeCancelTimer_Raw = 0;
-    g_KeFlushQueuedDpcs_Raw = 0;
-    g_ExQueueWorkItem_Raw = 0;
-    g_PsLookupProcessByProcessId_Raw = 0;
-    g_ObDereferenceObject_Raw = 0;
-    g_KeDelayExecutionThread_Raw = 0;
-    g_PsGetProcessCreateTimeQuadPart_Raw = 0;
-    g_ExAllocatePoolWithTag_Raw = 0;
-    g_ExFreePool_Raw = 0;
-    g_MmCopyVirtualMemory_Raw = 0;
-    g_PsGetCurrentProcess_Raw = 0;
-    g_PsAcquireProcessExitSynchronization_Raw = 0;
-    g_PsReleaseProcessExitSynchronization_Raw = 0;
-    g_PsCreateSystemThread_Raw = 0;
-    g_ZwClose_Raw = 0;
+    I->PsGetCurrentProcess = (FnPsGetCurrentProcess) Cfg.Imports[0];
+    I->PsLookupProcessByProcessId = (FnPsLookupProcessByProcessId) Cfg.Imports[1];
+    I->ObDereferenceObject = (FnObDereferenceObject) Cfg.Imports[2];
+    I->MmCopyVirtualMemory = (FnMmCopyVirtualMemory) Cfg.Imports[3];
+    I->AcquireExitSync = (FnPsAcquireProcessExitSynchronization) Cfg.Imports[4];
+    I->ReleaseExitSync = (FnPsReleaseProcessExitSynchronization) Cfg.Imports[5];
+    I->CreateTime = (FnPsGetProcessCreateTimeQuadPart) Cfg.Imports[6];
 }
 
 // Copy between a user VA in SourceProcess and either a user VA in TargetProcess
@@ -89,6 +64,21 @@ static int32_t PostboxJobCopy(const PostboxJobImports& Imports,
     return Status;
 }
 
+// DV-57: live EPROCESS layout check for the job-only build. The loader passes
+// PsGetCurrentProcess; the fields below are the same offsets pinned by the
+// static asserts in Lib/structs.h.
+static bool PostboxJobLayoutOk(const PostboxJobImports& I)
+{
+    void* Current = I.PsGetCurrentProcess();
+    if (!Current) return false;
+    const _EPROCESS* P = (_EPROCESS*) Current;
+    if (!P->UniqueProcessId) return false;
+    if (!P->ActiveProcessLinks.Flink || !P->ActiveProcessLinks.Blink) return false;
+    if (!P->Peb) return false;
+    if (!P->ImageFileName[0]) return false;
+    return true;
+}
+
 // Runs one batch inline in the entry thread. PASSIVE_LEVEL (DriverEntry).
 bool PostboxRunJobs(const PostboxJobConfig* Config)
 {
@@ -107,12 +97,20 @@ bool PostboxRunJobs(const PostboxJobConfig* Config)
     }
 
     PostboxJobImports Imports{};
-    PostboxJobTakeImports(&Imports);
+    PostboxJobTakeImports(Cfg, &Imports);
     if (!Imports.PsGetCurrentProcess || !Imports.PsLookupProcessByProcessId ||
         !Imports.ObDereferenceObject || !Imports.MmCopyVirtualMemory ||
         !Imports.AcquireExitSync || !Imports.ReleaseExitSync || !Imports.CreateTime)
     {
         PostboxStartFailure = 47;
+        PostboxWipe(&Imports, sizeof(Imports));
+        PostboxWipe(&Cfg, sizeof(Cfg));
+        return false;
+    }
+
+    if (!PostboxJobLayoutOk(Imports))
+    {
+        PostboxStartFailure = 49;
         PostboxWipe(&Imports, sizeof(Imports));
         PostboxWipe(&Cfg, sizeof(Cfg));
         return false;
