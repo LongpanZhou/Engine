@@ -238,6 +238,14 @@ static void TestPatternToBytes()
     auto p4 = PatternToBytes("0?");
     CHECK(p4.Length == 1);
     CHECK(static_cast<unsigned char>(p4.Bytes[0]) == 0xFF);
+    CHECK(!p4.Valid);                              // '?' is not a hex nibble
+
+    // DV-60: invalid hex and a short token must set Valid=false, and the
+    // ScanModuleImage runtime guard must reject them.
+    auto bad = PatternToBytes("GG");
+    CHECK(!bad.Valid);
+    auto shortToken = PatternToBytes("A");
+    CHECK(!shortToken.Valid);
 
     // mixed-case nibbles
     auto p5 = PatternToBytes("4a fF");
@@ -522,15 +530,18 @@ static void TestResolveRipRelative()
 }
 
 template<size_t N>
-static void CheckStringsPattern(const Pattern<N>& P)
+static void CheckStringsPattern(const Pattern<N>& Encoded)
 {
+    const Pattern<N> P = Decode(Encoded);
     CHECK(P.Length > 0 && P.Length <= 64);
-    // A literal 0x3F byte would be treated as a wildcard by Matches(); no
-    // current signature may contain one.
-    bool literal3F = false;
+    CHECK(P.Valid);
+
+    // Wildcards are carried in the explicit mask, so a literal 0x3F byte is
+    // still a bug: it would silently broaden the signature. Check the decoded
+    // bytes; the stored bytes are SEED-XORed.
     for (size_t i = 0; i < P.Length; ++i)
-        if (static_cast<unsigned char>(P.Bytes[i]) == 0x3F) literal3F = true;
-    CHECK(!literal3F);
+        if (!P.Wildcards[i])
+            CHECK(static_cast<unsigned char>(P.Bytes[i]) != 0x3F);
 }
 
 static void TestStringsHeader()

@@ -1005,6 +1005,12 @@ struct _KPROCESS
     ULONGLONG EndPadding[8];                                                //0x3f8
 };
 
+// DV-57: pin the PEB fields the module walk reads. A header change must fail
+// the build, not silently walk the wrong offset at runtime.
+static_assert(offsetof(_PEB, Ldr) == 0x18, "PEB.Ldr offset changed");
+static_assert(offsetof(_PEB, ProcessParameters) == 0x20, "PEB.ProcessParameters offset changed");
+static_assert(sizeof(_PEB) == 0x7c8, "PEB size changed");
+
 //0xa40 bytes (sizeof)
 struct _EPROCESS
 {
@@ -1351,6 +1357,14 @@ struct _EPROCESS
     ULONG DisabledComponentFlags;                                           //0xa20
     ULONG* volatile PathRedirectionHashes;                                  //0xa28
 };
+
+// DV-57: pin the EPROCESS fields the process walk, PEB lookup, and image-name
+// checks read. The target is Windows 10 19041 x64; a different build must fail
+// the static asserts or the runtime layout check in Process.cpp.
+static_assert(offsetof(_EPROCESS, UniqueProcessId) == 0x440, "EPROCESS.UniqueProcessId offset changed");
+static_assert(offsetof(_EPROCESS, ActiveProcessLinks) == 0x448, "EPROCESS.ActiveProcessLinks offset changed");
+static_assert(offsetof(_EPROCESS, Peb) == 0x550, "EPROCESS.Peb offset changed");
+static_assert(offsetof(_EPROCESS, ImageFileName) == 0x5a8, "EPROCESS.ImageFileName offset changed");
 
 // Object manager structures: the layouts behind a named kernel object, so driver-object hiding can be done with
 // raw memory work only, no object-manager routine calls. Layouts are the Windows 10 19041 x64 ones

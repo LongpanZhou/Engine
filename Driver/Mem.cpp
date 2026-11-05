@@ -386,7 +386,7 @@ static uint64_t CachedPfnPteAddressBase = 0;
 // plaintext nor ROT1-decipherable "PsInitialSystemProcess"/"PsLoadedModuleList"
 // strings: every stored byte sits in 0x80..0xFF, and neither the plain-ASCII scan
 // nor the ROT1 key reads it back. Decode is the same XOR into a stack buffer
-static void MemDecodeName(const char* Encoded, char* Out, uint32_t OutSize)
+[[maybe_unused]] static void MemDecodeName(const char* Encoded, char* Out, uint32_t OutSize)
 {
     uint32_t i = 0;
     for (; i + 1 < OutSize && Encoded[i]; ++i)
@@ -403,6 +403,12 @@ void MemSetPreStartNtoskrnl(uint64_t Base)
     if (!Base) return;
     __atomic_store_n(&CachedNtoskrnl, Base, __ATOMIC_SEQ_CST);
 
+#ifdef POSTBOX_JOB_ONLY
+    // The job-only image gets the ntoskrnl base from the loader and uses only
+    // the loader-provided job imports. It does not need the two data-export
+    // names or the FindFuncExports resolver, so keep them out of the image.
+    return;
+#else
     static constexpr EncodedName EncodedPsInitial = EncodeName("PsInitialSystemProcess");
     static constexpr EncodedName EncodedPsLoaded = EncodeName("PsLoadedModuleList");
     char PsInitialName[32];
@@ -421,6 +427,7 @@ void MemSetPreStartNtoskrnl(uint64_t Base)
         ((volatile char*) PsInitialName)[i] = 0;
     for (uint32_t i = 0; i < sizeof(PsLoadedName); ++i)
         ((volatile char*) PsLoadedName)[i] = 0;
+#endif // POSTBOX_JOB_ONLY
 }
 
 #ifdef DEBUG
@@ -475,7 +482,7 @@ bool VerifyMemSetPreStartNtoskrnl(uint64_t NtoskrnlBase)
 // True when a loader BaseDllName equals Expected (ASCII, case-insensitive). The read is bounded by
 // Name.Length: BaseDllName is a counted string, not necessarily NUL-terminated. Only the
 // non-Postbox GetNtoskrnl list walk consumes it; the Postbox build compiles the whole walk out
-static bool ModuleNameEquals(const _UNICODE_STRING &Name, const char *Expected)
+[[maybe_unused]] static bool ModuleNameEquals(const _UNICODE_STRING &Name, const char *Expected)
 {
     const size_t Length = Name.Length / sizeof(wchar_t);
     if (!Name.Buffer || (Name.Length & 1) || Length != StringLength(Expected)) return false;
@@ -502,7 +509,7 @@ address GetNtoskrnl()
     uint64_t Cached = __atomic_load_n(Slot, __ATOMIC_SEQ_CST);
     if (Cached) return Cached == Failed ? nullptr : (address) Cached;
 
-#ifdef POSTBOX_CHANNEL
+#if defined(POSTBOX_CHANNEL) || defined(POSTBOX_JOB_ONLY)
     const uint64_t Pre = __atomic_load_n(&PreStartNtoskrnl, __ATOMIC_SEQ_CST);
     if (Pre)
     {
@@ -594,6 +601,7 @@ address GetNtoskrnl()
         return base;
     } while (Steps < MaxScanSteps && (base -= 0x1000));
 
+    (void) MzSeen;   // used by print(), which is compiled out in release
     print(ERROR("GetNtoskrnl: NOT FOUND after %llu steps, %llu valid DOS headers"), Steps, MzSeen);
     __atomic_store_n(Slot, Failed, __ATOMIC_SEQ_CST);
     return nullptr;
@@ -606,6 +614,7 @@ address GetNtoskrnl()
 template<size_t N>
 static address ExtractImm64(const Pattern<N> &Sig, uint32_t GuardOffset, const char *What)
 {
+    (void) What;   // diagnostic label; print() is compiled out in release
     address Base = GetNtoskrnl();
     if (!Base) return nullptr;
 
@@ -911,6 +920,7 @@ bool VerifyPteBase()
 // directly readable at DriverEntry's IRQL). Returns the number of failed checks
 static uint32_t VerifyOneAddress(address Va, cr3 SystemCR3, const char *What)
 {
+    (void) What;   // diagnostic label; print() is compiled out in release
     uint32_t Failures = 0;
 
     // VA -> PA, our walk against the kernel's

@@ -90,8 +90,14 @@ struct PostboxNmiStatus
     uint64_t NtBase;
     uint64_t NtSize;
     uint64_t PsLoadedModuleList;
+    uint64_t ApcNeutralized;
+    uint64_t ThreadStartSpoofed;
+    // T0+ probe evidence: live KDPC fields and the detached DPC entry.
+    uint64_t DpcDeferredRoutine;
+    uint64_t DpcDeferredContext;
+    uint64_t DpcEntry;
 };
-static_assert(sizeof(PostboxNmiStatus) == 0x88, "NMI status ABI changed");
+static_assert(sizeof(PostboxNmiStatus) == 0xB0, "NMI status ABI changed");
 #endif
 
 // Test-only call-site stack probe. The MmCopyVirtualMemory trampoline records
@@ -395,6 +401,196 @@ inline bool PostboxConfigValid(const PostboxConfig& cfg, uint32_t* error = nullp
     if (!cfg.MmAllocateIndependentPages || !cfg.MmSetPageProtection ||
         !cfg.MmFreeIndependentPages)
         return fail();
+
+    if (error) *error = 0;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// F1 Job-post ABI (test-only; POSTBOX_JOB builds).
+//
+// One map, one entry, N jobs, one teardown. The loader owns an unnamed
+// pagefile-backed section containing a PostboxJobBatch plus the job data. The
+// driver runs inline in the entry thread (the loader's dummy thread), copies
+// the batch to its stack, executes each job with MmCopyVirtualMemory, writes
+// the result records back, and returns. No timer, DPC, work item, thread, or
+// state page is created. TargetPid == 0 means the current (loader) process.
+// ---------------------------------------------------------------------------
+
+// Non-ASCII tags: the job config/batch must not add a plaintext "PBJ1"/"BJB1"
+// signature to the image or the section.
+constexpr uint32_t PostboxJobConfigMagic = 0x8F3A27C1;
+constexpr uint32_t PostboxJobConfigVersion = 1;
+constexpr uint32_t PostboxJobBatchMagic = 0x9B4D62E5;
+constexpr uint32_t PostboxJobBatchVersion = 1;
+constexpr uint64_t PostboxJobDoneMagic = 0xA7C3E91D5B28F064ull;
+constexpr uint32_t PostboxJobMax = 32;
+constexpr uint32_t PostboxJobMaxBytes = 0x10000;         // per job
+constexpr uint32_t PostboxJobSectionMax = 0x100000;      // 1 MiB
+
+// Controller-owned job section. The controller writes this header at offset 0,
+// the PostboxJobBatch at +0x100, and the data regions after +0x1000. The child
+// loader maps the inherited handle and builds the driver config from it.
+constexpr uint32_t PostboxJobSectionMagic = 0x8C4E71B3;
+constexpr uint32_t PostboxJobSectionVersion = 1;
+constexpr uint32_t PostboxJobSectionHeaderBytes = 0x100;
+constexpr uint32_t PostboxJobSectionBatchOffset = 0x100;
+
+struct PostboxJobSectionHeader
+{
+    uint32_t Magic;                 // PostboxJobSectionMagic
+    uint32_t Version;               // PostboxJobSectionVersion
+    uint32_t Count;                 // matches the batch
+    uint32_t Flags;                 // must be 0
+    uint64_t SectionSize;           // total mapped section bytes
+    uint64_t TargetPid;             // nonzero; controller or game process
+    uint64_t TargetCreateTime;      // nonzero
+    uint64_t Nonce;                 // matches the batch/config
+    uint8_t Key[32];                // SipHash-2-4 key in [0..15]
+    uint64_t Mac;                   // SipHash-2-4 over the batch
+    uint8_t Reserved[0x100 - 0x58];
+};
+static_assert(sizeof(PostboxJobSectionHeader) == 0x100,
+              "job section header ABI changed");
+
+enum PostboxJobOp : uint32_t
+{
+    pb_job_ping = 1,        // no data transfer; proves inline execution
+    pb_job_read = 2,        // target Address -> section DataOffset
+    pb_job_write = 3,       // section DataOffset -> target Address
+};
+
+struct PostboxJobRecord
+{
+    uint32_t Op;            // PostboxJobOp
+    uint32_t Status;        // out: NTSTATUS
+    uint32_t Size;          // in: bytes
+    uint32_t Done;          // out: bytes copied
+    uint64_t Address;       // target VA
+    uint64_t DataOffset;    // section offset for the data
+    uint64_t Reserved;
+};
+static_assert(sizeof(PostboxJobRecord) == 0x28, "job record ABI changed");
+
+struct PostboxJobBatch
+{
+    uint32_t Magic;                 // PostboxJobBatchMagic
+    uint32_t Version;               // PostboxJobBatchVersion
+    uint32_t Count;                 // 1..PostboxJobMax
+    uint32_t Flags;                 // must be 0
+    uint64_t TargetPid;             // 0 = current process
+    uint64_t TargetCreateTime;      // 0 = do not verify
+    uint64_t Nonce;                 // must match the config
+    uint64_t Reserved;
+    PostboxJobRecord Jobs[PostboxJobMax];
+};
+static_assert(sizeof(PostboxJobBatch) == 0x530, "job batch ABI changed");
+static_assert(offsetof(PostboxJobBatch, Jobs) == 0x30, "job batch Jobs offset changed");
+
+// Layout is deliberately at the same offset as PostboxConfig::Layout (0x58),
+// so the image-protection path can consume either config with one helper.
+struct PostboxJobConfig
+{
+    uint32_t Magic;                 // PostboxJobConfigMagic
+    uint32_t Version;               // PostboxJobConfigVersion
+    uint32_t Count;                 // must match the batch
+    uint32_t Reserved;
+    uint64_t SectionVa;             // loader VA of the job section
+    uint64_t SectionSize;           // bytes mapped at SectionVa
+    uint64_t TargetPid;             // 0 = current process
+    uint64_t TargetCreateTime;      // 0 = do not verify
+    uint64_t Nonce;                 // binds this config to the batch
+    uint8_t Key[32];                // SipHash-2-4 key in [0..15]; [16..31] zero
+    PostboxImageLayout Layout;      // loader-built image section map
+    uint64_t Mac;                   // SipHash-2-4(Key, input PostboxJobBatch)
+    // DV-17: the loader resolves these seven nt exports and passes their
+    // addresses. The job-only driver has no export-name table/resolver.
+    uint64_t Imports[7];            // PsGetCurrentProcess, PsLookupProcessByProcessId,
+                                    // ObDereferenceObject, MmCopyVirtualMemory,
+                                    // PsAcquire/ReleaseProcessExitSynchronization,
+                                    // PsGetProcessCreateTimeQuadPart
+};
+static_assert(sizeof(PostboxJobConfig) == 0x148, "job config ABI changed");
+static_assert(offsetof(PostboxJobConfig, Layout) == 0x58, "job config Layout offset changed");
+static_assert(offsetof(PostboxJobConfig, Mac) == 0x108, "job config tail offset changed");
+static_assert(offsetof(PostboxJobConfig, Imports) == 0x110, "job config imports offset changed");
+
+inline bool PostboxJobConfigValid(const PostboxJobConfig& cfg, uint32_t* error = nullptr)
+{
+    auto fail = [&]() { if (error) *error = 40; return false; };
+
+    if (cfg.Magic != PostboxJobConfigMagic || cfg.Version != PostboxJobConfigVersion)
+        return fail();
+    if (cfg.Reserved != 0) return fail();
+
+    bool keyNonZero = false;
+    for (uint32_t i = 0; i < 16; ++i)
+        keyNonZero |= (cfg.Key[i] != 0);
+    if (!keyNonZero) return fail();
+
+    if (!cfg.SectionVa || !cfg.SectionSize || (cfg.SectionVa & 7)) return fail();
+    if (cfg.SectionSize < sizeof(PostboxJobBatch) || cfg.SectionSize > PostboxJobSectionMax)
+        return fail();
+    if (cfg.SectionVa > PostboxUserLimit - cfg.SectionSize) return fail();
+    if (!cfg.Count || cfg.Count > PostboxJobMax) return fail();
+    if (cfg.TargetPid > 0xFFFFFFFFull) return fail();
+    // A cross-process batch must bind the PID to its create time, otherwise a
+    // recycled PID can redirect the batch to a different process. A same-process
+    // batch (TargetPid == 0) must leave the create time zero.
+    if (cfg.TargetPid && !cfg.TargetCreateTime) return fail();
+    if (!cfg.TargetPid && cfg.TargetCreateTime) return fail();
+    if (cfg.Layout.Magic != PostboxLayoutMagic ||
+        cfg.Layout.Version != PostboxLayoutVersion ||
+        !cfg.Layout.NtoskrnlBase || !cfg.Layout.ImageBase || !cfg.Layout.AllocSize)
+        return fail();
+
+    for (uint32_t i = 0; i < 7; ++i)
+        if (!cfg.Imports[i]) return fail();
+
+    if (error) *error = 0;
+    return true;
+}
+
+inline bool PostboxJobBatchValid(const PostboxJobBatch& batch,
+                                 const PostboxJobConfig& cfg,
+                                 uint32_t* error = nullptr)
+{
+    auto fail = [&]() { if (error) *error = 41; return false; };
+
+    if (batch.Magic != PostboxJobBatchMagic || batch.Version != PostboxJobBatchVersion)
+        return fail();
+    if (batch.Flags != 0 || batch.Reserved != 0 ||
+        batch.Count != cfg.Count || batch.Count == 0 ||
+        batch.Count > PostboxJobMax)
+        return fail();
+    if (batch.TargetPid != cfg.TargetPid ||
+        batch.TargetCreateTime != cfg.TargetCreateTime ||
+        batch.Nonce != cfg.Nonce)
+        return fail();
+
+    for (uint32_t i = 0; i < batch.Count; ++i)
+    {
+        const PostboxJobRecord& job = batch.Jobs[i];
+        if (job.Reserved != 0) return fail();
+        if (job.Op != pb_job_ping && job.Op != pb_job_read && job.Op != pb_job_write)
+            return fail();
+        if (job.Size > PostboxJobMaxBytes) return fail();
+
+        if (job.Op == pb_job_ping)
+        {
+            if (job.Size != 0 || job.Address != 0 || job.DataOffset != 0) return fail();
+            continue;
+        }
+
+        if (!job.Size || !job.Address || job.Address >= PostboxUserLimit) return fail();
+        if (job.Size > PostboxUserLimit - job.Address) return fail();
+        // Explicit two-sided check: SectionSize - DataOffset must not underflow
+        // when a job is larger than the section.
+        if (job.DataOffset < sizeof(PostboxJobBatch) ||
+            job.DataOffset > cfg.SectionSize ||
+            job.Size > cfg.SectionSize - job.DataOffset)
+            return fail();
+    }
 
     if (error) *error = 0;
     return true;

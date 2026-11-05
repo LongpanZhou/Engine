@@ -582,6 +582,12 @@ int PostboxClientMain(int argc, char** argv)
         return 1;
     }
 
+#ifdef POSTBOX_SELFTEST
+    // The functional self-test is a test-client build, not the product client.
+    // Compiling it out removes the fixed constants, invalid accesses, and test
+    // strings from a shipping binary.
+    if (Options.SelfTest)
+    {
     int x = 9999;
     int y = 1111;
     if (!Submit(Header, Data, S, pb_read, reinterpret_cast<uint64_t>(&y), sizeof(y), 3000))
@@ -691,6 +697,8 @@ int PostboxClientMain(int argc, char** argv)
         return 1;
     }
     SecureZeroMemory(Data, PostboxDataMax);
+    } // Options.SelfTest
+#endif // POSTBOX_SELFTEST
 
 #ifdef NMI_PROBE
     // Test-only constructed-IDT gate self-test: install the gate, deliver one
@@ -814,7 +822,7 @@ int PostboxClientMain(int argc, char** argv)
         }
         PostboxNmiStatus St{};
         std::memcpy(&St, Data, sizeof(St));
-        std::printf("nmi status: magic=0x%X active=%u ready=%u detector=%016llx+%llx writes=%llu last_core=%llu last_count=%llu last_user=%llu last_rip=%016llx last_rsp=%016llx refresh_active=%llu refresh_run=%llu refresh_count=%llu list=%016llx nt=%016llx+%llx pslist=%016llx\n",
+        std::printf("nmi status: magic=0x%X active=%u ready=%u detector=%016llx+%llx writes=%llu last_core=%llu last_count=%llu last_user=%llu last_rip=%016llx last_rsp=%016llx refresh_active=%llu refresh_run=%llu refresh_count=%llu list=%016llx nt=%016llx+%llx pslist=%016llx apc_neutralized=%llu thread_start_spoofed=%llu dpc_routine=%016llx dpc_context=%016llx dpc_entry=%016llx\n",
                     St.Magic, St.Active, St.Ready,
                     static_cast<unsigned long long>(St.DetectorBase),
                     static_cast<unsigned long long>(St.DetectorSize),
@@ -830,7 +838,12 @@ int PostboxClientMain(int argc, char** argv)
                     static_cast<unsigned long long>(St.ListHead),
                     static_cast<unsigned long long>(St.NtBase),
                     static_cast<unsigned long long>(St.NtSize),
-                    static_cast<unsigned long long>(St.PsLoadedModuleList));
+                    static_cast<unsigned long long>(St.PsLoadedModuleList),
+                    static_cast<unsigned long long>(St.ApcNeutralized),
+                    static_cast<unsigned long long>(St.ThreadStartSpoofed),
+                    static_cast<unsigned long long>(St.DpcDeferredRoutine),
+                    static_cast<unsigned long long>(St.DpcDeferredContext),
+                    static_cast<unsigned long long>(St.DpcEntry));
         std::fflush(stdout);
         SecureZeroMemory(Data, PostboxDataMax);
     }
@@ -883,6 +896,24 @@ int PostboxClientMain(int argc, char** argv)
     {
         if (!HoldSession(Header, Data, S, Options.HoldMs, Options.HoldPingMs))
             return 1;
+    }
+
+    if (Options.NmiStatus)
+    {
+        // Post-hold read: proves the APC stackwalk countermeasure ran while the
+        // mapped threads were alive, not just during the short NMI window.
+        if (Submit(Header, Data, S, pb_nmi_status, 0, 0, 5000))
+        {
+            PostboxNmiStatus St{};
+            std::memcpy(&St, Data, sizeof(St));
+            std::printf("apc status: neutralized=%llu active=%u writes=%llu thread_start_spoofed=%llu\n",
+                        static_cast<unsigned long long>(St.ApcNeutralized),
+                        St.Active,
+                        static_cast<unsigned long long>(St.Writes),
+                        static_cast<unsigned long long>(St.ThreadStartSpoofed));
+            std::fflush(stdout);
+            SecureZeroMemory(Data, PostboxDataMax);
+        }
     }
 
     if (!Submit(Header, Data, S, pb_stop, 0, 0, 3000))

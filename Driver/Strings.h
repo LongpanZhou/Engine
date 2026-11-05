@@ -77,3 +77,22 @@ constexpr auto PteBaseSignature = EncodeBytes(PatternToBytes("48 BA ? ? ? ? ? ? 
 // 'mov rax, imm64; mov rax, [rax+rdx*8]; shl rax, 19h' inside MmGetVirtualForPhysical. The imm64 is the PfnDatabase
 // PteAddress column (GetPfnPteAddressBase reads it at match + 2); the shl displacement sits at match + 17
 constexpr auto PfnPteAddressSignature = EncodeBytes(PatternToBytes("48 B8 ? ? ? ? ? ? ? ? 48 8B 04 D0 48 C1 E0 19"));
+
+// Fail the build if any runtime signature contains an invalid hex token. This is
+// the compile-time half of V-26; ScanModuleImage has the runtime guard for
+// patterns built from non-constant input.
+static_assert(
+    PatternIsValid(PiDDBCacheListSignature) &&
+    PatternIsValid(PiDDBCacheTableSignature) &&
+    PatternIsValid(PiDDBLockSignature) &&
+    PatternIsValid(MmUnloadedDriversSignature) &&
+    PatternIsValid(MmLastUnloadedDriverSignature) &&
+    PatternIsValid(KernelHashBucketListSignature21H1) &&
+    PatternIsValid(KernelHashBucketListSignature22H2) &&
+    PatternIsValid(WdFilterRuntimeDriversListSignature) &&
+    PatternIsValid(WdFilterRuntimeDriversCountSignature) &&
+    PatternIsValid(WdFilterFreeDriverInfoSignature) &&
+    PatternIsValid(WdFilterFreeDriverInfoSignatureAlt) &&
+    PatternIsValid(PteBaseSignature) &&
+    PatternIsValid(PfnPteAddressSignature),
+    "invalid hex token in a runtime signature");

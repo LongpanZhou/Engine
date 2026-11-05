@@ -175,6 +175,27 @@ _EPROCESS *EnumerateEProcess(const wchar_t *ProcessName, const uint64_t PID = -1
     return nullptr;
 }
 
+// DV-57: runtime layout check for the EPROCESS/PEB fields the driver reads.
+// The static asserts in structs.h pin the compile-time offsets; this check
+// proves the live System process matches the same layout before any walk.
+// The job-only build performs the equivalent check from its loader-provided
+// PsGetCurrentProcess import, so it does not need the System import here.
+#ifndef POSTBOX_JOB_ONLY
+bool VerifyProcessLayout()
+{
+    const _EPROCESS* System = (_EPROCESS*) *__imp_PsInitialSystemProcess;
+    if (!System) return false;
+    if (System->UniqueProcessId != (void*) 4) return false;
+    if (System->Peb != nullptr) return false;
+    if (!System->ActiveProcessLinks.Flink || !System->ActiveProcessLinks.Blink) return false;
+    if (System->ImageFileName[0] != 'S' || System->ImageFileName[1] != 'y' ||
+        System->ImageFileName[2] != 's' || System->ImageFileName[3] != 't' ||
+        System->ImageFileName[4] != 'e' || System->ImageFileName[5] != 'm')
+        return false;
+    return EnumerateEProcess(L"System", 4) == System;
+}
+#endif // POSTBOX_JOB_ONLY
+
 #ifdef DEBUG
 // Debug-only self-test (DriverEntry step 0.8): the EPROCESS/module walkers must
 // agree with the kernel's own anchors, and a missing process/module must fail

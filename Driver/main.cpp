@@ -19,10 +19,15 @@ using namespace intrin;
 #ifndef MANUAL_MAP_ONLY
 #include "Hide.cpp"    // driver hiding: Unlink/RelinkDriverIntoModuleList, Hide/UnhideDriverObject
 #endif
-#ifndef POSTBOX_CHANNEL
-#include "Channel.cpp" // the shared-memory command channel (includes ../Common/Command.h itself)
+#ifdef POSTBOX_JOB_ONLY
+#include "PostboxJobShared.cpp" // job-only shared helpers; no PBOX/channel/NMI code
+#else
+#include "Postbox.cpp" // persistent timer/work-item channel
 #endif
-#include "Postbox.cpp" // opt-in timer/work-item channel; compiles to nothing unless POSTBOX_CHANNEL
+#ifdef POSTBOX_JOB
+#include "../Common/PostboxCrypto.h"
+#include "PostboxJob.cpp" // F1 job-post: one map, one entry, N jobs, one teardown
+#endif
 #ifdef POSTBOX_NMI
 #include "PostboxNmi.cpp" // constructed-IDT NMI gate; only in POSTBOX_NMI builds
 #endif
@@ -47,13 +52,8 @@ win::ntstatus DriverExit(win::DRIVER_OBJECT* DriverObject)
 #else
     const bool ManualMapped = !DriverObject || !DriverObject->DriverSection;
 
-    // Stop the command channel before the image is released. The default build uses the
-    // shared-memory channel; the opt-in POSTBOX_CHANNEL build stops the timer/work item.
-#ifdef POSTBOX_CHANNEL
+    // Stop the persistent Postbox channel before the image is released.
     PostboxStop();
-#else
-    ChannelStop();
-#endif
 
     // Rest of the teardown, both variants: an unloaded build that leaves the loader entry detached
     // makes the next load bugcheck 0x1A in MiProcessLoaderEntry
@@ -120,13 +120,21 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
 
     // The POSTBOX_CHANNEL build is manual-map only: the second entry argument is a
     // PostboxConfig instead of a provider image name.
-#ifdef POSTBOX_CHANNEL
+#if defined(POSTBOX_CHANNEL) || defined(POSTBOX_JOB_ONLY)
     const bool PostboxMode = ManualMapped && RegistryPath != nullptr;
 #else
     const bool PostboxMode = false;
 #endif
 
-#ifdef POSTBOX_CHANNEL
+    // F1 Job-post: the loader passes a PostboxJobConfig instead of the
+    // persistent PostboxConfig. The magic is the only mode discriminator; both
+    // configs carry the image layout at offset 0x58.
+#ifdef POSTBOX_JOB
+    const bool JobMode = PostboxMode &&
+        *reinterpret_cast<const uint32_t*>(RegistryPath) == PostboxJobConfigMagic;
+#endif
+
+#if defined(POSTBOX_CHANNEL) || defined(POSTBOX_JOB_ONLY)
     // The image is published as one RWX pool block. Apply the loader-supplied
     // section map before any channel state is initialized: .text RX, writable
     // sections RW/NX, everything else R/NX. Failure is fail-closed; the loader
@@ -134,7 +142,25 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
     if (PostboxMode)
     {
         print(INFO("DriverEntry: step 0.1 ProtectImageSections()"));
-        if (!ProtectImageSections((const PostboxConfig*) RegistryPath))
+#ifdef POSTBOX_JOB
+#ifdef POSTBOX_JOB_ONLY
+        const bool Protected = JobMode &&
+            ProtectImageSectionsLayout(
+                &reinterpret_cast<const PostboxJobConfig*>(RegistryPath)->Layout,
+                false /* F1: loader pre-protected; no global IPI */,
+                true  /* F1: verify-only, do not rewrite PTEs */);
+#else
+        const bool Protected = JobMode
+            ? ProtectImageSectionsLayout(
+                  &reinterpret_cast<const PostboxJobConfig*>(RegistryPath)->Layout,
+                  false /* F1: loader pre-protected; no global IPI */,
+                  true  /* F1: verify-only, do not rewrite PTEs */)
+            : ProtectImageSections((const PostboxConfig*) RegistryPath);
+#endif
+#else
+        const bool Protected = ProtectImageSections((const PostboxConfig*) RegistryPath);
+#endif
+        if (!Protected)
         {
             print(ERROR("DriverEntry: ProtectImageSections failed, returning 0xC0000001"));
             return static_cast<win::ntstatus>(
@@ -188,6 +214,18 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
         print(ERROR("DriverEntry: VerifyProcessEnumeration() failed"));
 #endif
 
+    // DV-57: live EPROCESS/PEB layout check; fail closed if the target build
+    // does not match the pinned 19041 offsets. The job-only build performs the
+    // equivalent check inside PostboxRunJobs from its PsGetCurrentProcess import.
+#ifndef POSTBOX_JOB_ONLY
+    print(INFO("DriverEntry: step 0.8b VerifyProcessLayout()"));
+    if (!VerifyProcessLayout())
+    {
+        print(ERROR("DriverEntry: VerifyProcessLayout() failed"));
+        return static_cast<win::ntstatus>(0xC0000001);
+    }
+#endif
+
     // Debug-only self-test: the lazy export walk against the real ntoskrnl
     // export table and the loader's import slots.
 #ifdef DEBUG
@@ -196,24 +234,8 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
         print(ERROR("DriverEntry: VerifyFindFuncExports() failed"));
 #endif
 
-    // Step 1: start the command channel. The default build uses the shared-memory section;
-    // Step 1: the default shared-memory channel starts here. The POSTBOX_CHANNEL build
-    // starts its timer at the end of the entry, after the image and the loader state are
-    // fully set up.
-#ifndef POSTBOX_CHANNEL
-    print(INFO("DriverEntry: step 1 ChannelStart()"));
-    if (!ChannelStart())
-    {
-        print(ERROR("DriverEntry: ChannelStart() failed, returning 0xC0000001"));
-        return static_cast<win::ntstatus>(0xC0000001);
-    }
-    print(INFO("DriverEntry: step 1 ChannelStart() ok"));
-#ifdef DEBUG
-    print(INFO("DriverEntry: step 1.5 VerifyChannelHeader/Loopback()"));
-    if (!VerifyChannelHeader() || !VerifyChannelLoopback())
-        print(ERROR("DriverEntry: channel self-test failed"));
-#endif
-#endif
+    // The persistent Postbox channel starts at step 6, after the image and the
+    // loader state are fully set up. The legacy shared-memory channel is gone.
 
     // The dedicated mapping table (compile-time switch in Mem.cpp). If linking fails at runtime the
     // table stays unlinked and mappings search the page tables as usual
@@ -222,6 +244,7 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
         print(INFO("DriverEntry: step 2 LinkMapTable()"));
         bool Linked = LinkMapTable();
         print(INFO("DriverEntry: step 2 LinkMapTable() returned %u"), (uint32_t) Linked);
+        (void) Linked;   // used by print(), which is compiled out in release
     }
 
 #ifndef MANUAL_MAP_ONLY
@@ -286,6 +309,25 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
     // CR0.WP to rewrite an already-zero page, which is a deterministic CR0-write VM
     // exit and a redundant artifact.
     print(INFO("DriverEntry: step 5 ErasePeHeader() skipped (mapper publishes headerless)"));
+
+    // Step 6: F1 Job-post runs the batch inline and returns. No timer, DPC,
+    // work item, thread, or state page is created; the loader frees the image
+    // as soon as the entry returns.
+#ifdef POSTBOX_JOB
+    if (JobMode)
+    {
+        print(INFO("DriverEntry: step 6 PostboxRunJobs()"));
+        if (!PostboxRunJobs(reinterpret_cast<const PostboxJobConfig*>(RegistryPath)))
+        {
+            print(ERROR("DriverEntry: PostboxRunJobs() failed, returning 0xC0000001"));
+            return static_cast<win::ntstatus>(
+                0xC0000000u | (PostboxStartFailure ? PostboxStartFailure : 46u));
+        }
+        print(INFO("DriverEntry: step 6 PostboxRunJobs() ok"));
+        print(INFO("DriverEntry: success"));
+        return win::ntstatus::success;
+    }
+#endif
 
     // Step 6: arm the Postbox timer only after the image, the trace cleanup and the PEB
     // header work are done. This removes the window where a work item could run against a

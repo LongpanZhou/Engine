@@ -356,7 +356,7 @@ bool UnlinkDriverFromModuleList(win::DRIVER_OBJECT *DriverObject)
     }
 
     auto Entry = (_KLDR_DATA_TABLE_ENTRY *) DriverObject->DriverSection;
-    ::print(INFO("UnlinkDriver: entry %p, DllBase %p, name %wZ"), (void *) Entry, Entry->DllBase,
+    print(INFO("UnlinkDriver: entry %p, DllBase %p, name %wZ"), (void *) Entry, Entry->DllBase,
             &Entry->BaseDllName);
 
     // Sanity: the loader entry must describe the driver image itself

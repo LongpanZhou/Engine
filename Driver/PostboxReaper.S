@@ -1,19 +1,19 @@
 # Postbox self-free reaper entry.
 #
-# PsCreateSystemThread starts this stub as the thread entry. PspSystemThreadStartup
-# called it with the Windows x64 ABI, so the return address on the stack is in
-# ntoskrnl, not in the image. RCX is the StartContext: the PostboxState page.
+# The reaper runs on the worker's terminal path: PostboxWorkEpilogue clears
+# PostboxInFlight, sees PostboxTeardownPending, loads PostboxStatePtr into RCX,
+# and jumps here instead of returning to ExpWorkerThread. The return address on
+# the stack is still the ExpWorkerThread call site, so the final tail jump to
+# MmFreeIndependentPages returns to nt, not to the freed image.
 #
-# PostboxReaperPrepare (C, PASSIVE) waits for the work routine to return, then
-# fills a three-qword plan (RawBase, AllocSize, MmFreeIndependentPages) and frees
-# the state page. The stub then tail-jumps to MmFreeIndependentPages. The tail
-# jump is the point: no instruction is fetched from the image after the free.
-# MmFreeIndependentPages returns to PspSystemThreadStartup, which terminates the
-# thread.
+# PostboxReaperPrepare (C, PASSIVE) waits for any remaining worker references,
+# fills a three-qword plan (RawBase, AllocSize, MmFreeIndependentPages), and
+# frees the state page. The stub then tail-jumps to MmFreeIndependentPages.
 #
 # If PostboxReaperPrepare returns 0 (the worker is still in flight, or another
-# teardown owns the page), the stub returns without freeing the image. The image
-# and state page leak rather than being freed under a stalled worker.
+# teardown owns the page), the stub returns to ExpWorkerThread without freeing
+# the image. The image and state page leak rather than being freed under a
+# stalled worker.
 
 # Worker entry wrapper. ExpWorkerThread calls this with RCX = the work item
 # parameter. The C worker is entered through an nt `pop rsp; ret` gadget so the
@@ -24,6 +24,12 @@
     .text
     .globl PostboxWorkEntry
 PostboxWorkEntry:
+    # Keep kernel APCs disabled for the whole mapped work item. Detector APCs
+    # stay queued until PostboxApcsNeutralizeAndEnable patches and releases
+    # them in the epilogue.
+    subq $8, %rsp
+    call PostboxApcsDisable
+    addq $8, %rsp
 #ifdef STACK_SPOOF
     movq g_PostboxPopRspRetSkip(%rip), %rax
     testq %rax, %rax
@@ -60,13 +66,33 @@ PostboxWorkEpilogue:
     movq $0, g_PostboxShadowDepth(%rip)
     movq %r12, %rsp
     popq %r12
+    subq $8, %rsp
+    call PostboxApcsNeutralizeAndEnable
+    call PostboxDrainThreadApcs
+    addq $8, %rsp
     movl $0, PostboxInFlight(%rip)
+    cmpl $0, PostboxTeardownPending(%rip)
+    je 3f
+    movq PostboxStatePtr(%rip), %rcx
+    testq %rcx, %rcx
+    jz 3f
+    jmp PostboxReaperEntry
+3:
     ret
 #else
     subq $0x28, %rsp
     call PostboxWorkRoutine
+    call PostboxApcsNeutralizeAndEnable
+    call PostboxDrainThreadApcs
     movl $0, PostboxInFlight(%rip)
     addq $0x28, %rsp
+    cmpl $0, PostboxTeardownPending(%rip)
+    je 3f
+    movq PostboxStatePtr(%rip), %rcx
+    testq %rcx, %rcx
+    jz 3f
+    jmp PostboxReaperEntry
+3:
     ret
 #endif
 
@@ -75,7 +101,7 @@ PostboxWorkEpilogue:
 PostboxReaperEntry:
     pushq %rbx
     subq $0x40, %rsp
-    movq %rcx, %rbx                 # StartContext = PostboxState*
+    movq %rcx, %rbx                 # State from PostboxStatePtr (inline path)
     leaq 0x20(%rsp), %rdx           # PostboxReaperPlan on this thread's stack
     movq %rbx, %rcx
     call PostboxReaperPrepare

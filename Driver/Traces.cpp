@@ -446,7 +446,7 @@ static bool DeletePiDDBEntry(void* Table, _PiDDB_CACHE_ENTRY* Entry, const _UNIC
     if (!PiDDBDeleteFn(Table, &Key))
     {
         RelinkPiDDBEntry(Entry, Flink, Blink);
-        ::print(WARN("PiDDB: AVL delete did not find entry %p (%wZ, timestamp %08x)"),
+        print(WARN("PiDDB: AVL delete did not find entry %p (%wZ, timestamp %08x)"),
               (void *) Entry, &Entry->DriverName, Entry->TimeDateStamp);
         return false;
     }
@@ -470,7 +470,7 @@ bool ClearPiDDBCache(const _UNICODE_STRING* Target, uint32_t Timestamp)
         return false;
     }
 
-    ::print(INFO("PiDDB: target %wZ, timestamp %08x"), Target, Timestamp);
+    print(INFO("PiDDB: target %wZ, timestamp %08x"), Target, Timestamp);
 
     address Nt = GetNtoskrnl();
     if (!Nt) return false;
@@ -525,7 +525,7 @@ bool ClearPiDDBCache(const _UNICODE_STRING* Target, uint32_t Timestamp)
         if (PiDDBEntryIsTarget(Entry, Target, Timestamp))
         {
             Targets++;
-            ::print(INFO("PiDDB: deleting entry %p (%wZ, timestamp %08x)"),
+            print(INFO("PiDDB: deleting entry %p (%wZ, timestamp %08x)"),
                     (void *) Entry, &Entry->DriverName, Entry->TimeDateStamp);
 
             if (DeletePiDDBEntry(Table, Entry, Target))
@@ -612,7 +612,7 @@ static bool VerifyPiDDBTree(void* Table, const _UNICODE_STRING* Name, uint32_t T
         if (PiDDBEntryIsTarget(Entry, Name, Timestamp))
         {
             if (!Found)
-                ::print(ERROR("VerifyPiDDB: tree entry %p still matches this driver (%wZ, timestamp %08x)"),
+                print(ERROR("VerifyPiDDB: tree entry %p still matches this driver (%wZ, timestamp %08x)"),
                       (void *) Entry, &Entry->DriverName, Entry->TimeDateStamp);
             Found = true;
         }
@@ -702,7 +702,7 @@ void VerifyPiDDBCache(const _UNICODE_STRING* Target, uint32_t Timestamp)
 
     if (Leaked)
     {
-        ::print(ERROR("VerifyPiDDB: FAILED, list entry %p still matches this driver (%wZ, timestamp %08x)"),
+        print(ERROR("VerifyPiDDB: FAILED, list entry %p still matches this driver (%wZ, timestamp %08x)"),
               (void *) Leaked, &Leaked->DriverName, Leaked->TimeDateStamp);
         return;
     }
@@ -1717,7 +1717,7 @@ bool ClearWdFilterDriverList(const _UNICODE_STRING* Target, uint32_t Timestamp)
         Walked++;
         if (Named && HashBucketNameMatches(Name.Buffer, Name.Length / 2, Base, BaseChars))
         {
-            ::print(INFO("WdFilter: removing %wZ"), &Name);
+            print(INFO("WdFilter: removing %wZ"), &Name);
 
             if (!UnlinkWdFilterEntry(Link))
             {
@@ -1930,7 +1930,7 @@ bool CleanExtraTraces(const _UNICODE_STRING* Target)
         return false;
     }
 
-    ::print(INFO("CleanTraces: extra target %wZ, no timestamp match"), Target);
+    print(INFO("CleanTraces: extra target %wZ, no timestamp match"), Target);
 
     bool PiDDB = ClearPiDDBCache(Target, 0);
     bool MmU = ClearMmUnloadedDrivers(Target, 0);

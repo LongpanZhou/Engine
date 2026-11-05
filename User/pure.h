@@ -15,6 +15,11 @@ struct ClientOptions
     uint32_t HoldPingMs;
     const char* LoaderPath;
     const char* LoaderArgs;
+#ifdef POSTBOX_SELFTEST
+    // The read/write/invalid/bulk sequence is a test harness, not a product
+    // default. It is compiled only into the explicit test client.
+    bool SelfTest;
+#endif
 #ifdef NMI_PROBE
     bool NmiProbe;
     uint32_t NmiSpinMs;
@@ -58,6 +63,12 @@ inline bool ParseArguments(int argc, char** argv, ClientOptions& Options)
         {
             Options.Kill = true;
         }
+#ifdef POSTBOX_SELFTEST
+        else if (std::strcmp(Arg, "--selftest") == 0)
+        {
+            Options.SelfTest = true;
+        }
+#endif
         else if (std::strcmp(Arg, "--hold") == 0)
         {
             if (i + 1 >= argc || !ParseMilliseconds(argv[i + 1], Options.HoldMs))

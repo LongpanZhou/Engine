@@ -54,23 +54,33 @@ template<size_t N>
 struct Pattern
 {
     std::array<char, N> Bytes;
+    // Explicit wildcard mask: 1 = '?', 0 = literal byte. Keeping this separate
+    // from Bytes means a literal 0x3F can never be mistaken for a wildcard.
+    std::array<uint8_t, N> Wildcards;
     size_t Length;
+    bool Valid;
 
     const char *data() const { return Bytes.data(); }
 };
 
-// Encode/decode a whole pattern, preserving the length that PatternToBytes computed. The byte array
-// is XORed exactly like a string; only the length is carried separately.
+// Compile-time check used by Strings.h: a pattern with an invalid hex token must
+// fail the build instead of silently becoming a 0xFF byte at scan time.
+template<size_t N>
+constexpr bool PatternIsValid(const Pattern<N> &P) { return P.Valid; }
+
+// Encode/decode a whole pattern, preserving the length and validity that
+// PatternToBytes computed. The byte array is XORed exactly like a string; only
+// the length/validity are carried separately.
 template<size_t N>
 constexpr Pattern<N> EncodeBytes(const Pattern<N> &In)
 {
-    return {XorSeed(In.Bytes), In.Length};
+    return {XorSeed(In.Bytes), In.Wildcards, In.Length, In.Valid};
 }
 
 template<size_t N>
 constexpr Pattern<N> Decode(const Pattern<N> &In)
 {
-    return {XorSeed(In.Bytes), In.Length};
+    return {XorSeed(In.Bytes), In.Wildcards, In.Length, In.Valid};
 }
 
 // Hex to bytes
@@ -87,27 +97,50 @@ template<size_t N>
 constexpr Pattern<N> PatternToBytes(const char (&Signature)[N])
 {
     std::array<char, N> Bytes{};
+    std::array<uint8_t, N> Wildcards{};
     size_t i = 0;
     size_t len = 0;
+    bool valid = true;
 
     while (i < N - 1)
     {
         if (Signature[i] == ' ') { ++i; continue; }
-        if (Signature[i] == '?') { Bytes[len++] = '?'; i += 2; continue; }
-        Bytes[len++] = static_cast<char>(HexToByte(Signature[i]) << 4 | HexToByte(Signature[i + 1]));
+        if (Signature[i] == '?')
+        {
+            Bytes[len] = '?';
+            Wildcards[len] = 1;
+            ++len;
+            i += 2;
+            continue;
+        }
+
+        // A hex token must have two valid digits. 0xFF is the invalid sentinel;
+        // accepting it silently would turn a typo into a real 0xFF byte.
+        const uint8_t hi = HexToByte(Signature[i]);
+        const uint8_t lo = HexToByte(Signature[i + 1]);
+        if (hi == 0xFF || lo == 0xFF) valid = false;
+
+        Bytes[len] = static_cast<char>(hi << 4 | lo);
+        Wildcards[len] = 0;
+        ++len;
         i += 2;
     }
 
     Bytes[len] = '\0';
-    return {Bytes, len};
+    return {Bytes, Wildcards, len, valid};
 }
 
-// True if the signature matches at Current ('?' matches any byte)
-static bool Matches(const char *Current, const char *Signature, size_t size)
+// True if the signature matches at Current. Wildcards are explicit mask bits;
+// a literal 0x3F byte is compared normally.
+static bool Matches(const char *Current, const char *Signature,
+                    const uint8_t *Wildcards, size_t size)
 {
     for (size_t i = 0; i < size; ++i)
-        if (Signature[i] != '?' && Signature[i] != Current[i])
-            return false;
+    {
+        if ((Wildcards && Wildcards[i]) || (!Wildcards && Signature[i] == '?'))
+            continue;
+        if (Signature[i] != Current[i]) return false;
+    }
     return true;
 }
 
@@ -115,9 +148,10 @@ static bool Matches(const char *Current, const char *Signature, size_t size)
 // the exact range that was searched
 constexpr bool VerboseScan = false;
 
-// Signature scan over a range. This is intentionally quiet: ScanModuleImage tries .PAGE and then
-// .text and logs one result after all section attempts are done
-address SignatureScan(const void *StartAddress, const void *EndAddress, const char *Signature, size_t Size)
+// Signature scan over a range. This is intentionally quiet: ScanModuleImage tries .text and then
+// .PAGE and logs one result after all section attempts are done
+address SignatureScan(const void *StartAddress, const void *EndAddress, const char *Signature,
+                      size_t Size, const uint8_t *Wildcards = nullptr)
 {
     if constexpr (VerboseScan)
     {
@@ -140,13 +174,15 @@ address SignatureScan(const void *StartAddress, const void *EndAddress, const ch
     // unchanged. An all-wildcard signature (First == size) keeps matching at the first position,
     // exactly as before
     size_t First = 0;
-    while (First < size && Signature[First] == '?') ++First;
+    while (First < size &&
+           ((Wildcards && Wildcards[First]) || (!Wildcards && Signature[First] == '?')))
+        ++First;
 
     for (const char *Current = (char *) StartAddress; Current <= (char *) ((size_t) EndAddress - size); ++Current)
     {
         // In range by construction: First < size, and the loop bound holds Current + size <= EndAddress
         if (First < size && Current[First] != Signature[First]) continue;
-        if (Matches(Current, Signature, size))
+        if (Matches(Current, Signature, Wildcards, size))
             return Current;
     }
 
@@ -154,8 +190,10 @@ address SignatureScan(const void *StartAddress, const void *EndAddress, const ch
 }
 
 // Pattern scan over one image section
-address SectionScan(address BaseAddress, const char *SectionName, const char *Signature, size_t Size)
+address SectionScan(address BaseAddress, const char *SectionName, const char *Signature,
+                    size_t Size, const uint8_t *Wildcards = nullptr)
 {
+    (void) Wildcards;   // signature wildcard table is applied by the caller
     // Get section
     auto dosHeader = (_IMAGE_DOS_HEADER *) BaseAddress;
     auto ntHeader = (_IMAGE_NT_HEADERS64 *) (BaseAddress + dosHeader->e_lfanew);
