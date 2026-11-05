@@ -1,4 +1,4 @@
-// Postbox command channel: a timer DPC queues a work item; the work item polls a mailbox
+﻿// Postbox command channel: a timer DPC queues a work item; the work item polls a mailbox
 // in the client's own private memory. No section, no handle, no named object, no dedicated
 // thread. Included by main.cpp only when POSTBOX_CHANNEL is defined. The legacy
 // shared-memory channel (Channel.cpp) was removed; the job-only build excludes this file
@@ -48,6 +48,18 @@ struct PostboxWork
 };
 static_assert(sizeof(PostboxWork) == 0x20, "WORK_QUEUE_ITEM layout changed");
 
+// T0+: detached work-item context. The WORK_QUEUE_ITEM lives in a normal
+// nonpaged pool block, not the state page. WorkerRoutine is an nt `jmp [rcx]`
+// thunk; [Context] is the mapped entry. The entry is populated only while the
+// item is queued and cleared again after the worker dequeues it.
+struct PostboxWorkContext
+{
+    uint64_t Entry;                     // 0x00: nt thunk target
+    uint64_t State;                     // 0x08: resident state page (data)
+    PostboxWork Work;                   // 0x10: actual WORK_QUEUE_ITEM
+};
+static_assert(sizeof(PostboxWorkContext) == 0x30, "work context layout changed");
+
 using FnKeInitializeTimerEx = void (*)(PostboxTimer*, int32_t);
 using FnKeInitializeDpc = void (*)(PostboxDpc*, void (*)(void*, void*, void*, void*), void*);
 using FnKeSetCoalescableTimer = uint32_t (*)(PostboxTimer*, _LARGE_INTEGER, uint32_t, uint32_t, PostboxDpc*);
@@ -86,6 +98,7 @@ using FnMmCopyVirtualMemory = int32_t (*)(void* SourceProcess, void* SourceAddre
                                           void* TargetProcess, void* TargetAddress,
                                           size_t Size, int32_t PreviousMode, size_t* Done);
 using FnKeIpiGenericCall = uint64_t (*)(uint64_t (*)(uint64_t), uint64_t);
+using FnKeQueryInterruptTime = uint64_t (*)(uint64_t* PerformanceCounter);
 using FnPsLookupThreadByThreadId = int32_t (*)(void* ThreadId, void** Thread);
 using FnPsCreateSystemThread = int32_t (*)(void** ThreadHandle, uint32_t DesiredAccess,
                                            void* ObjectAttributes, void* ProcessHandle,
@@ -118,9 +131,13 @@ static address g_MmSetPageProtection_Raw = 0;
 static address g_MmFreeIndependentPages_Raw = 0;
 static address g_KeEnterCriticalRegion_Raw = 0;
 static address g_KeLeaveCriticalRegion_Raw = 0;
+static address g_KeQueryInterruptTime_Raw = 0;
 
 static address g_MmCopyMemory = 0;
 static address g_MmCopyVirtualMemory_Raw = 0;
+// Preserved thread-start spoof and thread-creation helpers. The zero-thread
+// path does not call them, but the code remains available for the fallback
+// thread design and for experiments.
 static address g_PsCreateSystemThread_Raw = 0;
 static address g_ZwClose_Raw = 0;
 static address g_PsLookupThreadByThreadId_Raw = 0;
@@ -129,6 +146,9 @@ static volatile long PostboxRunning = 0;
 // Cleared by the assembly worker wrapper after PostboxWorkRoutine returns, so
 // the reaper cannot free the image while the C worker is still in its epilogue.
 extern "C" volatile long PostboxInFlight = 0;
+// Set by PostboxStartReaper when the worker's terminal path must free the state
+// page/image. The assembly epilogue consumes it after the worker routine returns.
+extern "C" volatile long PostboxTeardownPending = 0;
 static volatile long PostboxTeardown = 0;
 static volatile long PostboxReaperStarted = 0;
 
@@ -181,20 +201,22 @@ struct PostboxImports
     address MmAllocateIndependentPages;
     address MmSetPageProtection;
     address MmFreeIndependentPages;
-    // APC-stackwalk thread loop: keep kernel APCs out of the mapped step and
-    // enable them only for the clean wait.
+    // Kernel APCs stay disabled for the mapped worker step; the worker also
+    // uses KeQueryInterruptTimePrecise for the 1 s NMI refresh deadline.
     address KeEnterCriticalRegion;
     address KeLeaveCriticalRegion;
     address PsLookupThreadByThreadId;
+    address KeQueryInterruptTime;
 };
 
+// Preserved for the fallback thread design.
 struct PostboxClientId
 {
     void* UniqueProcess;
     void* UniqueThread;
 };
 
-static void PostboxSpoofThreadStart(void* ThreadId);
+[[maybe_unused]] static void PostboxSpoofThreadStart(void* ThreadId);
 
 // NMI-gate imports. Kept in the state page so the NMI build's .data does not
 // carry eight ntoskrnl routine pointers. PostboxNmiInstall runs after the state
@@ -270,19 +292,15 @@ struct PostboxNmiSanitizeState
 #ifdef NMI_FRAME_FIRST
     uint64_t ExtraHandles[16];
     uint32_t ExtraCount;
-    uint32_t MonitorActive;
 #endif
     uint32_t Active;
     uint32_t DetectorKind;   // 1 = nmi-callback-handler, 2 = unKover
     // N-10: the sanitizer can be ready but inactive when the detector is not
-    // loaded yet. The PASSIVE work routine retries activation and refreshes the
-    // detector range; RefreshTick paces the module-list walk.
+    // loaded yet. PostboxWorkRoutine retries activation and refreshes the
+    // detector range on a 1 s deadline. No dedicated thread exists.
     uint32_t Ready;
-    uint32_t RefreshTick;
-    // N-10: a dedicated PASSIVE refresh thread so a long-running mailbox command
-    // (for example the mapped spin) cannot delay detector activation.
-    uint32_t RefreshRun;
-    uint32_t RefreshThreadActive;
+    uint32_t Reserved;
+    uint64_t RefreshDeadline;
 #ifdef NMI_PROBE
     // Test-only evidence block for the pb_nmi_status command. Not in the
     // shipped layout (NMI_PROBE is off in the product).
@@ -300,8 +318,8 @@ struct PostboxNmiSanitizeState
 #endif
 
 #ifdef STACK_SPOOF
-// APC-stackwalk thread loop context. Kept in the state page, not .data, so the
-// step/wait routine pointers do not become a static image scan target.
+// Preserved APC-stackwalk thread-loop context. The zero-thread design does not
+// start a loop, but the spoof fallback and experiments still use this layout.
 struct PostboxThreadLoopContext
 {
     uint64_t State;
@@ -335,7 +353,8 @@ struct PostboxState
     pb::PostboxKeys Keys;
     PostboxTimer Timer;
     PostboxDpc Dpc;
-    PostboxWork Work;
+    PostboxWorkContext* WorkCtx;
+    uint64_t WorkJump;
     void* Process;
     uint8_t* Stage;
     uint64_t SessionId;
@@ -368,8 +387,8 @@ struct PostboxState
     PostboxNmiImports NmiImports;
 #endif
 #ifdef STACK_SPOOF
-    // APC-stackwalk step loops. The monitor/refresh threads run their mapped
-    // work only inside the step, then wait through the clean-wait stub.
+    // Preserved for the fallback thread design; the zero-thread path does not
+    // consume these contexts.
     PostboxThreadLoopContext MonitorLoop;
     PostboxThreadLoopContext RefreshLoop;
 #endif
@@ -378,7 +397,9 @@ static_assert(sizeof(PostboxState) <= 0x800, "PostboxState overlaps the fake NMI
 #ifdef E3_DPC_PROBE
 static_assert(offsetof(PostboxState, E3) == 0x308, "E3 result offset changed");
 #endif
-static PostboxState* PostboxStatePtr = nullptr;
+// External linkage: PostboxReaper.S loads this directly on the worker's
+// terminal path.
+extern "C" PostboxState* PostboxStatePtr = nullptr;
 static uint32_t PostboxPollRefs = 0;
 static bool PostboxPollTeardown = false;
 
@@ -414,10 +435,11 @@ PostboxMemCaches* PostboxGetMemCaches()
 #define g_KeEnterCriticalRegion (PostboxStatePtr->Imports.KeEnterCriticalRegion)
 #define g_KeLeaveCriticalRegion (PostboxStatePtr->Imports.KeLeaveCriticalRegion)
 #define g_PsLookupThreadByThreadId (PostboxStatePtr->Imports.PsLookupThreadByThreadId)
+#define g_KeQueryInterruptTime (PostboxStatePtr->Imports.KeQueryInterruptTime)
 
 #ifdef STACK_SPOOF
 // Defined with the stack-spoof assembly and globals below; forward-declared for
-// the APC-stackwalk thread loop setup.
+// the worker's stack-spoof setup and the preserved thread-loop fallback.
 extern "C" uint64_t g_PostboxPopRspRet;
 extern "C" uint64_t g_PostboxPopRspRetSkip;
 extern "C" void PostboxThreadLoop();
@@ -1453,6 +1475,27 @@ static uint64_t PostboxNmiFindDpcJumpGadget(address Nt, uint64_t NtSize)
     }
     return 0;
 }
+
+// First `jmp qword ptr [rcx]` (FF 21) or `jmp qword ptr [rcx+0]` (FF 61 00)
+// in an executable nt section. ExpWorkerThread calls WorkerRoutine(Parameter)
+// with RCX = Parameter, so the work item can name an nt thunk and keep the
+// mapped entry in the detached context.
+static uint64_t PostboxNmiFindWorkJumpGadget(address Nt, uint64_t NtSize)
+{
+    PostboxNmiSection Sections[16] = {};
+    const uint32_t Count = PostboxNmiExecSections(Nt, NtSize, Sections, 16);
+    for (uint32_t i = 0; i < Count; ++i)
+    {
+        const uint8_t* P = (const uint8_t*) (uintptr_t) Sections[i].Va;
+        for (uint64_t j = 0; j + 2 < Sections[i].Size; ++j)
+            if (P[j] == 0xFF && P[j + 1] == 0x21)
+                return Sections[i].Va + j;
+        for (uint64_t j = 0; j + 2 < Sections[i].Size; ++j)
+            if (P[j] == 0xFF && P[j + 1] == 0x61 && P[j + 2] == 0x00)
+                return Sections[i].Va + j;
+    }
+    return 0;
+}
 #endif
 
 // Redirect a mapped interrupted RIP to an nt ret gadget. The original RIP is
@@ -1664,18 +1707,12 @@ static void PostboxNmiRefreshDetector(PostboxState* S)
 // sanitizer entry whenever the list head is not ours, making the frame
 // trampoline run before the detector's callback. It never deregisters under a
 // live callback; the handles are released at stop.
-// One monitor iteration. The APC-stackwalk loop runs this with kernel APCs
-// disabled, then waits outside the mapped frames. The legacy C thread keeps
-// the old wrapper for fallback builds where the clean-wait gadget is missing.
-static int PostboxNmiMonitorStep(PostboxState* S)
+// One monitor pass. PostboxWorkRoutine runs this on the existing worker with
+// kernel APCs disabled; there is no dedicated monitor thread.
+static void PostboxNmiMonitorStep(PostboxState* S)
 {
-    if (!S) return 0;
-    if (!__atomic_load_n(&S->NmiSanitize.Active, __ATOMIC_ACQUIRE))
-    {
-        __atomic_store_n(&S->NmiSanitize.MonitorActive, 0, __ATOMIC_RELEASE);
-        return 0;
-    }
-    __atomic_store_n(&S->NmiSanitize.MonitorActive, 1, __ATOMIC_RELEASE);
+    if (!S || !__atomic_load_n(&S->NmiSanitize.Active, __ATOMIC_ACQUIRE))
+        return;
 
     const uint64_t Head = *(uint64_t*) (uintptr_t) S->NmiSanitize.ListHead;
     if (Head)
@@ -1694,33 +1731,16 @@ static int PostboxNmiMonitorStep(PostboxState* S)
             }
         }
     }
-    return 1;
-}
-
-static void PostboxNmiMonitorThread(void* Context)
-{
-    auto* S = (PostboxState*) Context;
-    if (!S) return;
-    PostboxApcsDisable();
-    while (PostboxNmiMonitorStep(S))
-    {
-        PostboxNeutralizeDetectorApcs();
-        _LARGE_INTEGER Delay{};
-        Delay.QuadPart = -10000;      // 1 ms
-        PostboxDelayExecutionThread(0, 0, &Delay);
-    }
-    PostboxNeutralizeDetectorApcs();
-    PostboxApcsNeutralizeAndEnable();
 }
 
 #endif
 
 #ifdef STACK_SPOOF
-// Arm an APC-stackwalk step loop. The context lives in the state page; the
-// clean-wait assembly needs the resolved pop-rsp gadget and both critical
-// region routines.
-static bool PostboxInitThreadLoop(PostboxThreadLoopContext* C, PostboxState* S,
-                                  uint64_t Step, int64_t Interval)
+// Preserved APC-stackwalk thread-loop setup. The zero-thread path does not
+// create a loop, but the fallback thread design still uses this helper.
+[[maybe_unused]] static bool PostboxInitThreadLoop(PostboxThreadLoopContext* C,
+                                                   PostboxState* S, uint64_t Step,
+                                                   int64_t Interval)
 {
     if (!C || !S || !Step || !g_PostboxPopRspRet || !g_PostboxPopRspRetSkip)
         return false;
@@ -1766,108 +1786,14 @@ static bool PostboxNmiTryActivate(PostboxState* S)
         if (PostboxNmiOrderOk(S, (uint64_t) (uintptr_t) &PostboxNmiSanitizeEntry))
         {
             N.Active = 1;
-#ifdef NMI_FRAME_FIRST
-            void* ThreadHandle = nullptr;
-            void* Start = (void*) &PostboxNmiMonitorThread;
-            void* StartContext = S;
-#ifdef STACK_SPOOF
-            if (PostboxInitThreadLoop(&S->MonitorLoop, S,
-                                      (uint64_t) (uintptr_t) &PostboxNmiMonitorStep,
-                                      -10000 /* 1 ms */))
-            {
-                Start = (void*) &PostboxThreadLoop;
-                StartContext = &S->MonitorLoop;
-            }
-#endif
-            PostboxClientId Cid{};
-            if (((FnPsCreateSystemThread) g_PsCreateSystemThread)(
-                    &ThreadHandle, 0x1FFFFF, nullptr, nullptr, &Cid,
-                    Start, StartContext) >= 0 && ThreadHandle)
-            {
-                PostboxSpoofThreadStart(Cid.UniqueThread);
-                ((FnZwClose) g_ZwClose)(ThreadHandle);
-            }
-#endif
+            // Re-registration at the list head is done by PostboxNmiMonitorStep
+            // from PostboxWorkRoutine on the existing worker thread.
             return true;
         }
 
         ((FnNmiDeregister) N.Deregister)(Handle);
         N.Handle = 0;
     }
-    return false;
-}
-
-// N-10: dedicated PASSIVE detector-refresh thread. The mailbox worker can be
-// blocked for the whole duration of a long command (the mapped spin), so the
-// work-routine refresh is only a fallback. This thread runs independently and
-// never touches the callback list from an NMI.
-// One refresh iteration, run with kernel APCs disabled by the APC-stackwalk
-// loop. The 1 s wait lives outside this function.
-static int PostboxNmiRefreshStep(PostboxState* S)
-{
-    if (!S) return 0;
-    if (!__atomic_load_n(&S->NmiSanitize.RefreshRun, __ATOMIC_ACQUIRE))
-    {
-        __atomic_store_n(&S->NmiSanitize.RefreshThreadActive, 0, __ATOMIC_RELEASE);
-        return 0;
-    }
-    __atomic_store_n(&S->NmiSanitize.RefreshThreadActive, 1, __ATOMIC_RELEASE);
-#ifdef NMI_PROBE
-    S->NmiSanitize.RefreshCount++;
-#endif
-    PostboxNmiRefreshDetector(S);
-    if (!S->NmiSanitize.Active)
-        PostboxNmiTryActivate(S);
-    return 1;
-}
-
-static void PostboxNmiRefreshThread(void* Context)
-{
-    auto* S = (PostboxState*) Context;
-    if (!S) return;
-    PostboxApcsDisable();
-    while (PostboxNmiRefreshStep(S))
-    {
-        PostboxNeutralizeDetectorApcs();
-        _LARGE_INTEGER Delay{};
-        Delay.QuadPart = -100 * 10000;      // 1 s
-        PostboxDelayExecutionThread(0, 0, &Delay);
-    }
-    PostboxNeutralizeDetectorApcs();
-    PostboxApcsNeutralizeAndEnable();
-    __atomic_store_n(&S->NmiSanitize.RefreshThreadActive, 0, __ATOMIC_RELEASE);
-}
-
-// Start the refresh thread after the timer is armed, so the start-failure path
-// never leaves a thread behind a freed state page. If creation fails, the
-// work-routine refresh remains as a fallback.
-static bool PostboxNmiStartRefreshThread(PostboxState* S)
-{
-    if (!S || !S->NmiSanitize.Ready) return false;
-    if (!g_PsCreateSystemThread || !g_ZwClose) return false;
-    __atomic_store_n(&S->NmiSanitize.RefreshRun, 1, __ATOMIC_RELEASE);
-    void* ThreadHandle = nullptr;
-    void* Start = (void*) &PostboxNmiRefreshThread;
-    void* StartContext = S;
-#ifdef STACK_SPOOF
-    if (PostboxInitThreadLoop(&S->RefreshLoop, S,
-                              (uint64_t) (uintptr_t) &PostboxNmiRefreshStep,
-                              -10000000 /* 1 s */))
-    {
-        Start = (void*) &PostboxThreadLoop;
-        StartContext = &S->RefreshLoop;
-    }
-#endif
-    PostboxClientId Cid{};
-    if (((FnPsCreateSystemThread) g_PsCreateSystemThread)(
-            &ThreadHandle, 0x1FFFFF, nullptr, nullptr, &Cid,
-            Start, StartContext) >= 0 && ThreadHandle)
-    {
-        PostboxSpoofThreadStart(Cid.UniqueThread);
-        ((FnZwClose) g_ZwClose)(ThreadHandle);
-        return true;
-    }
-    __atomic_store_n(&S->NmiSanitize.RefreshRun, 0, __ATOMIC_RELEASE);
     return false;
 }
 
@@ -1932,31 +1858,15 @@ static void PostboxNmiSanitizeStop(PostboxState* S)
 {
     if (!S || !S->NmiSanitize.Ready) return;
 
-    // Stop the PASSIVE refresh thread first; it may be inside a detector wait.
-    __atomic_store_n(&S->NmiSanitize.RefreshRun, 0, __ATOMIC_RELEASE);
-    _LARGE_INTEGER ThreadDelay{};
-    ThreadDelay.QuadPart = -10 * 10000;      // 10 ms
-    for (uint32_t i = 0; i < 500; ++i)
-    {
-        if (!__atomic_load_n(&S->NmiSanitize.RefreshThreadActive, __ATOMIC_ACQUIRE))
-            break;
-        PostboxDelayExecutionThread(0, 0, &ThreadDelay);
-    }
-
-#ifdef NMI_FRAME_FIRST
+    // The monitor/refresh now run on the mailbox worker, which is the caller of
+    // this routine. Clear Active first so no further monitor step registers a
+    // callback after the handles below are released.
     S->NmiSanitize.Active = 0;
     _LARGE_INTEGER MonitorDelay{};
     MonitorDelay.QuadPart = -20 * 10000;
     PostboxDelayExecutionThread(0, 0, &MonitorDelay);
-    // Let the monitor step leave the mapped image before the state page (which
-    // holds its loop context) can be freed by the reaper.
-    for (uint32_t i = 0; i < 500 &&
-                       __atomic_load_n(&S->NmiSanitize.MonitorActive, __ATOMIC_ACQUIRE); ++i)
-    {
-        _LARGE_INTEGER D{};
-        D.QuadPart = -10000;
-        PostboxDelayExecutionThread(0, 0, &D);
-    }
+
+#ifdef NMI_FRAME_FIRST
     for (uint32_t i = 0; i < S->NmiSanitize.ExtraCount; ++i)
         if (S->NmiSanitize.ExtraHandles[i] && S->NmiSanitize.Deregister)
             ((FnNmiDeregister) S->NmiSanitize.Deregister)(
@@ -2170,7 +2080,7 @@ static bool PostboxResolve(address* IpiGenericCallOut)
     // image's .rdata carries neither plaintext nor ROT1-decipherable bytes. This is
     // anti-static-scan, not secrecy: decoded into stack buffers and wiped after the
     // resolve. The resolved pointers remain in .data.
-    constexpr uint32_t ImportCount = 22;
+    constexpr uint32_t ImportCount = 23;
     static constexpr EncodedName EncodedNames[] = {
         EncodeName("KeInitializeTimerEx"),
         EncodeName("KeInitializeDpc"),
@@ -2194,6 +2104,7 @@ static bool PostboxResolve(address* IpiGenericCallOut)
         EncodeName("KeEnterCriticalRegion"),
         EncodeName("KeLeaveCriticalRegion"),
         EncodeName("PsLookupThreadByThreadId"),
+        EncodeName("KeQueryInterruptTimePrecise"),
     };
     static_assert(sizeof(EncodedNames) / sizeof(EncodedNames[0]) == ImportCount,
                   "import name table changed");
@@ -2244,6 +2155,7 @@ static bool PostboxResolve(address* IpiGenericCallOut)
     g_KeEnterCriticalRegion_Raw = Functions[19];
     g_KeLeaveCriticalRegion_Raw = Functions[20];
     g_PsLookupThreadByThreadId_Raw = Functions[21];
+    g_KeQueryInterruptTime_Raw = Functions[22];
 
     for (uint32_t i = 0; i < ImportCount; ++i)
     {
@@ -2304,7 +2216,6 @@ extern "C" uint64_t g_PostboxShadowReturn = 0;
 
 extern "C" void PostboxShadowReturn();
 extern "C" void PostboxStackProbeTarget();
-extern "C" void PostboxThreadLoop();
 
 // Generic call-site spoof. The assembly stub takes the target as its first
 // argument, builds an nt-gadget fake stack, and tail-jumps to the target.
@@ -2396,10 +2307,8 @@ extern "C" void PostboxDrainThreadApcs(void)
     PostboxDelayExecutionThread(0, 1, &zero);
 }
 
-// Called from PostboxThreadLoop while the loop holds a critical region, so
-// this wait runs with kernel APCs disabled. The APC stackwalk countermeasure
-// neutralizes the detector's queued KAPC before the region is left, so the
-// wait's mapped return address is never captured by an APC.
+// Preserved APC-stackwalk thread-loop wait. The zero-thread path does not call
+// it; the fallback loop still does.
 extern "C" int32_t PostboxSpoofedThreadWait(int64_t* Interval)
 {
     if (!Interval) return -1;
@@ -2525,9 +2434,9 @@ static void PostboxReleaseProcessExit(void* Process)
     ((FnPsReleaseProcessExitSynchronization) g_PsReleaseProcessExitSynchronization)(Process);
 }
 
-static int32_t PostboxCreateSystemThread(void** ThreadHandle, uint32_t DesiredAccess,
-                                         void* ObjectAttributes, void* ProcessHandle,
-                                         void* ClientId, void* StartRoutine, void* StartContext)
+[[maybe_unused]] static int32_t PostboxCreateSystemThread(
+    void** ThreadHandle, uint32_t DesiredAccess, void* ObjectAttributes,
+    void* ProcessHandle, void* ClientId, void* StartRoutine, void* StartContext)
 {
     // Seven stack arguments: keep this direct. The reaper entry itself is a
     // tail jump to MmFreeIndependentPages, so the API return is already nt.
@@ -2536,12 +2445,10 @@ static int32_t PostboxCreateSystemThread(void** ThreadHandle, uint32_t DesiredAc
         StartRoutine, StartContext);
 }
 
-// SystemThreadScanner reads ThreadQuerySetWin32StartAddress, which is
-// _ETHREAD.Win32StartAddress (19041: +0x4D0). The mapped monitor/refresh/reaper
-// threads are created with a mapped entry point; point the field at an nt
-// routine after creation so the scanner resolves a backed module. Do not touch
-// _ETHREAD.StartAddress (+0x450); that is the kernel startup routine.
-static void PostboxSpoofThreadStart(void* ThreadId)
+// Preserved start-address spoof. The zero-thread path creates no ETHREAD, but
+// the fallback thread design still rewrites the field unKOver's
+// ThreadQuerySetWin32StartAddress path reads.
+[[maybe_unused]] static void PostboxSpoofThreadStart(void* ThreadId)
 {
     if (!ThreadId || !g_PsLookupThreadByThreadId) return;
     void* ThreadObj = nullptr;
@@ -2558,7 +2465,7 @@ static void PostboxSpoofThreadStart(void* ThreadId)
     PostboxDereferenceObject(ThreadObj);
 }
 
-static int32_t PostboxCloseHandle(void* Handle)
+[[maybe_unused]] static int32_t PostboxCloseHandle(void* Handle)
 {
 #ifdef STACK_SPOOF
     if (g_PostboxApiShadow && g_ZwClose)
@@ -2860,6 +2767,21 @@ static bool PostboxArm(uint32_t PeriodMs, uint32_t ToleranceMs, bool FromDpc = f
 // Slow the timer after a run of idle polls. Also called on a failed lookup/header read.
 static void PostboxIdleTick()
 {
+#ifdef NMI_SANITIZE
+    // The NMI monitor now runs on this worker. Do not back the timer off to
+    // 250 ms while the sanitizer is active; the monitor needs the 4 ms cadence
+    // to keep its callback at the head of the detector's per-IOCTL registration.
+    if (PostboxStatePtr && PostboxStatePtr->NmiSanitize.Active)
+    {
+        PostboxIdleTicks = 0;
+        if (PostboxPeriodMs != 4)
+        {
+            PostboxPeriodMs = 4;
+            (void) PostboxArm(4, 1);
+        }
+        return;
+    }
+#endif
     if (PostboxPeriodMs == 4 && ++PostboxIdleTicks >= 500)
     {
         PostboxPeriodMs = 250;
@@ -2991,6 +2913,11 @@ static void PostboxFreeStatePage()
     // it out first; the g_Mm* macros must not be used after the exchange because
     // PostboxStatePtr is already null.
     const address Free = State->Imports.MmFreeIndependentPages;
+    const address FreePool = State->Imports.ExFreePool;
+    PostboxWorkContext* Ctx = State->WorkCtx;
+    State->WorkCtx = nullptr;
+    if (Ctx && FreePool)
+        ((FnExFreePool) FreePool)(Ctx);
     PostboxWipe(State, 0x1000);
     if (Free)
         ((FnMmFreeIndependentPages) Free)(State, 0x1000);
@@ -3015,9 +2942,10 @@ extern "C" uint64_t PostboxReaperPrepare(PostboxState* State, PostboxReaperPlan*
     if (!DelayThread) return 0;
     for (uint32_t i = 0; i < 1000 && __atomic_load_n(&PostboxInFlight, __ATOMIC_ACQUIRE); ++i)
     {
-        // The reaper is a mapped system thread too. Patch any detector APC that
-        // arrived since the last wait so it is delivered as a neutralizer (no
-        // RtlCaptureStackBackTrace) instead of capturing this mapped stack.
+        // The reaper runs on the mapped worker's terminal path too. Patch any
+        // detector APC that arrived since the last wait so it is delivered as a
+        // neutralizer (no RtlCaptureStackBackTrace) instead of capturing this
+        // mapped stack.
         PostboxNeutralizeDetectorApcs();
         _LARGE_INTEGER Interval{};
         Interval.QuadPart = -10000;   // 1 ms
@@ -3056,6 +2984,16 @@ extern "C" uint64_t PostboxReaperPrepare(PostboxState* State, PostboxReaperPlan*
     PostboxFreeShadow();
 #endif
 
+    // The work item is idle and the worker has cleared its mapped entry. Free
+    // the detached context before the state page that holds the pointer.
+    {
+        const address FreePool = State->Imports.ExFreePool;
+        PostboxWorkContext* Ctx = State->WorkCtx;
+        State->WorkCtx = nullptr;
+        if (Ctx && FreePool)
+            ((FnExFreePool) FreePool)(Ctx);
+    }
+
     // Exchange first so a concurrent stop cannot free the same page twice. If a
     // new state page replaced this one, leave the old page alone.
     PostboxState* Expected = State;
@@ -3075,9 +3013,10 @@ extern "C" uint64_t PostboxReaperPrepare(PostboxState* State, PostboxReaperPlan*
     return 1;
 }
 
-// Creates the system thread whose entry is the assembly tail-jump stub. The
-// thread frees the loader allocation (RawBase/AllocSize), not the aligned image
-// base, and then returns to PspSystemThreadStartup.
+// Arms the worker's terminal reaper path. The assembly epilogue consumes the
+// flag after it clears PostboxInFlight, then tail-jumps through the existing
+// PostboxReaperEntry stub. The stub frees the loader allocation
+// (RawBase/AllocSize), not the aligned image base, and returns to ExpWorkerThread.
 static bool PostboxStartReaper()
 {
     if (__atomic_exchange_n(&PostboxReaperStarted, 1, __ATOMIC_ACQ_REL) != 0)
@@ -3090,31 +3029,19 @@ static bool PostboxStartReaper()
         return false;
     }
     PostboxState* State = PostboxStatePtr;
-    const address CreateThread = State->Imports.PsCreateSystemThread;
-    const address CloseThread = State->Imports.ZwClose;
-    if (!CreateThread || !CloseThread || !State->Imports.MmFreeIndependentPages ||
+    if (!State->Imports.MmFreeIndependentPages ||
         !State->ReaperBase || !State->ReaperSize)
     {
         __atomic_store_n(&PostboxReaperStarted, 0, __ATOMIC_RELEASE);
         return false;
     }
 
-    // The reaper frees the state page, so read the close routine into a local
-    // before the thread can run. The StartContext is the state page itself.
-    void* ThreadHandle = nullptr;
-    PostboxClientId Cid{};
-    const int32_t Status = PostboxCreateSystemThread(
-        &ThreadHandle, 0x1FFFFF /* THREAD_ALL_ACCESS */, nullptr, nullptr, &Cid,
-        (void*) &PostboxReaperEntry, State);
-    if (Status < 0 || !ThreadHandle)
-    {
-        __atomic_store_n(&PostboxReaperStarted, 0, __ATOMIC_RELEASE);
-        print(ERROR("Postbox: reaper thread creation failed"));
-        return false;
-    }
-    PostboxSpoofThreadStart(Cid.UniqueThread);
-    PostboxCloseHandle(ThreadHandle);
-    print(INFO("Postbox: reaper armed"));
+    // The worker consumes this flag in PostboxWorkEpilogue after it clears
+    // PostboxInFlight. It then jumps to PostboxReaperEntry with the state page
+    // in RCX, so teardown runs on the nt-owned worker thread. No thread is
+    // created, and no post-creation start-address patch is needed.
+    __atomic_store_n(&PostboxTeardownPending, 1, __ATOMIC_RELEASE);
+    print(INFO("Postbox: reaper armed on worker terminal path"));
     return true;
 }
 
@@ -3180,8 +3107,18 @@ static void PostboxDpcRoutine(void*, void*, void*, void*)
 #endif
     if (__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE))
     {
-        if (__atomic_exchange_n(&PostboxInFlight, 1, __ATOMIC_ACQ_REL) == 0)
-            PostboxQueueWorkItem(&PostboxStatePtr->Work, 1);   // DelayedWorkQueue
+        PostboxState* S = PostboxStatePtr;
+        if (S && S->WorkCtx &&
+            __atomic_exchange_n(&PostboxInFlight, 1, __ATOMIC_ACQ_REL) == 0)
+        {
+            PostboxWorkContext* Ctx = S->WorkCtx;
+            Ctx->Entry = (uint64_t) (uintptr_t) &PostboxWorkEntry;
+            Ctx->Work.WorkerRoutine = S->WorkJump
+                ? (void*) (uintptr_t) S->WorkJump
+                : (void*) &PostboxWorkEntry;
+            Ctx->Work.Parameter = Ctx;
+            PostboxQueueWorkItem(&Ctx->Work, 1);   // DelayedWorkQueue
+        }
     }
 #ifdef POSTBOX_ONESHOT_TIMER
     // Re-arm only while running and unchanged since entry: a stop between entry and
@@ -3216,7 +3153,9 @@ static void PostboxInstallDpcSpoof(PostboxState* S)
     }
     S->Dpc.DeferredRoutine = (void*) (uintptr_t) Gadget;
     S->Dpc.DeferredContext = (void*) (uintptr_t) &PostboxDpcRoutine;
-    print(INFO("Postbox: DPC entry spoofed (%p)"), (void*) (uintptr_t) Gadget);
+    S->WorkJump = PostboxNmiFindWorkJumpGadget(Nt, NtSize);
+    print(INFO("Postbox: DPC entry spoofed (%p), work entry thunk %p"),
+          (void*) (uintptr_t) Gadget, (void*) (uintptr_t) S->WorkJump);
 }
 #endif
 
@@ -3243,19 +3182,30 @@ extern "C" void PostboxWorkRoutine(void*)
     if (__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE))
     {
 #ifdef NMI_SANITIZE
-        // N-10: detector refresh/activation is PASSIVE work, never an NMI.
-        // 250 * 4 ms ~= 1 s, so a rename or late load is picked up promptly
-        // without walking the module list on every work item.
+        // Detector refresh/activation and monitor re-registration are PASSIVE
+        // work, never an NMI. Both now run on this existing worker; no
+        // dedicated monitor/refresh thread exists.
         if (State && State->NmiSanitize.Ready)
         {
-            if (++State->NmiSanitize.RefreshTick >= 250)
+            uint64_t PerformanceCounter = 0;
+            const uint64_t Now = g_KeQueryInterruptTime
+                ? ((FnKeQueryInterruptTime) g_KeQueryInterruptTime)(&PerformanceCounter) : 0;
+            if (State->NmiSanitize.RefreshDeadline == 0 ||
+                Now >= State->NmiSanitize.RefreshDeadline)
             {
-                State->NmiSanitize.RefreshTick = 0;
+                State->NmiSanitize.RefreshDeadline = Now + 10000000ull; // 1 s
+#ifdef NMI_PROBE
+                State->NmiSanitize.RefreshCount++;
+#endif
                 if (!State->NmiSanitize.Active)
                     PostboxNmiTryActivate(State);
                 else
                     PostboxNmiRefreshDetector(State);
             }
+#ifdef NMI_FRAME_FIRST
+            if (State->NmiSanitize.Active)
+                PostboxNmiMonitorStep(State);
+#endif
         }
 #endif
 #ifdef E3_DPC_PROBE
@@ -3266,17 +3216,15 @@ extern "C" void PostboxWorkRoutine(void*)
         PostboxPollSpoof();
     }
 
-    // Terminal work item: running is clear and the timer is cancelled, so no DPC
-    // can queue this item again. The worker already loaded WorkerRoutine; clear
-    // the fields so the resident state page keeps no pointer back into the image.
-    // Use the captured State, not the global, so a restart cannot redirect this
-    // clear at the new page.
-    if (!__atomic_load_n(&PostboxRunning, __ATOMIC_ACQUIRE) && State)
+    // The worker already loaded WorkerRoutine/Parameter and the nt work-entry
+    // thunk has consumed [Context]. Clear the mapped entry so the detached pool
+    // block holds no code pointer while the item is idle. The DPC repopulates it
+    // immediately before the next queue.
+    if (State && State->WorkCtx)
     {
-        State->Work.WorkerRoutine = nullptr;
-        State->Work.Parameter = nullptr;
-        State->Work.List.Flink = nullptr;
-        State->Work.List.Blink = nullptr;
+        State->WorkCtx->Entry = 0;
+        State->WorkCtx->Work.WorkerRoutine = nullptr;
+        State->WorkCtx->Work.Parameter = nullptr;
     }
 }
 
@@ -3564,8 +3512,8 @@ static void PostboxPollAttached(void* MailboxProcess)
         St.LastCore = PostboxStatePtr->NmiSanitize.LastCore;
         St.LastRip = PostboxStatePtr->NmiSanitize.LastRip;
         St.LastRsp = PostboxStatePtr->NmiSanitize.LastRsp;
-        St.RefreshActive = PostboxStatePtr->NmiSanitize.RefreshThreadActive;
-        St.RefreshRun = PostboxStatePtr->NmiSanitize.RefreshRun;
+        St.RefreshActive = 0;
+        St.RefreshRun = 0;
         St.RefreshCount = PostboxStatePtr->NmiSanitize.RefreshCount;
         St.ListHead = PostboxStatePtr->NmiSanitize.ListHead;
         St.NtBase = PostboxStatePtr->NmiSanitize.NtBase;
@@ -3859,6 +3807,7 @@ bool PostboxStart(const PostboxConfig* Config)
     PostboxStatePtr->Imports.KeLeaveCriticalRegion = g_KeLeaveCriticalRegion_Raw;
     PostboxStatePtr->Imports.PsLookupThreadByThreadId =
         g_PsLookupThreadByThreadId_Raw;
+    PostboxStatePtr->Imports.KeQueryInterruptTime = g_KeQueryInterruptTime_Raw;
 
     g_KeInitializeTimerEx_Raw = 0;
     g_KeInitializeDpc_Raw = 0;
@@ -3881,6 +3830,7 @@ bool PostboxStart(const PostboxConfig* Config)
     g_KeEnterCriticalRegion_Raw = 0;
     g_KeLeaveCriticalRegion_Raw = 0;
     g_PsLookupThreadByThreadId_Raw = 0;
+    g_KeQueryInterruptTime_Raw = 0;
 
     // Acquire the client reference and verify its create time once, not per poll.
     // Pid/CreateTime are the last config fields any path reads; keep Pid for the
@@ -3977,11 +3927,25 @@ bool PostboxStart(const PostboxConfig* Config)
     // the pb_nmi self-test, then the Windows IDT is restored in the same work item.
 #endif
 
-    // ExInitializeWorkItem's fields, without pulling in the macro from the vendor headers
-    PostboxStatePtr->Work.List.Flink = nullptr;
-    PostboxStatePtr->Work.List.Blink = nullptr;
-    PostboxStatePtr->Work.WorkerRoutine = (void*) &PostboxWorkEntry;
-    PostboxStatePtr->Work.Parameter = nullptr;
+    // Detached work-item context: a normal nonpaged pool block, not the state
+    // page. The state page keeps only a data pointer to it.
+    {
+        auto* Ctx = (PostboxWorkContext*) ((FnExAllocatePoolWithTag)
+            g_ExAllocatePoolWithTag)(0x200 /* NonPagedPoolNx */,
+                                     sizeof(PostboxWorkContext), 'KFWk');
+        if (!Ctx)
+        {
+            print(ERROR("Postbox: work context allocation failed"));
+            PostboxFreeStatePage();
+            return false;
+        }
+        __builtin_memset(Ctx, 0, sizeof(*Ctx));
+        Ctx->Entry = (uint64_t) (uintptr_t) &PostboxWorkEntry;
+        Ctx->State = (uint64_t) (uintptr_t) PostboxStatePtr;
+        Ctx->Work.WorkerRoutine = (void*) &PostboxWorkEntry;
+        Ctx->Work.Parameter = Ctx;
+        PostboxStatePtr->WorkCtx = Ctx;
+    }
 
     PostboxInitializeTimer(&PostboxStatePtr->Timer, 0);   // NotificationTimer
     PostboxInitializeDpc(&PostboxStatePtr->Dpc, &PostboxDpcRoutine, nullptr);
@@ -4012,10 +3976,9 @@ bool PostboxStart(const PostboxConfig* Config)
     }
 
 #ifdef NMI_SANITIZE
-    // N-10: start the independent PASSIVE detector-refresh thread only after the
-    // timer is armed, so the start-failure path above cannot leave it running
-    // behind a freed state page.
-    PostboxNmiStartRefreshThread(PostboxStatePtr);
+    // The mailbox worker owns detector refresh and monitor re-registration now.
+    // Deadline 0 makes the first worker pass refresh immediately.
+    PostboxStatePtr->NmiSanitize.RefreshDeadline = 0;
 #endif
 
     print(INFO("Postbox: live, pid %u mailbox %p, 4 ms timer"),
@@ -4492,6 +4455,7 @@ bool VerifyPostboxResolveNames()
         {"KeEnterCriticalRegion", I.KeEnterCriticalRegion},
         {"KeLeaveCriticalRegion", I.KeLeaveCriticalRegion},
         {"PsLookupThreadByThreadId", I.PsLookupThreadByThreadId},
+        {"KeQueryInterruptTimePrecise", I.KeQueryInterruptTime},
     };
     for (const auto& S : Slots)
     {
