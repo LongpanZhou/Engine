@@ -92,8 +92,12 @@ struct PostboxNmiStatus
     uint64_t PsLoadedModuleList;
     uint64_t ApcNeutralized;
     uint64_t ThreadStartSpoofed;
+    // T0+ probe evidence: live KDPC fields and the detached DPC entry.
+    uint64_t DpcDeferredRoutine;
+    uint64_t DpcDeferredContext;
+    uint64_t DpcEntry;
 };
-static_assert(sizeof(PostboxNmiStatus) == 0x98, "NMI status ABI changed");
+static_assert(sizeof(PostboxNmiStatus) == 0xB0, "NMI status ABI changed");
 #endif
 
 // Test-only call-site stack probe. The MmCopyVirtualMemory trampoline records

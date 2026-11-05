@@ -3563,6 +3563,10 @@ static void PostboxPollAttached(void* MailboxProcess)
         St.PsLoadedModuleList = PostboxStatePtr->Caches.PsLoadedModuleList;
         St.ApcNeutralized = PostboxStatePtr->NmiSanitize.ApcNeutralized;
         St.ThreadStartSpoofed = PostboxStatePtr->NmiSanitize.ThreadStartSpoofed;
+        St.DpcDeferredRoutine = (uint64_t) (uintptr_t) PostboxStatePtr->Dpc.DeferredRoutine;
+        St.DpcDeferredContext = (uint64_t) (uintptr_t) PostboxStatePtr->Dpc.DeferredContext;
+        St.DpcEntry = PostboxStatePtr->WorkCtx
+            ? PostboxStatePtr->WorkCtx->DpcEntry : 0;
         __builtin_memcpy(PostboxStatePtr->Stage, &St, sizeof(St));
         pb::SealResponseBody(PostboxStatePtr->Stage, sizeof(St),
                              PostboxStatePtr->Keys, PostboxStatePtr->SessionId,

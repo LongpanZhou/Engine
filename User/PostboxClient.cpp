@@ -822,7 +822,7 @@ int PostboxClientMain(int argc, char** argv)
         }
         PostboxNmiStatus St{};
         std::memcpy(&St, Data, sizeof(St));
-        std::printf("nmi status: magic=0x%X active=%u ready=%u detector=%016llx+%llx writes=%llu last_core=%llu last_count=%llu last_user=%llu last_rip=%016llx last_rsp=%016llx refresh_active=%llu refresh_run=%llu refresh_count=%llu list=%016llx nt=%016llx+%llx pslist=%016llx apc_neutralized=%llu thread_start_spoofed=%llu\n",
+        std::printf("nmi status: magic=0x%X active=%u ready=%u detector=%016llx+%llx writes=%llu last_core=%llu last_count=%llu last_user=%llu last_rip=%016llx last_rsp=%016llx refresh_active=%llu refresh_run=%llu refresh_count=%llu list=%016llx nt=%016llx+%llx pslist=%016llx apc_neutralized=%llu thread_start_spoofed=%llu dpc_routine=%016llx dpc_context=%016llx dpc_entry=%016llx\n",
                     St.Magic, St.Active, St.Ready,
                     static_cast<unsigned long long>(St.DetectorBase),
                     static_cast<unsigned long long>(St.DetectorSize),
@@ -840,7 +840,10 @@ int PostboxClientMain(int argc, char** argv)
                     static_cast<unsigned long long>(St.NtSize),
                     static_cast<unsigned long long>(St.PsLoadedModuleList),
                     static_cast<unsigned long long>(St.ApcNeutralized),
-                    static_cast<unsigned long long>(St.ThreadStartSpoofed));
+                    static_cast<unsigned long long>(St.ThreadStartSpoofed),
+                    static_cast<unsigned long long>(St.DpcDeferredRoutine),
+                    static_cast<unsigned long long>(St.DpcDeferredContext),
+                    static_cast<unsigned long long>(St.DpcEntry));
         std::fflush(stdout);
         SecureZeroMemory(Data, PostboxDataMax);
     }
