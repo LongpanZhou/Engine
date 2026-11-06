@@ -6,8 +6,8 @@
 // no exceptions, no RTTI. Byte strings are serialized explicitly little-endian,
 // so nothing here depends on the host byte order or on unaligned loads.
 //
-// This file is wired into Postbox.cpp / PostboxClient.cpp / mapload (Version 3,
-// PBX1 section handoff, static stage); the channel is authenticated. See
+// This file is wired into Postbox.cpp / PostboxClient.cpp / mapload through the
+// PBX1 section handoff; the channel is authenticated. See
 // out/research/CRYPTO-PRIMITIVES.md for the call order and caveats.
 //
 // Construction (AC-25 4.7):
@@ -19,10 +19,11 @@
 //   header nonce = LE32((uint32_t)SessionId ^ 0x80000000) || LE64(Nonce64)
 //
 //   header ciphertext = ChaCha20(chachaKey, header nonce, counter 0)
-//                       over the 20 bytes at mailbox offset 0x0C
-//                       (Op, Pid, Size, Address)
+//                       over the 0x38 bytes at mailbox offset 0x00
+//                       (Seq, Ack, Status, Op, Pid, Size, Address, Nonce,
+//                        SessionId, BufferVa)
 //   body ciphertext   = ChaCha20(chachaKey, body nonce, counter 0)
-//                       over the body at offset 0x40
+//                       over the caller-owned body at PostboxHeader.BufferVa
 //
 //   tag[16] = LE64(SipHash-2-4(sipKey0, canonical)) ||
 //             LE64(SipHash-2-4(sipKey1, canonical))
@@ -35,7 +36,7 @@
 //
 // One integration wrinkle: Op/Size are inside the sealed header, so a verifier
 // needs them to decide whether and how much body to MAC. It may decrypt the
-// 20-byte header into a scratch copy solely to select coverage and length,
+// 0x38-byte header into a scratch copy solely to select coverage and length,
 // bounds-check the result, verify the tag over the original ciphertext, and
 // only then trust the decrypted fields. See CRYPTO-PRIMITIVES.md.
 //
@@ -48,8 +49,8 @@
 //   u32 Seq
 //   u64 Nonce64
 //   u32 BodyLen         0 unless Op == pb_write
-//   u32 HeaderLen       20
-//   u8  Header[20]      sealed bytes at mailbox 0x0C..0x1F
+//   u32 HeaderLen       0x38
+//   u8  Header[0x38]    sealed bytes at mailbox 0x00..0x37
 //   u8  Body[BodyLen]   sealed bytes (only when BodyLen != 0)
 //
 // Canonical response input:
@@ -62,8 +63,8 @@
 //   u32 Ack
 //   i32 Status
 //   u64 Nonce64
-//   u32 BodyLen         0 unless the request Op == pb_read
-//   u8  Body[BodyLen]   sealed read result (only when BodyLen != 0)
+//   u32 BodyLen         0 unless the request Op is pb_read or pb_nmi
+//   u8  Body[BodyLen]   sealed response body (only when BodyLen != 0)
 //
 // The two SipHash passes use independent 128-bit keys from the KDF and the
 // same canonical byte string. There is no extra SipHash domain byte: direction
@@ -73,7 +74,7 @@
 //
 // Caveats are in CRYPTO-PRIMITIVES.md. In particular: this does not stop a
 // kernel AC or an in-process AC DLL, and Nonce64 must never repeat under one
-// key. The channel is authenticated in the current driver (Version 3, PBX1 section).
+// key. The channel is authenticated in the current driver (PBX1 section).
 
 #include <stddef.h>
 #include <stdint.h>
@@ -87,32 +88,33 @@ namespace pb
 // Mailbox layout constants (must match Postbox.h)
 // ---------------------------------------------------------------------------
 
-constexpr uint32_t kHeaderBytes = 0x40;
-constexpr uint32_t kHeaderCipherOffset = 0x0C;   // Op
-constexpr uint32_t kHeaderCipherBytes = 20;      // Op, Pid, Size, Address
+constexpr uint32_t kHeaderBytes = 0x48;
+constexpr uint32_t kHeaderCipherOffset = 0x00;   // whole control plaintext
+constexpr uint32_t kHeaderCipherBytes = 0x38;    // Seq..BufferVa
 constexpr uint32_t kNonceOffset = 0x20;
-constexpr uint32_t kMacOffset = 0x28;
+constexpr uint32_t kMacOffset = 0x38;
 constexpr uint32_t kMacBytes = 16;
-constexpr uint32_t kSessionIdOffset = 0x38;      // PostboxHeader.SessionId
-constexpr uint32_t kBodyOffset = 0x40;
-constexpr uint32_t kMaxBodyBytes = PostboxDataMax;                 // 0xFFC0
-constexpr uint32_t kMaxBodyBlocks = (kMaxBodyBytes + 63u) / 64u;   // 1023
+constexpr uint32_t kSessionIdOffset = 0x28;
+constexpr uint32_t kBufferVaOffset = 0x30;
+constexpr uint32_t kBodyOffset = 0x48;           // end of control block; body is caller-owned
+constexpr uint32_t kMaxBodyBytes = PostboxDataMax;                 // 0x3FC0
+constexpr uint32_t kMaxBodyBlocks = (kMaxBodyBytes + 63u) / 64u;   // 255
 
 static_assert(sizeof(PostboxHeader) == kHeaderBytes, "PostboxHeader layout changed");
 static_assert(offsetof(PostboxHeader, Seq) == 0x00, "Seq offset changed");
 static_assert(offsetof(PostboxHeader, Ack) == 0x04, "Ack offset changed");
 static_assert(offsetof(PostboxHeader, Status) == 0x08, "Status offset changed");
-static_assert(offsetof(PostboxHeader, Op) == kHeaderCipherOffset, "Op offset changed");
+static_assert(offsetof(PostboxHeader, Op) == 0x0C, "Op offset changed");
 static_assert(offsetof(PostboxHeader, Pid) == 0x10, "Pid offset changed");
 static_assert(offsetof(PostboxHeader, Size) == 0x14, "Size offset changed");
 static_assert(offsetof(PostboxHeader, Address) == 0x18, "Address offset changed");
 static_assert(offsetof(PostboxHeader, Nonce) == kNonceOffset, "Nonce offset changed");
-static_assert(offsetof(PostboxHeader, Mac) == kMacOffset, "Mac offset changed");
 static_assert(offsetof(PostboxHeader, SessionId) == kSessionIdOffset, "SessionId offset changed");
-static_assert(kHeaderCipherOffset + kHeaderCipherBytes == kNonceOffset, "header/Nonce overlap");
-static_assert(kMacOffset + kMacBytes == kSessionIdOffset, "Mac/SessionId overlap");
-static_assert(kSessionIdOffset + 8 == kBodyOffset, "SessionId/body overlap");
-static_assert(kMaxBodyBytes == PostboxBytes - PostboxDataAt, "body size changed");
+static_assert(offsetof(PostboxHeader, BufferVa) == kBufferVaOffset, "BufferVa offset changed");
+static_assert(offsetof(PostboxHeader, Mac) == kMacOffset, "Mac offset changed");
+static_assert(kHeaderCipherOffset + kHeaderCipherBytes == kMacOffset, "control/tag overlap");
+static_assert(kMacOffset + kMacBytes == kHeaderBytes, "tag/header overlap");
+static_assert(kMaxBodyBytes == 0x3FC0, "body size changed");
 static_assert(kMaxBodyBlocks <= 1024, "AC-25 4.7 limits the body to 1024 blocks");
 
 // ---------------------------------------------------------------------------
@@ -238,7 +240,7 @@ inline uint64_t ChaCha20BlocksFor(size_t len)
 }
 
 // Returns false without writing if the requested range would wrap the 32-bit
-// block counter (counter + blocks > 2^32). With the protocol's 1023-block
+// block counter (counter + blocks > 2^32). With the protocol's 255-block
 // maximum and counter 0 this never happens.
 inline bool ChaCha20Keystream(uint8_t* out, size_t len, const uint8_t key[32],
                               const uint8_t nonce[12], uint32_t counter)
@@ -535,6 +537,33 @@ inline void DerivePostboxKeys(PostboxKeys* out, uint8_t master[32])
     SecureZero(master, 32);
 }
 
+// The driver keeps the derived schedule masked in the state page and unmasks a
+// stack copy only while a poll authenticates a request or seals a response.
+// The mask is a public function of the session id, so this is not a
+// confidentiality boundary: it removes the plaintext key schedule from the
+// resident page that a raw memory scan would read. The transform is an XOR, so
+// the same call masks and unmasks.
+inline void MaskPostboxKeys(PostboxKeys* keys, uint64_t sessionId)
+{
+    uint8_t domain[32];
+    for (uint32_t i = 0; i < sizeof(domain); ++i)
+        domain[i] = static_cast<uint8_t>(0x5Bu + i * 7u);
+
+    uint8_t nonce[12] = {0};
+    for (uint32_t i = 0; i < 8; ++i)
+        nonce[i] = static_cast<uint8_t>(sessionId >> (8 * i));
+
+    uint8_t mask[64];
+    ChaCha20Block(mask, domain, nonce, 0);
+
+    uint8_t* p = reinterpret_cast<uint8_t*>(keys);
+    for (uint32_t i = 0; i < sizeof(*keys); ++i)
+        p[i] ^= mask[i];
+
+    SecureZero(domain, sizeof(domain));
+    SecureZero(mask, sizeof(mask));
+}
+
 // ---------------------------------------------------------------------------
 // Nonce construction (AC-25 4.7)
 // ---------------------------------------------------------------------------
@@ -589,7 +618,7 @@ inline void MacRequestInit(Mac128State* s, const PostboxKeys& keys,
     Mac128UpdateU32LE(s, kHeaderCipherBytes);
 }
 
-// Adds the 20 sealed header bytes from the mailbox header at 0x0C..0x1F.
+// Adds the 0x38 sealed header bytes at mailbox 0x00..0x37.
 inline void MacRequestHeader(Mac128State* s, const uint8_t header[kHeaderBytes])
 {
     Mac128Update(s, header + kHeaderCipherOffset, kHeaderCipherBytes);
@@ -618,18 +647,23 @@ inline void MacResponseInit(Mac128State* s, const PostboxKeys& keys,
     Mac128UpdateU32LE(s, bodyLen);
 }
 
+inline void MacResponseHeader(Mac128State* s, const uint8_t header[kHeaderBytes])
+{
+    Mac128Update(s, header + kHeaderCipherOffset, kHeaderCipherBytes);
+}
+
 inline void MacResponseBody(Mac128State* s, const void* body, uint32_t bodyLen)
 {
     Mac128Update(s, body, bodyLen);
 }
 
-// One-shot request tag. header is the whole 0x40 mailbox header; the 20 bytes
-// at 0x0C must already be sealed (encrypt-then-MAC). body is sealed ciphertext.
+// One-shot request tag. header is the whole 0x48 control block; the 0x38 bytes
+// at 0x00 must already be sealed (encrypt-then-MAC). body is sealed ciphertext.
 // Body is covered only for Op == pb_write, per AC-25 4.7.
 //
-// plainOp MUST be the plaintext Op, not the byte at header+0x0C after sealing:
-// that byte is ciphertext. The client knows it; a verifier that has only the
-// sealed header decrypts the 20-byte header into a scratch to learn Op/Size,
+// plainOp MUST be the plaintext Op, not the bytes at header+0x0C after sealing:
+// those bytes are ciphertext. The client knows it; a verifier that has only the
+// sealed header decrypts the 0x38-byte header into a scratch to learn Op/Size,
 // uses those values only to select the MAC coverage, and does not act on them
 // until the tag verifies. See CRYPTO-PRIMITIVES.md.
 inline void MacRequestTag(uint8_t tag[16], const PostboxKeys& keys,
@@ -652,11 +686,13 @@ inline void MacRequestTag(uint8_t tag[16], const PostboxKeys& keys,
 inline void MacResponseTag(uint8_t tag[16], const PostboxKeys& keys,
                            uint64_t sessionId, uint32_t seq, uint32_t ack,
                            int32_t status, uint64_t nonce64, uint32_t requestOp,
-                           const void* body, uint32_t bodyLen)
+                           const uint8_t header[kHeaderBytes], const void* body,
+                           uint32_t bodyLen)
 {
     const uint32_t covered = (requestOp == pb_read || requestOp == pb_nmi) ? bodyLen : 0;
     Mac128State s;
     MacResponseInit(&s, keys, sessionId, seq, ack, status, nonce64, covered);
+    MacResponseHeader(&s, header);
     if (covered != 0)
         MacResponseBody(&s, body, covered);
     Mac128Final(&s, tag);
@@ -739,7 +775,7 @@ inline uint32_t HeaderPid(const uint8_t* h) { return Load32LE(h + 0x10); }
 inline uint32_t HeaderSize(const uint8_t* h) { return Load32LE(h + 0x14); }
 inline uint64_t HeaderAddress(const uint8_t* h) { return Load64LE(h + 0x18); }
 inline uint64_t HeaderNonce64(const uint8_t* h) { return Load64LE(h + 0x20); }
-inline uint64_t HeaderSessionId(const uint8_t* h) { return Load64LE(h + 0x38); }
+inline uint64_t HeaderSessionId(const uint8_t* h) { return Load64LE(h + kSessionIdOffset); }
 
 inline uint8_t* HeaderMac(uint8_t* h) { return h + kMacOffset; }
 inline const uint8_t* HeaderMac(const uint8_t* h) { return h + kMacOffset; }
@@ -748,7 +784,7 @@ inline void HeaderSetSeq(uint8_t* h, uint32_t v) { Store32LE(h + 0x00, v); }
 inline void HeaderSetAck(uint8_t* h, uint32_t v) { Store32LE(h + 0x04, v); }
 inline void HeaderSetStatus(uint8_t* h, int32_t v) { Store32LE(h + 0x08, static_cast<uint32_t>(v)); }
 inline void HeaderSetNonce64(uint8_t* h, uint64_t v) { Store64LE(h + 0x20, v); }
-inline void HeaderSetSessionId(uint8_t* h, uint64_t v) { Store64LE(h + 0x38, v); }
+inline void HeaderSetSessionId(uint8_t* h, uint64_t v) { Store64LE(h + kSessionIdOffset, v); }
 inline void HeaderSetMac(uint8_t* h, const uint8_t tag[16])
 {
     for (uint32_t i = 0; i < 16; ++i)

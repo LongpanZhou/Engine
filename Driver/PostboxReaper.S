@@ -24,6 +24,10 @@
     .text
     .globl PostboxWorkEntry
 PostboxWorkEntry:
+    # The nt DPC queues the item; mark in-flight here before any mapped work so
+    # the reaper cannot free the page under a just-started worker. The epilogue
+    # clears it.
+    movl $1, PostboxInFlight(%rip)
     # Keep kernel APCs disabled for the whole mapped work item. Detector APCs
     # stay queued until PostboxApcsNeutralizeAndEnable patches and releases
     # them in the epilogue.
@@ -39,7 +43,6 @@ PostboxWorkEntry:
     movq g_PostboxShadowJumpGadget(%rip), %rax
     testq %rax, %rax
     jz 2f
-    movq $0, g_PostboxShadowDepth(%rip)
     movl $1, g_PostboxShadowActive(%rip)
 2:
     leaq -0x60(%r12), %rsp
@@ -57,13 +60,14 @@ PostboxWorkEntry:
 1:
     subq $0x28, %rsp
     call PostboxWorkRoutine
+    call PostboxApcsNeutralizeAndEnable
+    call PostboxDrainThreadApcs
     movl $0, PostboxInFlight(%rip)
     addq $0x28, %rsp
-    ret
+    jmp PostboxWorkTail
 
 PostboxWorkEpilogue:
     movl $0, g_PostboxShadowActive(%rip)
-    movq $0, g_PostboxShadowDepth(%rip)
     movq %r12, %rsp
     popq %r12
     subq $8, %rsp
@@ -71,14 +75,7 @@ PostboxWorkEpilogue:
     call PostboxDrainThreadApcs
     addq $8, %rsp
     movl $0, PostboxInFlight(%rip)
-    cmpl $0, PostboxTeardownPending(%rip)
-    je 3f
-    movq PostboxStatePtr(%rip), %rcx
-    testq %rcx, %rcx
-    jz 3f
-    jmp PostboxReaperEntry
-3:
-    ret
+    jmp PostboxWorkTail
 #else
     subq $0x28, %rsp
     call PostboxWorkRoutine
@@ -86,6 +83,15 @@ PostboxWorkEpilogue:
     call PostboxDrainThreadApcs
     movl $0, PostboxInFlight(%rip)
     addq $0x28, %rsp
+#endif
+# Shared terminal path: PostboxInFlight is clear and the caller's stack is
+# restored. Tail-jump into the reaper when the state page is still resident.
+PostboxWorkTail:
+    movq PostboxStatePtr(%rip), %rax
+    testq %rax, %rax
+    jz 3f
+    cmpq $0, 0x1028(%rax)
+    jne 3f
     cmpl $0, PostboxTeardownPending(%rip)
     je 3f
     movq PostboxStatePtr(%rip), %rcx
@@ -94,7 +100,49 @@ PostboxWorkEpilogue:
     jmp PostboxReaperEntry
 3:
     ret
-#endif
+
+    .text
+    # Exact-entry start path. KiUmsRestoreUch with Count=32 leaves IF=0 and
+    # RSP = InitialStack-0x20. The copied qwords are, from RSP upward:
+    #   [rsp]    = EventThread (unused)
+    #   [rsp+8]  = EventEntry  = exact-entry nt ret thunk
+    #   [rsp+16] = Copy[0]     = PsTerminateSystemThread
+    #   [rsp+24] = Copy[1]
+    # Shift up 8 for the normal start ABI. The event reaper is entered at RSP
+    # 8 mod 16 and enters MmFreeIndependentPages with RSP = base-0x28, so
+    # MmFree's 0x20-byte shadow spill only touches EventThread/Copy[1]. The
+    # exact-entry skip thunk then steps over that shadow space and pops the
+    # ret thunk and PsTerminateSystemThread with 8-mod-16 alignment.
+    .globl PostboxEventStackEntry
+PostboxEventStackEntry:
+    sti
+    addq $8, %rsp
+    movl $1, PostboxInFlight(%rip)
+    subq $0x28, %rsp
+    call PostboxEventLoop
+    addq $0x28, %rsp
+    movl $0, PostboxInFlight(%rip)
+    movq PostboxStatePtr(%rip), %rcx
+    testq %rcx, %rcx
+    jz 1f
+    jmp PostboxEventReaperEntry
+1:
+    ret
+
+    .text
+    .globl PostboxEventThreadEntry
+PostboxEventThreadEntry:
+    movl $1, PostboxInFlight(%rip)
+    subq $0x28, %rsp
+    call PostboxEventLoop
+    addq $0x28, %rsp
+    movl $0, PostboxInFlight(%rip)
+    movq PostboxStatePtr(%rip), %rcx
+    testq %rcx, %rcx
+    jz 1f
+    jmp PostboxReaperEntry
+1:
+    ret
 
     .text
     .globl PostboxReaperEntry
@@ -113,6 +161,40 @@ PostboxReaperEntry:
     movq 0x30(%rsp), %rax           # MmFreeIndependentPages
     addq $0x40, %rsp
     popq %rbx
+    jmp *%rax
+
+1:
+    addq $0x40, %rsp
+    popq %rbx
+    ret
+
+    .text
+    # Exact-entry event terminal. Entered from PostboxEventStackEntry with
+    # RSP = base+8, where [base+8] is the exact-entry nt ret thunk and
+    # [base+16] is PsTerminateSystemThread. On success, enter MmFree with
+    # RSP = base-0x28 and an exact-entry `add rsp,0x28; ret` in [base-0x28].
+    # MmFree spills into [base-0x20, base), below the terminal copy; the skip
+    # thunk then pops the ret thunk and PsTerminate with correct alignment.
+    # On failure, return through [base+8] so the thread still terminates.
+    .globl PostboxEventReaperEntry
+PostboxEventReaperEntry:
+    pushq %rbx
+    subq $0x40, %rsp
+    movq %rcx, %rbx
+    leaq 0x20(%rsp), %rdx
+    movq %rbx, %rcx
+    call PostboxReaperPrepare
+    testq %rax, %rax
+    jz 1f
+
+    movq 0x20(%rsp), %rcx           # RawBase
+    movq 0x28(%rsp), %rdx           # AllocSize
+    movq 0x30(%rsp), %rax           # MmFreeIndependentPages
+    addq $0x40, %rsp
+    popq %rbx                       # RSP = base+8
+    movq g_PostboxTerminalSkip(%rip), %r10
+    movq %r10, -0x30(%rsp)          # [base-0x28] = skip thunk
+    subq $0x30, %rsp                # RSP = base-0x28 (8 mod 16)
     jmp *%rax
 
 1:

@@ -22,13 +22,14 @@ constexpr auto ExReleaseResourceName = Encode("ExReleaseResourceLite");
 constexpr auto ExFreePoolName = Encode("ExFreePool");
 constexpr auto RtlDeleteElementGenericTableAvlName = Encode("RtlDeleteElementGenericTableAvl");
 
-// Byte signatures that reach the trace globals from the reference 64KernelDriverCleaner (wildcard ?).
-// Stored encoded like every other string; used via Decode(...).data() as a SignatureScan byte string
+// Byte signatures that reach the trace globals (wildcard ?). Stored encoded like
+// every other string; decoded to a Pattern and passed to ScanModuleImage.
 
 // The PiDDB housekeeping list head (nt!PiDDBCacheList), through the block in nt!PiLookupInDDBCache
 // that threads a fresh entry onto the list tail: `lea rdx,[head] / mov rcx,[head->Blink] / cmp
-// [rcx],rdx` — the Rtl InsertTailList shape. Unique in the whole image (verified against the live
-// 19041 kernel) and located in PAGE, which ScanModuleImage searches first
+// [rcx],rdx` - the Rtl InsertTailList shape. Unique in the whole image (verified
+// against the live 19041 kernel) and located in .PAGE, which is searched after
+// .text.
 constexpr auto PiDDBCacheListSignature = EncodeBytes(PatternToBytes(
     "48 8D 15 ? ? ? ? 48 8B 0D ? ? ? ? 48 39 11"));
 
@@ -79,8 +80,8 @@ constexpr auto PteBaseSignature = EncodeBytes(PatternToBytes("48 BA ? ? ? ? ? ? 
 constexpr auto PfnPteAddressSignature = EncodeBytes(PatternToBytes("48 B8 ? ? ? ? ? ? ? ? 48 8B 04 D0 48 C1 E0 19"));
 
 // Fail the build if any runtime signature contains an invalid hex token. This is
-// the compile-time half of V-26; ScanModuleImage has the runtime guard for
-// patterns built from non-constant input.
+// compile-time validation of every runtime signature; ScanModuleImage has the
+// runtime guard for patterns built from non-constant input.
 static_assert(
     PatternIsValid(PiDDBCacheListSignature) &&
     PatternIsValid(PiDDBCacheTableSignature) &&

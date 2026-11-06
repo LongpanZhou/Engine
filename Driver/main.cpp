@@ -26,7 +26,8 @@ using namespace intrin;
 #endif
 #ifdef POSTBOX_JOB
 #include "../Common/PostboxCrypto.h"
-#include "PostboxJob.cpp" // F1 job-post: one map, one entry, N jobs, one teardown
+#include "../Common/PostboxJobCrypto.h" // sealed job batch/data helpers
+#include "PostboxJob.cpp" // job-only batch: one map, one entry, N jobs, one teardown
 #endif
 #ifdef POSTBOX_NMI
 #include "PostboxNmi.cpp" // constructed-IDT NMI gate; only in POSTBOX_NMI builds
@@ -42,14 +43,6 @@ extern "C" void (*__CTOR_LIST__[2])() = {nullptr, nullptr};
 #ifndef MANUAL_MAP_ONLY
 win::ntstatus DriverExit(win::DRIVER_OBJECT* DriverObject)
 {
-#ifdef MANUAL_MAP_ONLY
-    // The Postbox build is manual-map only: stop the timer/work item and unlink the
-    // map table. There is no loader entry, no object to unhide, and no PE header to
-    // restore; the mapper publishes the image headerless.
-    PostboxStop();
-    UnlinkMapTable();
-    return win::ntstatus::success;
-#else
     const bool ManualMapped = !DriverObject || !DriverObject->DriverSection;
 
     // Stop the persistent Postbox channel before the image is released.
@@ -96,7 +89,6 @@ win::ntstatus DriverExit(win::DRIVER_OBJECT* DriverObject)
         ((_KLDR_DATA_TABLE_ENTRY*) DriverObject->DriverSection)->BaseDllName.Length = 0;
 
     return win::ntstatus::success;
-#endif
 }
 #endif // MANUAL_MAP_ONLY
 
@@ -118,15 +110,15 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
     }
 #endif
 
-    // The POSTBOX_CHANNEL build is manual-map only: the second entry argument is a
-    // PostboxConfig instead of a provider image name.
+    // Postbox builds are manual-map only: the second entry argument is a
+    // PostboxConfig or PostboxJobConfig instead of a provider image name.
 #if defined(POSTBOX_CHANNEL) || defined(POSTBOX_JOB_ONLY)
     const bool PostboxMode = ManualMapped && RegistryPath != nullptr;
 #else
     const bool PostboxMode = false;
 #endif
 
-    // F1 Job-post: the loader passes a PostboxJobConfig instead of the
+    // Job-only build: the loader passes a PostboxJobConfig instead of the
     // persistent PostboxConfig. The magic is the only mode discriminator; both
     // configs carry the image layout at offset 0x58.
 #ifdef POSTBOX_JOB
@@ -146,15 +138,13 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
 #ifdef POSTBOX_JOB_ONLY
         const bool Protected = JobMode &&
             ProtectImageSectionsLayout(
-                &reinterpret_cast<const PostboxJobConfig*>(RegistryPath)->Layout,
-                false /* F1: loader pre-protected; no global IPI */,
-                true  /* F1: verify-only, do not rewrite PTEs */);
+                &reinterpret_cast<const PostboxJobConfig*>(RegistryPath)->Layout);
 #else
         const bool Protected = JobMode
             ? ProtectImageSectionsLayout(
                   &reinterpret_cast<const PostboxJobConfig*>(RegistryPath)->Layout,
-                  false /* F1: loader pre-protected; no global IPI */,
-                  true  /* F1: verify-only, do not rewrite PTEs */)
+                  false /* loader pre-protected; no global IPI */,
+                  true  /* verify-only; do not rewrite PTEs */)
             : ProtectImageSections((const PostboxConfig*) RegistryPath);
 #endif
 #else
@@ -171,8 +161,9 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
 #endif
 
 #ifndef MANUAL_MAP_ONLY
-    // Step 0: clean the traces of earlier cycles (PiDDB / MmUnloadedDrivers / CI hash bucket / WdFilter
-    // list) before the hook, so Hook() works against pristine state. Skip entirely for a manual map.
+    // Step 0: clean traces from earlier loads (PiDDB / MmUnloadedDrivers / CI hash bucket / WdFilter
+    // list) before this image unlinks itself, so each cleaner sees the loader entry. Skip entirely
+    // for a manual map.
     print(INFO("DriverEntry: step 0 CleanDriverTraces()"));
     if (!ManualMapped) CleanDriverTraces(DriverObject);
 
@@ -184,39 +175,47 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
         CleanExtraTraces(RegistryPath);
 #endif
 
-    // Debug-only self-test: checks the PTE_BASE extraction against the kernel's own MM routines.
-    // Release builds compile this out; both the call and the function are absent
+    // Debug-only self-tests. Release builds compile both the calls and the
+    // verifier functions out.
 #ifdef DEBUG
     print(INFO("DriverEntry: step 0.5 VerifyPteBase()"));
     if (!VerifyPteBase())
         print(ERROR("DriverEntry: VerifyPteBase() failed"));
-#endif
 
-    // Debug-only self-test: runs every hand-written memory path against the kernel's MM routines.
-    // Release builds compile this out; both the call and the function are absent
-#ifdef DEBUG
     print(INFO("DriverEntry: step 0.6 VerifyMemory()"));
-    if (!VerifyMemory()) print(WARN("DriverEntry: VerifyMemory() reported failures (see output above)"));
-#endif
+    if (!VerifyMemory())
+        print(WARN("DriverEntry: VerifyMemory() reported failures (see output above)"));
 
-    // Debug-only self-test: the pre-start ntoskrnl data-export cache must match the
-    // import slots, and the SEED-XOR name decode must recover the plaintext.
-#ifdef DEBUG
+    // The pre-start data-export cache must match the import slots, and the
+    // SEED-XOR name decode must recover the plaintext.
     print(INFO("DriverEntry: step 0.7 VerifyMemSetPreStartNtoskrnl()"));
     if (!VerifyMemSetPreStartNtoskrnl((uint64_t) (uintptr_t) GetNtoskrnl()))
         print(ERROR("DriverEntry: VerifyMemSetPreStartNtoskrnl() failed"));
-#endif
 
-    // Debug-only self-test: EPROCESS/module enumeration against the kernel anchors.
-#ifdef DEBUG
+    // EPROCESS/module enumeration against the kernel anchors.
     print(INFO("DriverEntry: step 0.8 VerifyProcessEnumeration()"));
     if (!VerifyProcessEnumeration())
         print(ERROR("DriverEntry: VerifyProcessEnumeration() failed"));
 #endif
 
-    // DV-57: live EPROCESS/PEB layout check; fail closed if the target build
-    // does not match the pinned 19041 offsets. The job-only build performs the
-    // equivalent check inside PostboxRunJobs from its PsGetCurrentProcess import.
+#ifdef POSTBOX_CHANNEL
+    // Resolve the nt data exports before VerifyProcessLayout reads the System
+    // process. This keeps the product image free of the PsInitialSystemProcess
+    // import slot while preserving the pre-start layout check.
+    if (PostboxMode)
+    {
+        const auto* PostboxCfg = (const PostboxConfig*) RegistryPath;
+        uint32_t ConfigError = 0;
+        if (!PostboxConfigValid(*PostboxCfg, &ConfigError))
+            return static_cast<win::ntstatus>(
+                0xC0000000u | (ConfigError ? ConfigError : 30u));
+        MemSetPreStartNtoskrnl(PostboxCfg->Layout.NtoskrnlBase);
+    }
+#endif
+
+    // EPROCESS/PEB layout check; fail closed if the target build does not match
+    // the pinned 19041 offsets. The job-only build performs the equivalent check
+    // inside PostboxRunJobs from its PsGetCurrentProcess import.
 #ifndef POSTBOX_JOB_ONLY
     print(INFO("DriverEntry: step 0.8b VerifyProcessLayout()"));
     if (!VerifyProcessLayout())
@@ -235,7 +234,7 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
 #endif
 
     // The persistent Postbox channel starts at step 6, after the image and the
-    // loader state are fully set up. The legacy shared-memory channel is gone.
+    // loader state are fully set up.
 
     // The dedicated mapping table (compile-time switch in Mem.cpp). If linking fails at runtime the
     // table stays unlinked and mappings search the page tables as usual
@@ -284,35 +283,15 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
         print(ERROR("DriverEntry: UnlinkDriverFromModuleList failed, driver may still be visible"));
 #endif
 
-    // Hide the driver object itself, so \Driver walks see neither the module nor the object.
-    // TEMPORARY: disabled while testing SCM status. Leaving the object in \Driver lets SCM report
-    // the service as RUNNING. Restore this block when object hiding is required.
-    // if (DriverObject)
-    // {
-    //     print(INFO("DriverEntry: step 4 HideDriverObject()"));
-    //     bool Hidden = HideDriverObject(DriverObject);
-    //     if (!Hidden)
-    //         print(ERROR("DriverEntry: HideDriverObject failed, driver object may remain visible"));
-    //
-    // #ifdef DEBUG
-    //     if (Hidden && !VerifyHideDriverObject(DriverObject, true))
-    //         print(ERROR("DriverEntry: step 4 hide verification failed"));
-    // #endif
-    // }
-
-    // Step 5: remove the PE headers only for a manual map. The normal loader still parses the image
-    // header after DriverEntry returns: IopLoadDriver -> MiFreeDriverInitialization -> MiSnapDriverRange
-    // calls RtlImageNtHeader, and erasing the header here makes that path bugcheck 0x7E (0xC0000005).
-    // A manual map has no loader entry and no IopLoadDriver cleanup, so it is safe to erase.
-    // The mapper zeroes the PE headers in the local image before publishing, so the
-    // mapped header page is already empty. Do not call ErasePeHeader here: it clears
-    // CR0.WP to rewrite an already-zero page, which is a deterministic CR0-write VM
-    // exit and a redundant artifact.
+    // Step 5: do not erase the PE header. The normal loader calls
+    // RtlImageNtHeader after DriverEntry, so erasing it would bugcheck 0x7E. A
+    // manual map is published headerless, so ErasePeHeader would only add a
+    // redundant CR0.WP write.
     print(INFO("DriverEntry: step 5 ErasePeHeader() skipped (mapper publishes headerless)"));
 
-    // Step 6: F1 Job-post runs the batch inline and returns. No timer, DPC,
-    // work item, thread, or state page is created; the loader frees the image
-    // as soon as the entry returns.
+    // Step 6: the job-only batch runs inline and returns. No timer, DPC, work
+    // item, thread, or state page is created; the loader frees the image as soon
+    // as the entry returns.
 #ifdef POSTBOX_JOB
     if (JobMode)
     {
@@ -329,9 +308,9 @@ win::ntstatus DriverEntry(win::DRIVER_OBJECT* DriverObject, win::UNICODE_STRING*
     }
 #endif
 
-    // Step 6: arm the Postbox timer only after the image, the trace cleanup and the PEB
-    // header work are done. This removes the window where a work item could run against a
-    // half-initialized image (and, with MAPPED_SAFE=OFF, before LinkMapTable).
+    // Step 6: arm the Postbox timer only after the image, trace cleanup, and PE-header
+    // handling are complete. This removes the window where a work item could run
+    // against a half-initialized image.
 #ifdef POSTBOX_CHANNEL
     print(INFO("DriverEntry: step 6 PostboxStart()"));
     if (!PostboxMode || !PostboxStart((const PostboxConfig*) RegistryPath))

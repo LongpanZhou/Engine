@@ -8,27 +8,28 @@
 constexpr uint64_t POSTBOX_BUILD_HASH = 0x9061d574d28ac4b2ull;   // FNV-1a of Driver.sys
 #endif
 
-// Postbox: the driver <-> client mailbox described in out/research/AC-25_channel.md.
+// Postbox: driver <-> client mailbox protocol.
 //
 // The client owns one private committed page (or a heap block). The driver reads and
-// writes it through the target CR3; there is no section, handle, name, or dedicated
-// thread on the kernel side. One request is outstanding at a time:
+// writes it through the target CR3; the kernel side has no section or name. One
+// request is outstanding at a time:
 //
 //   client: fill Op/Pid/Address/Size and the body, derive/seal, then Seq++ (release)
-//   driver: poll on its timer, verify the tag, execute, write Mac/Status/Ack = Seq
+//   driver: poll on its event or timer, verify the tag, execute, write Mac/Status/Ack = Seq
 //   client: wait for Ack == Seq, verify the response tag, then read Status and the body
 //
-// Version 3 uses ChaCha20 for Op/Pid/Size/Address and the body, and 128-bit SipHash-2-4
-// tags for requests/responses. The client CSPRNG key reaches the loader through the PBX1 section
-// handoff; the driver derives and wipes. This is authenticated transport, not a trust
-// boundary against a kernel AC or an in-process DLL.
+// ChaCha20 seals the 0x38-byte control block (Seq..BufferVa) and the body; 128-bit
+// SipHash-2-4 tags authenticate requests and responses. The client CSPRNG key reaches
+// the loader through the PBX1 section handoff; the driver derives and wipes it. This is
+// authenticated transport, not a trust boundary against a kernel AC or an in-process DLL.
 //
 // The opt-in POSTBOX_NMI build adds a constructed-IDT NMI gate (Driver/PostboxNmi.*)
 // and the pb_nmi op; it does not change the mailbox or config layout.
 
-constexpr uint32_t PostboxBytes = 0x10000;          // 64 KiB mailbox
-constexpr uint32_t PostboxDataAt = 0x40;            // body starts after the header
-constexpr uint32_t PostboxDataMax = PostboxBytes - PostboxDataAt;
+// The mailbox is only the sealed control block. The body
+// is transferred through a caller-owned buffer named by PostboxHeader.BufferVa.
+constexpr uint32_t PostboxDataMax = 0x3FC0;          // max body bytes per request (16 KiB - 0x40)
+constexpr uint32_t PostboxDataAt = 0x48;             // control block size
 
 enum PostboxOp : uint32_t
 {
@@ -92,7 +93,7 @@ struct PostboxNmiStatus
     uint64_t PsLoadedModuleList;
     uint64_t ApcNeutralized;
     uint64_t ThreadStartSpoofed;
-    // T0+ probe evidence: live KDPC fields and the detached DPC entry.
+    // probe evidence: live KDPC fields and the detached DPC entry.
     uint64_t DpcDeferredRoutine;
     uint64_t DpcDeferredContext;
     uint64_t DpcEntry;
@@ -130,21 +131,25 @@ static_assert(sizeof(PostboxStackProbeResult) == 0x78, "stack probe result ABI c
 // 8-byte aligned. Packing this struct would make the atomic accesses unaligned.
 struct alignas(8) PostboxHeader
 {
-    volatile uint32_t Seq;          // client increments after a request is written
-    volatile uint32_t Ack;          // driver sets to Seq when the request is done
-    volatile int32_t Status;        // NTSTATUS of the last request
-    uint32_t Op;                    // PostboxOp
-    uint32_t Pid;                   // client-side diagnostic; ignored by the driver
-    uint32_t Size;                  // bytes in the body
-    uint64_t Address;               // target VA for read/write
-    uint64_t Nonce;                 // per-request 64-bit counter (MAC/cipher input)
-    uint8_t Mac[16];                // 128-bit SipHash-2-4 tag
-    uint64_t SessionId;             // per-session random ID (was Reserved[8])
+    volatile uint32_t Seq;          // sealed: client request sequence
+    volatile uint32_t Ack;          // sealed: driver response sequence
+    volatile int32_t Status;        // sealed: NTSTATUS of the last request
+    uint32_t Op;                    // sealed: PostboxOp
+    uint32_t Pid;                   // sealed: client diagnostic; ignored by the driver
+    uint32_t Size;                  // sealed: bytes in the body
+    uint64_t Address;               // sealed: target VA for read/write
+    uint64_t Nonce;                 // sealed: per-request counter
+    uint64_t SessionId;             // sealed: per-session random ID
+    uint64_t BufferVa;              // sealed: caller-owned body buffer
+    uint8_t Mac[16];                // 128-bit SipHash-2-4 tag over ciphertext+body
 };
 
-static_assert(sizeof(PostboxHeader) == PostboxDataAt, "header must end at the body");
+constexpr uint32_t PostboxBytes = sizeof(PostboxHeader);
+static_assert(sizeof(PostboxHeader) == PostboxDataAt, "control block must be 0x48 bytes");
 static_assert((offsetof(PostboxHeader, Seq) % 4) == 0, "Seq must be 4-byte aligned");
 static_assert((offsetof(PostboxHeader, Address) % 8) == 0, "Address must be 8-byte aligned");
+static_assert(offsetof(PostboxHeader, BufferVa) == 0x30, "BufferVa offset changed");
+static_assert(offsetof(PostboxHeader, Mac) == 0x38, "Mac offset changed");
 
 constexpr uint32_t PostboxConfigMagic = 0x8E2B41D7;   // non-ASCII config tag
 
@@ -214,10 +219,9 @@ struct PostboxConfig
 // loader command line. The section is page-granular and is deleted when the last
 // handle closes.
 //
-// CreateTime is not independently verified by the loader any more (that needed a
-// process handle + GetProcessTimes). The driver re-checks it with
-// PsGetProcessCreateTimeQuadPart before it touches the mailbox (Postbox.cpp), so
-// a forged record only fails PostboxStart.
+// The loader does not verify CreateTime against the client process. The driver
+// re-checks it with PsGetProcessCreateTimeQuadPart before it touches the mailbox
+// (Postbox.cpp), so a forged record only fails PostboxStart.
 constexpr uint32_t PostboxSectionHandoffMagic = 0x31584250;   // "PBX1"
 constexpr uint32_t PostboxSectionHandoffVersion = 2;
 constexpr uint32_t PostboxSectionBytes = 0x1000;              // one page
@@ -241,7 +245,7 @@ struct alignas(8) PostboxSectionHandoff
     uint32_t Reserved;              // PostboxSectionState* handshake state
     uint64_t MailboxVa;             // user VA of the mailbox (8-byte aligned)
     uint64_t SessionId;             // per-session random ID
-    uint64_t CreateTime;            // client process creation time, diagnostic
+    uint64_t CreateTime;            // client process creation time (copied to PostboxConfig)
     uint8_t Key[32];                // master key; zero until LOADER_READY
 };
 static_assert(sizeof(PostboxSectionHandoff) == 0x48, "PostboxSectionHandoff layout changed");
@@ -315,8 +319,7 @@ inline uint32_t PostboxResponseBodyLen(int32_t Status, uint32_t Op, uint32_t Siz
 }
 
 // ---------------------------------------------------------------------------
-// PostboxPollAttached decision rules, extracted so the host tests can exercise
-// every branch without a live client mailbox.
+// Pure decision rules for PostboxPollAttached; shared with the host tests.
 // ---------------------------------------------------------------------------
 
 enum class PostboxSeqVerdict
@@ -363,20 +366,35 @@ inline bool PostboxRequestShapeOk(bool KnownOp, bool ZeroBodyOp, uint32_t Op,
     return KnownOp && SizeOk && !(SameSeq && Op != pb_stop);
 }
 
-// Post-MAC read/write range check: the target must be a user VA below
-// MmUserProbeAddress, the size must fit the stage, and a write must not
-// overlap the mailbox header (it would clobber Seq/Ack/Status mid-request).
+// Post-MAC read/write range check: the target and body buffer must be user VAs
+// below MmUserProbeAddress and fit the stage; a write target and the body buffer
+// must not overlap the mailbox header (that would clobber Seq/Ack/Status).
 inline bool PostboxRequestRangeOk(uint32_t Op, uint32_t Size, uint64_t Address,
-                                  uint64_t MailboxVa, uint32_t StageBytes)
+                                  uint64_t BufferVa, uint64_t MailboxVa,
+                                  uint32_t StageBytes)
 {
     if (Op != pb_read && Op != pb_write) return true;
 
-    const bool InRange = Address && Address < PostboxUserLimit && Size <= StageBytes &&
+    const bool SizeOk = Size <= StageBytes;
+    const bool InRange = Address && Address < PostboxUserLimit && SizeOk &&
                          Address <= (PostboxUserLimit - 1 - Size);
+    const bool BufferRange = BufferVa && BufferVa < PostboxUserLimit && SizeOk &&
+                             BufferVa <= (PostboxUserLimit - 1 - Size);
     const bool OverlapsHeader = InRange && Op == pb_write && Size != 0 &&
-                                Address < MailboxVa + PostboxDataAt &&
+                                Address < MailboxVa + PostboxBytes &&
                                 Address + Size > MailboxVa;
-    return InRange && !OverlapsHeader;
+    const bool BufferOverlapsHeader = BufferRange && Size != 0 &&
+                                      BufferVa < MailboxVa + PostboxBytes &&
+                                      BufferVa + Size > MailboxVa;
+    return InRange && BufferRange && !OverlapsHeader && !BufferOverlapsHeader;
+}
+
+inline bool PostboxKeyNonZero(const uint8_t* Key, size_t Size)
+{
+    bool Any = false;
+    for (size_t i = 0; i < Size; ++i)
+        Any |= (Key[i] != 0);
+    return Any;
 }
 
 inline bool PostboxConfigValid(const PostboxConfig& cfg, uint32_t* error = nullptr)
@@ -393,10 +411,7 @@ inline bool PostboxConfigValid(const PostboxConfig& cfg, uint32_t* error = nullp
     if (cfg.MailboxVa > PostboxUserLimit - PostboxBytes || (cfg.MailboxVa & 7))
         return fail();
 
-    bool keyNonZero = false;
-    for (uint32_t i = 0; i < sizeof(cfg.Key); ++i)
-        keyNonZero |= (cfg.Key[i] != 0);
-    if (!keyNonZero) return fail();
+    if (!PostboxKeyNonZero(cfg.Key, sizeof(cfg.Key))) return fail();
 
     if (!cfg.MmAllocateIndependentPages || !cfg.MmSetPageProtection ||
         !cfg.MmFreeIndependentPages)
@@ -407,22 +422,29 @@ inline bool PostboxConfigValid(const PostboxConfig& cfg, uint32_t* error = nullp
 }
 
 // ---------------------------------------------------------------------------
-// F1 Job-post ABI (test-only; POSTBOX_JOB builds).
+// Job-only batch ABI (POSTBOX_JOB builds).
 //
-// One map, one entry, N jobs, one teardown. The loader owns an unnamed
+// One map, one entry, N jobs, one teardown. The controller owns an unnamed
 // pagefile-backed section containing a PostboxJobBatch plus the job data. The
 // driver runs inline in the entry thread (the loader's dummy thread), copies
-// the batch to its stack, executes each job with MmCopyVirtualMemory, writes
-// the result records back, and returns. No timer, DPC, work item, thread, or
-// state page is created. TargetPid == 0 means the current (loader) process.
+// the sealed batch to its stack, opens it, executes each job with
+// MmCopyVirtualMemory, writes the sealed result records back, and returns. No
+// timer, DPC, work item, thread, or state page is created. TargetPid == 0 means
+// the current (loader) process.
+//
+// Version 2 seals the batch and every data region with ChaCha20 and
+// authenticates the ciphertext batch with SipHash-2-4. The master key is the
+// 32-byte Key field; each hop erases its copy once the child key schedule is
+// derived (see PostboxJobCrypto.h). The section never carries plaintext target
+// VAs, sizes, or read/write data.
 // ---------------------------------------------------------------------------
 
 // Non-ASCII tags: the job config/batch must not add a plaintext "PBJ1"/"BJB1"
 // signature to the image or the section.
 constexpr uint32_t PostboxJobConfigMagic = 0x8F3A27C1;
-constexpr uint32_t PostboxJobConfigVersion = 1;
+constexpr uint32_t PostboxJobConfigVersion = 2;
 constexpr uint32_t PostboxJobBatchMagic = 0x9B4D62E5;
-constexpr uint32_t PostboxJobBatchVersion = 1;
+constexpr uint32_t PostboxJobBatchVersion = 2;
 constexpr uint64_t PostboxJobDoneMagic = 0xA7C3E91D5B28F064ull;
 constexpr uint32_t PostboxJobMax = 32;
 constexpr uint32_t PostboxJobMaxBytes = 0x10000;         // per job
@@ -432,7 +454,7 @@ constexpr uint32_t PostboxJobSectionMax = 0x100000;      // 1 MiB
 // the PostboxJobBatch at +0x100, and the data regions after +0x1000. The child
 // loader maps the inherited handle and builds the driver config from it.
 constexpr uint32_t PostboxJobSectionMagic = 0x8C4E71B3;
-constexpr uint32_t PostboxJobSectionVersion = 1;
+constexpr uint32_t PostboxJobSectionVersion = 2;
 constexpr uint32_t PostboxJobSectionHeaderBytes = 0x100;
 constexpr uint32_t PostboxJobSectionBatchOffset = 0x100;
 
@@ -446,8 +468,8 @@ struct PostboxJobSectionHeader
     uint64_t TargetPid;             // nonzero; controller or game process
     uint64_t TargetCreateTime;      // nonzero
     uint64_t Nonce;                 // matches the batch/config
-    uint8_t Key[32];                // SipHash-2-4 key in [0..15]
-    uint64_t Mac;                   // SipHash-2-4 over the batch
+    uint8_t Key[32];                // master key; child zeroes after load
+    uint64_t Mac;                   // SipHash-2-4 over the sealed batch
     uint8_t Reserved[0x100 - 0x58];
 };
 static_assert(sizeof(PostboxJobSectionHeader) == 0x100,
@@ -477,11 +499,11 @@ struct PostboxJobBatch
     uint32_t Magic;                 // PostboxJobBatchMagic
     uint32_t Version;               // PostboxJobBatchVersion
     uint32_t Count;                 // 1..PostboxJobMax
-    uint32_t Flags;                 // must be 0
+    uint32_t Flags;                 // must be 0 in a request
     uint64_t TargetPid;             // 0 = current process
     uint64_t TargetCreateTime;      // 0 = do not verify
     uint64_t Nonce;                 // must match the config
-    uint64_t Reserved;
+    uint64_t Reserved;              // input 0; PostboxJobDoneMagic in a result
     PostboxJobRecord Jobs[PostboxJobMax];
 };
 static_assert(sizeof(PostboxJobBatch) == 0x530, "job batch ABI changed");
@@ -500,11 +522,11 @@ struct PostboxJobConfig
     uint64_t TargetPid;             // 0 = current process
     uint64_t TargetCreateTime;      // 0 = do not verify
     uint64_t Nonce;                 // binds this config to the batch
-    uint8_t Key[32];                // SipHash-2-4 key in [0..15]; [16..31] zero
+    uint8_t Key[32];                // master key; driver derives and wipes
     PostboxImageLayout Layout;      // loader-built image section map
-    uint64_t Mac;                   // SipHash-2-4(Key, input PostboxJobBatch)
-    // DV-17: the loader resolves these seven nt exports and passes their
-    // addresses. The job-only driver has no export-name table/resolver.
+    uint64_t Mac;                   // SipHash-2-4 over the sealed PostboxJobBatch
+    // The loader resolves these seven nt exports and passes their addresses.
+    // The job-only driver has no export-name table/resolver.
     uint64_t Imports[7];            // PsGetCurrentProcess, PsLookupProcessByProcessId,
                                     // ObDereferenceObject, MmCopyVirtualMemory,
                                     // PsAcquire/ReleaseProcessExitSynchronization,
@@ -523,10 +545,7 @@ inline bool PostboxJobConfigValid(const PostboxJobConfig& cfg, uint32_t* error =
         return fail();
     if (cfg.Reserved != 0) return fail();
 
-    bool keyNonZero = false;
-    for (uint32_t i = 0; i < 16; ++i)
-        keyNonZero |= (cfg.Key[i] != 0);
-    if (!keyNonZero) return fail();
+    if (!PostboxKeyNonZero(cfg.Key, sizeof(cfg.Key))) return fail();
 
     if (!cfg.SectionVa || !cfg.SectionSize || (cfg.SectionVa & 7)) return fail();
     if (cfg.SectionSize < sizeof(PostboxJobBatch) || cfg.SectionSize > PostboxJobSectionMax)

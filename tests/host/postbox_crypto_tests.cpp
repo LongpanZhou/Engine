@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
 // Engine-ci/tests/host/postbox_crypto_tests.cpp
 //
-// Host-side unit tests for Engine-ci/Common/PostboxCrypto.h — the
+// Host-side unit tests for Engine-ci/Common/PostboxCrypto.h - the
 // authenticated-mailbox crypto layer (ChaCha20, SipHash-2-4, key schedule,
 // request/response MACs, seal/open helpers, header field accessors).
 //
@@ -25,23 +25,13 @@
 #include <cstring>
 #include <initializer_list>
 
+#include "check.h"
 #include "../../Common/Postbox.h"
 #include "../../Common/PostboxCrypto.h"
 
 // ---------------------------------------------------------------------------
 // Micro harness
 // ---------------------------------------------------------------------------
-
-static unsigned g_Pass = 0;
-static unsigned g_Fail = 0;
-
-static void Report(bool ok, const char* file, unsigned line, const char* expr)
-{
-    if (ok) ++g_Pass;
-    else { ++g_Fail; std::printf("[FAIL] %s:%u  %s\n", file, line, expr); }
-}
-
-#define CHECK(Cond) Report((Cond), __FILE__, __LINE__, #Cond)
 
 static void MakeKeys(pb::PostboxKeys* keys, uint8_t seed)
 {
@@ -62,6 +52,13 @@ struct Canon
     void U64(uint64_t v) { for (unsigned i = 0; i < 8; ++i) Bytes[N++] = static_cast<uint8_t>(v >> (8 * i)); }
     void Raw(const void* p, size_t n) { memcpy(Bytes + N, p, n); N += n; }
 };
+
+// Expected tag from the independent canonical bytes: two SipHash halves.
+static void ExpectedMac(uint8_t (&Out)[16], const pb::PostboxKeys& Keys, const Canon& Input)
+{
+    pb::Store64LE(Out, pb::SipHash24(Keys.SipKey0, Input.Bytes, Input.N));
+    pb::Store64LE(Out + 8, pb::SipHash24(Keys.SipKey1, Input.Bytes, Input.N));
+}
 
 // ===========================================================================
 // 1. Primitive reference vectors
@@ -102,7 +99,7 @@ static void TestSipHashIncremental()
 
 static void TestChaCha20BlockRfc8439()
 {
-    // RFC 8439 section 2.3.2 — ChaCha20 block function test vector:
+    // RFC 8439 section 2.3.2 - ChaCha20 block function test vector:
     // key 00..1F, nonce 00 00 00 09 00 00 00 4A 00 00 00 00, counter 1.
     // This is the independent check for the quarter-round and state layout.
     const uint8_t key[32] = {
@@ -139,8 +136,8 @@ static void TestChaChaBlocksFor()
     CHECK(pb::ChaCha20BlocksFor(63) == 1);
     CHECK(pb::ChaCha20BlocksFor(64) == 1);
     CHECK(pb::ChaCha20BlocksFor(65) == 2);
-    CHECK(pb::ChaCha20BlocksFor(pb::kMaxBodyBytes) == pb::kMaxBodyBlocks);   // 1023
-    CHECK(pb::kMaxBodyBlocks == 1023);
+    CHECK(pb::ChaCha20BlocksFor(pb::kMaxBodyBytes) == pb::kMaxBodyBlocks);   // 255
+    CHECK(pb::kMaxBodyBlocks == 255);
 }
 
 static void TestChaChaCounterWrap()
@@ -157,10 +154,7 @@ static void TestChaChaCounterWrap()
     CHECK(pb::ChaCha20Keystream(out, 512, key, nonce, 0xFFFFFFF8u));
     memset(out, 0xAA, sizeof(out));
     CHECK(!pb::ChaCha20Keystream(out, 512, key, nonce, 0xFFFFFFF9u));
-    bool untouched = true;
-    for (uint32_t i = 0; i < sizeof(out); ++i)
-        if (out[i] != 0xAA) untouched = false;
-    CHECK(untouched);
+    CHECK(AllBytesEqual(out, sizeof(out), 0xAA));
 
     // a single block at the very top of the counter space is valid
     CHECK(pb::ChaCha20Keystream(out, 64, key, nonce, 0xFFFFFFFFu));
@@ -176,10 +170,7 @@ static void TestChaChaXorWrapReject()
     memset(out, 0xAA, sizeof(out));
 
     CHECK(!pb::ChaCha20Xor(out, 512, key, nonce, 0xFFFFFFF9u));   // 8 blocks wrap
-    bool untouched = true;
-    for (uint32_t i = 0; i < sizeof(out); ++i)
-        if (out[i] != 0xAA) untouched = false;
-    CHECK(untouched);
+    CHECK(AllBytesEqual(out, sizeof(out), 0xAA));
 
     CHECK(!pb::ChaCha20Xor(out, 128, key, nonce, 0xFFFFFFFFu));   // 2 blocks wrap
     CHECK(pb::ChaCha20Xor(out, 0, key, nonce, 0xFFFFFFFFu));      // zero length ok
@@ -226,10 +217,7 @@ static void TestDerivePostboxKeys()
     pb::DerivePostboxKeys(&k1, master);
 
     // the master is wiped in place, all 32 bytes
-    bool wiped = true;
-    for (uint32_t i = 0; i < 32; ++i)
-        if (master[i] != 0) wiped = false;
-    CHECK(wiped);
+    CHECK(AllBytesZero(master, sizeof(master)));
 
     // deterministic: same master -> identical subkeys
     pb::DerivePostboxKeys(&k1again, masterCopy);
@@ -273,6 +261,35 @@ static void TestWipePostboxKeys()
     CHECK(memcmp(&keys, zero, sizeof(keys)) != 0);   // non-zero before the wipe
     pb::WipePostboxKeys(&keys);
     CHECK(memcmp(&keys, zero, sizeof(keys)) == 0);   // and zero after
+}
+
+static void TestMaskPostboxKeys()
+{
+    pb::PostboxKeys keys{}, original{};
+    MakeKeys(&keys, 0x51);
+    memcpy(&original, &keys, sizeof(keys));
+
+    const uint64_t sessionId = 0x1122'3344'5566'7788ull;
+    pb::MaskPostboxKeys(&keys, sessionId);
+    CHECK(memcmp(&keys, &original, sizeof(keys)) != 0);   // masked at rest
+
+    // The same session id reverses the transform exactly.
+    pb::MaskPostboxKeys(&keys, sessionId);
+    CHECK(memcmp(&keys, &original, sizeof(keys)) == 0);
+
+    // A different session id does not.
+    pb::MaskPostboxKeys(&keys, sessionId);
+    pb::MaskPostboxKeys(&keys, sessionId ^ 1);
+    CHECK(memcmp(&keys, &original, sizeof(keys)) != 0);
+
+    // A zero session id is still a valid, non-identity mask.
+    pb::PostboxKeys zeroSession = original;
+    pb::MaskPostboxKeys(&zeroSession, 0);
+    CHECK(memcmp(&zeroSession, &original, sizeof(zeroSession)) != 0);
+
+    pb::WipePostboxKeys(&keys);
+    pb::WipePostboxKeys(&original);
+    pb::WipePostboxKeys(&zeroSession);
 }
 
 // ===========================================================================
@@ -319,24 +336,20 @@ static void TestSealOpenHeaderAndBody()
     CHECK(pb::OpenRequestBody(body, sizeof(body), keys, sessionId, nonce64));
     CHECK(memcmp(body, plain, sizeof(body)) == 0);
 
-    // header: ONLY the 20 bytes at 0x0C..0x1F are sealed. Fill every byte so a
-    // wrong cipher offset/length (e.g. sealing into the Nonce) is caught.
+    // the whole 0x38-byte control plaintext is sealed; only the
+    // 16-byte tag at 0x38..0x47 stays in the clear.
     uint8_t header[pb::kHeaderBytes];
     for (uint32_t i = 0; i < sizeof(header); ++i) header[i] = static_cast<uint8_t>(i * 3 + 1);
     uint8_t headerPlain[pb::kHeaderBytes];
     memcpy(headerPlain, header, sizeof(header));
 
     CHECK(pb::SealRequestHeader(header, keys, sessionId, nonce64));
-    bool lowUnchanged = true, highUnchanged = true, cipherChanged = false;
-    for (uint32_t i = 0; i < pb::kHeaderCipherOffset; ++i)
-        if (header[i] != headerPlain[i]) lowUnchanged = false;
-    for (uint32_t i = pb::kNonceOffset; i < sizeof(header); ++i)
-        if (header[i] != headerPlain[i]) highUnchanged = false;
-    for (uint32_t i = pb::kHeaderCipherOffset; i < pb::kNonceOffset; ++i)
-        if (header[i] != headerPlain[i]) cipherChanged = true;
-    CHECK(lowUnchanged);      // Seq/Ack/Status untouched
-    CHECK(highUnchanged);     // Nonce/Mac/SessionId untouched
-    CHECK(cipherChanged);     // Op/Pid/Size/Address sealed
+    const bool tagUnchanged =
+        memcmp(header + pb::kMacOffset, headerPlain + pb::kMacOffset,
+               sizeof(header) - pb::kMacOffset) == 0;
+    const bool controlChanged = memcmp(header, headerPlain, pb::kMacOffset) != 0;
+    CHECK(tagUnchanged);      // Mac/tag stays in the clear
+    CHECK(controlChanged);    // Seq..BufferVa sealed
 
     CHECK(pb::OpenRequestHeader(header, keys, sessionId, nonce64));
     CHECK(memcmp(header, headerPlain, sizeof(header)) == 0);
@@ -375,7 +388,7 @@ static void TestSealOpenWrongNonceFails()
 
 static void TestSealOpenMaxBody()
 {
-    // The protocol's maximum body: 0xFFC0 bytes = 1023 ChaCha blocks.
+    // The protocol's maximum body: 0x3FC0 bytes = 255 ChaCha blocks.
     static uint8_t body[pb::kMaxBodyBytes];
     for (uint32_t i = 0; i < pb::kMaxBodyBytes; ++i)
         body[i] = static_cast<uint8_t>(i * 13 + 7);
@@ -446,10 +459,7 @@ static void TestMac128FinalWipesState()
     pb::Mac128Final(&s, tag);
     const uint8_t zero[sizeof(s)] = {};
     CHECK(memcmp(&s, zero, sizeof(s)) == 0);         // state wiped
-    bool tagNonZero = false;
-    for (uint32_t i = 0; i < 16; ++i)
-        if (tag[i] != 0) tagNonZero = true;
-    CHECK(tagNonZero);
+    CHECK(AnyByteNonZero(tag, sizeof(tag)));
 }
 
 // ===========================================================================
@@ -485,6 +495,25 @@ static RequestFixture MakeRequestFixture()
     return f;
 }
 
+// Independent request canonical input for a given body length. A read request
+// passes 0 and does not append the body.
+static Canon EncodeRequestCanon(const RequestFixture& f, uint32_t BodyLen)
+{
+    Canon C;
+    C.U8(pb::kMacRequestDomainVersion);              // 0x11
+    C.U8(0);                                         // flags
+    C.U16(0);                                        // reserved
+    C.U64(f.SessionId);
+    C.U32(f.Seq);
+    C.U64(f.Nonce64);
+    C.U32(BodyLen);
+    C.U32(pb::kHeaderCipherBytes);                   // headerLen = 0x38
+    C.Raw(f.Header + pb::kHeaderCipherOffset, pb::kHeaderCipherBytes);
+    if (BodyLen)
+        C.Raw(f.Body, BodyLen);
+    return C;
+}
+
 static void TestMacRequestCanonicalBytes()
 {
     // Independently encode the canonical request input from the spec in
@@ -494,21 +523,9 @@ static void TestMacRequestCanonicalBytes()
     // MacRequestInit cannot pass.
     RequestFixture f = MakeRequestFixture();
 
-    Canon canon;
-    canon.U8(pb::kMacRequestDomainVersion);          // 0x11
-    canon.U8(0);                                     // flags
-    canon.U16(0);                                    // reserved
-    canon.U64(f.SessionId);
-    canon.U32(f.Seq);
-    canon.U64(f.Nonce64);
-    canon.U32(sizeof(f.Body));                       // bodyLen (pb_write)
-    canon.U32(pb::kHeaderCipherBytes);               // headerLen = 20
-    canon.Raw(f.Header + pb::kHeaderCipherOffset, pb::kHeaderCipherBytes);
-    canon.Raw(f.Body, sizeof(f.Body));
-
+    const Canon canon = EncodeRequestCanon(f, sizeof(f.Body));
     uint8_t expected[16];
-    pb::Store64LE(expected, pb::SipHash24(f.Keys.SipKey0, canon.Bytes, canon.N));
-    pb::Store64LE(expected + 8, pb::SipHash24(f.Keys.SipKey1, canon.Bytes, canon.N));
+    ExpectedMac(expected, f.Keys, canon);
 
     uint8_t tag[16];
     pb::MacRequestTag(tag, f.Keys, f.SessionId, f.Seq, f.Nonce64, pb_write,
@@ -516,19 +533,9 @@ static void TestMacRequestCanonicalBytes()
     CHECK(memcmp(tag, expected, 16) == 0);
 
     // a read request must use bodyLen 0 in the canonical input
-    Canon readCanon;
-    readCanon.U8(pb::kMacRequestDomainVersion);
-    readCanon.U8(0);
-    readCanon.U16(0);
-    readCanon.U64(f.SessionId);
-    readCanon.U32(f.Seq);
-    readCanon.U64(f.Nonce64);
-    readCanon.U32(0);
-    readCanon.U32(pb::kHeaderCipherBytes);
-    readCanon.Raw(f.Header + pb::kHeaderCipherOffset, pb::kHeaderCipherBytes);
+    const Canon readCanon = EncodeRequestCanon(f, 0);
     uint8_t expectedRead[16];
-    pb::Store64LE(expectedRead, pb::SipHash24(f.Keys.SipKey0, readCanon.Bytes, readCanon.N));
-    pb::Store64LE(expectedRead + 8, pb::SipHash24(f.Keys.SipKey1, readCanon.Bytes, readCanon.N));
+    ExpectedMac(expectedRead, f.Keys, readCanon);
     uint8_t readTag[16];
     pb::MacRequestTag(readTag, f.Keys, f.SessionId, f.Seq, f.Nonce64, pb_read,
                       f.Header, f.Body, sizeof(f.Body));
@@ -597,6 +604,9 @@ static void TestMacResponseCanonicalBytes()
     const int32_t status = 0;
     const uint64_t nonce64 = 0x42;
     uint8_t body[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint8_t responseHeader[pb::kHeaderBytes] = {};
+    for (uint32_t i = 0; i < sizeof(responseHeader); ++i)
+        responseHeader[i] = static_cast<uint8_t>(i + 0x40);
 
     Canon canon;
     canon.U8(pb::kMacResponseDomainVersion);         // 0x21
@@ -608,15 +618,15 @@ static void TestMacResponseCanonicalBytes()
     canon.U32(static_cast<uint32_t>(status));
     canon.U64(nonce64);
     canon.U32(sizeof(body));
+    canon.Raw(responseHeader, pb::kHeaderCipherBytes);
     canon.Raw(body, sizeof(body));
 
     uint8_t expected[16];
-    pb::Store64LE(expected, pb::SipHash24(keys.SipKey0, canon.Bytes, canon.N));
-    pb::Store64LE(expected + 8, pb::SipHash24(keys.SipKey1, canon.Bytes, canon.N));
+    ExpectedMac(expected, keys, canon);
 
     uint8_t tag[16];
     pb::MacResponseTag(tag, keys, sessionId, seq, ack, status, nonce64, pb_read,
-                       body, sizeof(body));
+                       responseHeader, body, sizeof(body));
     CHECK(memcmp(tag, expected, 16) == 0);
 
     // request and response domains differ (direction confusion fails even
@@ -639,47 +649,49 @@ static void TestMacResponseCoverage()
     const uint64_t nonce64 = 0x77;
     uint8_t body[8] = {1,2,3,4,5,6,7,8};
     uint8_t body2[8] = {9,9,9,9,9,9,9,9};
+    uint8_t zeroHeader[pb::kHeaderBytes] = {};
 
     // status is covered
     uint8_t okTag[16], failTag[16];
     pb::MacResponseTag(okTag, keys, sessionId, seq, ack, status, nonce64, pb_read,
-                       body, sizeof(body));
+                       zeroHeader, body, sizeof(body));
     pb::MacResponseTag(failTag, keys, sessionId, seq, ack,
                        static_cast<int32_t>(0xC000'0005u), nonce64, pb_read,
-                       body, sizeof(body));
+                       zeroHeader, body, sizeof(body));
     CHECK(!pb::Mac128Equal(okTag, failTag));
 
     // ack is covered
     uint8_t ackTag[16];
     pb::MacResponseTag(ackTag, keys, sessionId, seq, ack + 1, status, nonce64, pb_read,
-                       body, sizeof(body));
+                       zeroHeader, body, sizeof(body));
     CHECK(!pb::Mac128Equal(okTag, ackTag));
 
     // pb_read and pb_nmi cover the body; pb_ping does not
     uint8_t readA[16], readB[16], nmiA[16], nmiB[16], pingA[16], pingB[16];
-    pb::MacResponseTag(readA, keys, sessionId, seq, ack, status, nonce64, pb_read, body, 8);
-    pb::MacResponseTag(readB, keys, sessionId, seq, ack, status, nonce64, pb_read, body2, 8);
+    pb::MacResponseTag(readA, keys, sessionId, seq, ack, status, nonce64, pb_read, zeroHeader, body, 8);
+    pb::MacResponseTag(readB, keys, sessionId, seq, ack, status, nonce64, pb_read, zeroHeader, body2, 8);
     CHECK(!pb::Mac128Equal(readA, readB));
 
-    pb::MacResponseTag(nmiA, keys, sessionId, seq, ack, status, nonce64, pb_nmi, body, 8);
-    pb::MacResponseTag(nmiB, keys, sessionId, seq, ack, status, nonce64, pb_nmi, body2, 8);
+    pb::MacResponseTag(nmiA, keys, sessionId, seq, ack, status, nonce64, pb_nmi, zeroHeader, body, 8);
+    pb::MacResponseTag(nmiB, keys, sessionId, seq, ack, status, nonce64, pb_nmi, zeroHeader, body2, 8);
     CHECK(!pb::Mac128Equal(nmiA, nmiB));
 
-    pb::MacResponseTag(pingA, keys, sessionId, seq, ack, status, nonce64, pb_ping, body, 8);
-    pb::MacResponseTag(pingB, keys, sessionId, seq, ack, status, nonce64, pb_ping, body2, 8);
+    pb::MacResponseTag(pingA, keys, sessionId, seq, ack, status, nonce64, pb_ping, zeroHeader, body, 8);
+    pb::MacResponseTag(pingB, keys, sessionId, seq, ack, status, nonce64, pb_ping, zeroHeader, body2, 8);
     CHECK(pb::Mac128Equal(pingA, pingB));
 
     // pb_nmi coverage must equal the manual composition with bodyLen 8
     uint8_t manual[16];
     pb::Mac128State m;
     pb::MacResponseInit(&m, keys, sessionId, seq, ack, status, nonce64, 8);
+    pb::MacResponseHeader(&m, zeroHeader);
     pb::MacResponseBody(&m, body, 8);
     pb::Mac128Final(&m, manual);
     CHECK(memcmp(nmiA, manual, 16) == 0);
 }
 
 // ===========================================================================
-// 8. Header accessors — LE round trips
+// 8. Header accessors - LE round trips
 // ===========================================================================
 
 static void TestHeaderAccessors()
@@ -731,7 +743,7 @@ static void TestHeaderAccessors()
 static void TestAbiContracts()
 {
     CHECK(sizeof(pb::PostboxKeys) == 64);
-    CHECK(sizeof(PostboxHeader) == 0x40);
+    CHECK(sizeof(PostboxHeader) == 0x48);
     CHECK(sizeof(PostboxSectionHandoff) == 0x48);
     CHECK(sizeof(PostboxConfig) == 0x110);
     CHECK(sizeof(PostboxImageLayout) == 0xB0);
@@ -798,21 +810,22 @@ static void TestPollDecisionRules()
 
     // post-MAC range: user VA bound, stage bound, write/header overlap
     const uint64_t Mailbox = 0x10000;
-    CHECK(PostboxRequestRangeOk(pb_ping, 0, 0, Mailbox, Stage));
-    CHECK(!PostboxRequestRangeOk(pb_read, 4, 0, Mailbox, Stage));
-    CHECK(PostboxRequestRangeOk(pb_read, 4, 0x1000, Mailbox, Stage));
-    CHECK(!PostboxRequestRangeOk(pb_read, 4, PostboxUserLimit, Mailbox, Stage));
-    CHECK(!PostboxRequestRangeOk(pb_read, Stage + 1, 0x1000, Mailbox, Stage));
+    const uint64_t Body = 0x20000;
+    CHECK(PostboxRequestRangeOk(pb_ping, 0, 0, Body, Mailbox, Stage));
+    CHECK(!PostboxRequestRangeOk(pb_read, 4, 0, Body, Mailbox, Stage));
+    CHECK(PostboxRequestRangeOk(pb_read, 4, 0x1000, Body, Mailbox, Stage));
+    CHECK(!PostboxRequestRangeOk(pb_read, 4, PostboxUserLimit, Body, Mailbox, Stage));
+    CHECK(!PostboxRequestRangeOk(pb_read, Stage + 1, 0x1000, Body, Mailbox, Stage));
 
     // strict bound: Address + Size must stay below PostboxUserLimit
-    CHECK(PostboxRequestRangeOk(pb_read, 1, PostboxUserLimit - 2, Mailbox, Stage));
-    CHECK(!PostboxRequestRangeOk(pb_read, 1, PostboxUserLimit - 1, Mailbox, Stage));
+    CHECK(PostboxRequestRangeOk(pb_read, 1, PostboxUserLimit - 2, Body, Mailbox, Stage));
+    CHECK(!PostboxRequestRangeOk(pb_read, 1, PostboxUserLimit - 1, Body, Mailbox, Stage));
 
-    // a write overlapping the 0x40-byte header is rejected; a read is not
-    CHECK(!PostboxRequestRangeOk(pb_write, 0x30, 0x10020, Mailbox, Stage));
-    CHECK(PostboxRequestRangeOk(pb_read, 0x30, 0x10020, Mailbox, Stage));
-    CHECK(PostboxRequestRangeOk(pb_write, 0x20, Mailbox - 0x20, Mailbox, Stage));
-    CHECK(!PostboxRequestRangeOk(pb_write, 0x21, Mailbox - 0x20, Mailbox, Stage));
+    // a write overlapping the 0x48-byte control block is rejected; a read is not
+    CHECK(!PostboxRequestRangeOk(pb_write, 0x30, 0x10020, Body, Mailbox, Stage));
+    CHECK(PostboxRequestRangeOk(pb_read, 0x30, 0x10020, Body, Mailbox, Stage));
+    CHECK(PostboxRequestRangeOk(pb_write, 0x20, Mailbox - 0x20, Body, Mailbox, Stage));
+    CHECK(!PostboxRequestRangeOk(pb_write, 0x21, Mailbox - 0x20, Body, Mailbox, Stage));
 }
 
 static void TestPageFlagsMergeAndBodyLengths()
@@ -846,9 +859,9 @@ static void TestPageFlagsMergeAndBodyLengths()
 static void TestProtocolConstants()
 {
     // Postbox.h constants the driver and the loader both depend on.
-    CHECK(PostboxBytes == 0x10000);
-    CHECK(PostboxDataAt == 0x40);
-    CHECK(PostboxDataMax == 0xFFC0);
+    CHECK(PostboxBytes == 0x48);
+    CHECK(PostboxDataAt == 0x48);
+    CHECK(PostboxDataMax == 0x3FC0);
     CHECK(PostboxSectionBytes == 0x1000);
     CHECK(PostboxSectionHandoffVersion == 2);
     CHECK(PostboxLayoutVersion == 1);
@@ -872,15 +885,16 @@ static void TestProtocolConstants()
     CHECK(PostboxSectionStatePublishing == 4);
     CHECK(PostboxSectionStateWithdrawn == 5);
 
-    CHECK(pb::kHeaderBytes == 0x40);
-    CHECK(pb::kHeaderCipherOffset == 0x0C);
-    CHECK(pb::kHeaderCipherBytes == 20);
+    CHECK(pb::kHeaderBytes == 0x48);
+    CHECK(pb::kHeaderCipherOffset == 0x00);
+    CHECK(pb::kHeaderCipherBytes == 0x38);
     CHECK(pb::kNonceOffset == 0x20);
-    CHECK(pb::kMacOffset == 0x28);
+    CHECK(pb::kMacOffset == 0x38);
     CHECK(pb::kMacBytes == 16);
-    CHECK(pb::kSessionIdOffset == 0x38);
-    CHECK(pb::kBodyOffset == 0x40);
-    CHECK(pb::kMaxBodyBlocks == 1023);
+    CHECK(pb::kSessionIdOffset == 0x28);
+    CHECK(pb::kBufferVaOffset == 0x30);
+    CHECK(pb::kBodyOffset == 0x48);
+    CHECK(pb::kMaxBodyBlocks == 255);
 
     // config field offsets the loader writes and the driver reads
     CHECK(offsetof(PostboxConfig, Magic) == 0x00);
@@ -994,6 +1008,7 @@ int main()
     TestDerivePostboxKeys();
     TestDerivePostboxKeysComposition();
     TestWipePostboxKeys();
+    TestMaskPostboxKeys();
     TestNonceConstruction();
 
     TestSealOpenHeaderAndBody();
@@ -1014,7 +1029,5 @@ int main()
     TestPollDecisionRules();
     TestPostboxConfigValid();
 
-    std::printf("\n==== kf_postbox_crypto_tests: %u passed, %u failed ====\n",
-                g_Pass, g_Fail);
-    return g_Fail ? 1 : 0;
+    return Summary("kf_postbox_crypto_tests");
 }

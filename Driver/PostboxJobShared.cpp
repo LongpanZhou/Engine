@@ -1,4 +1,4 @@
-// F1 job-only shared helpers.
+// Job-only shared helpers.
 //
 // Included by main.cpp only for POSTBOX_JOB_ONLY builds. The job-only image has
 // no Postbox channel, PBOX config, mailbox, timer, DPC, work item, NMI
@@ -46,7 +46,7 @@ static bool GetPteForVa(address Va, uint64_t*& Entry)
     uint64_t* Pde = SelfMapEntry(address((uint64_t) (uintptr_t) Pte));
     uint64_t* Pdpte = SelfMapEntry(address((uint64_t) (uintptr_t) Pde));
     uint64_t* Pml4e = SelfMapEntry(address((uint64_t) (uintptr_t) Pdpte));
-    if (!Pml4e || !Pdpte || !Pde || !Pte) return false;
+    if (!Pml4e || !Pdpte || !Pde) return false;
 
     if (!(*Pml4e & 1) || !(*Pdpte & 1) || !(*Pde & 1)) return false;
     if (*Pdpte & (1ull << 7)) return false;       // 1 GB page
@@ -57,30 +57,12 @@ static bool GetPteForVa(address Va, uint64_t*& Entry)
     return true;
 }
 
-static bool SetPageProtection(address Va, bool Write, bool Execute)
+// Image protection verifier: the loader applied the final section map before
+// the entry, so this pass only verifies the split on the entry CPU. It has no
+// PostboxResolve, no PTE write, and no KeIpiGenericCall: the job image carries
+// no export-name table and no global TLB IPI.
+bool ProtectImageSectionsLayout(const PostboxImageLayout* Layout)
 {
-    uint64_t* Entry = nullptr;
-    if (!GetPteForVa(Va, Entry)) return false;
-
-    uint64_t Value = *Entry;
-    if (Write) Value |= 2;
-    else       Value &= ~2ull;
-    if (Execute) Value &= ~(1ull << 63);
-    else         Value |= (1ull << 63);
-
-    __atomic_store_n(Entry, Value, __ATOMIC_RELEASE);
-    invlpg(Va);
-    return true;
-}
-
-// F1 protection pass: the loader applied the final section map before the
-// entry, so this pass only re-applies/verifies the split on the entry CPU. It
-// deliberately has no PostboxResolve and no KeIpiGenericCall: the job image
-// carries no export-name table and no global TLB IPI.
-bool ProtectImageSectionsLayout(const PostboxImageLayout* Layout, bool FlushAllCpus = false,
-                                bool VerifyOnly = true)
-{
-    (void) FlushAllCpus;
     PostboxStartFailure = 20;
     if (!Layout || Layout->Magic != PostboxLayoutMagic ||
         Layout->Version != PostboxLayoutVersion)
@@ -128,12 +110,12 @@ bool ProtectImageSectionsLayout(const PostboxImageLayout* Layout, bool FlushAllC
     for (uint64_t Va = L.ImageBase; Va < End; Va += 0x1000)
     {
         uint32_t Flags = PostboxPageRNx;
+        const uint64_t PageEnd = Va + 0x1000;
         for (uint32_t i = 0; i < L.SectionCount; ++i)
         {
             const PostboxSectionLayout& S = L.Sections[i];
             const uint64_t SecStart = L.ImageBase + S.Rva;
             const uint64_t SecEnd = SecStart + S.Size;
-            const uint64_t PageEnd = Va + 0x1000;
             if (PageEnd <= (SecStart & ~0xFFFull) ||
                 Va >= ((SecEnd + 0xFFF) & ~0xFFFull))
                 continue;
@@ -142,18 +124,9 @@ bool ProtectImageSectionsLayout(const PostboxImageLayout* Layout, bool FlushAllC
 
         const bool Write = (Flags == PostboxPageRwNx);
         const bool Execute = (Flags == PostboxPageRx);
-        if (!VerifyOnly)
-        {
-            if (!SetPageProtection(address(Va), Write, Execute))
-            {
-                print(ERROR("PostboxJob: protect page %p failed"), (void*) (uintptr_t) Va);
-                PostboxStartFailure = 25;
-                return false;
-            }
-        }
 
         uint64_t* Verify = nullptr;
-        if (!GetPteForVa(address(Va), Verify) || !Verify)
+        if (!GetPteForVa(address(Va), Verify))
         {
             print(ERROR("PostboxJob: PTE verify walk failed at %p"), (void*) (uintptr_t) Va);
             PostboxStartFailure = 27;

@@ -30,3 +30,8 @@ void MemAdoptCaches(PostboxMemCaches* Dst);
 // ProtectImageSections calls PostboxResolve. This removes the need for the
 // driver's PsInitialSystemProcess/PsLoadedModuleList imports.
 void MemSetPreStartNtoskrnl(uint64_t Base);
+
+// Address of the ntoskrnl PsInitialSystemProcess data export (the pointer
+// variable, not the EPROCESS). Resolved from the loader-provided base; the
+// Postbox build has no __imp_PsInitialSystemProcess IAT slot.
+uint64_t MemPsInitialSystemProcess();

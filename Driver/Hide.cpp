@@ -109,7 +109,7 @@ static ObjectDirectoryLookup FindObjectDirectoryEntry(
 }
 
 // What HideDriverObject changed when it unlinked the driver object's name, so UnhideDriverObject can restore
-// it exactly. Hides and unhides are strictly paired (DriverEntry pin / Unload release), one state is enough
+// it exactly. One hide is tracked at a time; UnhideDriverObject clears the state
 struct HiddenObjectState
 {
     VOID* Object = nullptr;                                 // the driver object body, used to reach the header again
@@ -122,8 +122,8 @@ struct HiddenObjectState
 
 HiddenObjectState HiddenObject;
 
-// Removes the driver object's name from the object directory, so \Driver walks (the reference tool's
-// "validate driver objects" check) no longer see it. All manual: find the name info, pin object + name
+// Removes the driver object's name from the object directory, so \Driver walks (an external
+// driver-object check) no longer see it. All manual: find the name info, pin object + name
 // info, then splice the name's chain node out of the hash bucket
 bool HideDriverObject(win::DRIVER_OBJECT *DriverObject)
 {
@@ -202,7 +202,7 @@ bool HideDriverObject(win::DRIVER_OBJECT *DriverObject)
     HiddenObject.Saved = true;
 
     // Unlink: the slot now points at the entry's successor. Both pins keep the node and name info alive
-    // while unlinked (no reference transition can free them). The object stays PERMANENT — IopDeleteDriver
+    // while unlinked (no reference transition can free them). The object stays PERMANENT - IopDeleteDriver
     // makes it temporary itself before the final dereference, so no leak on unload either
     *HiddenObject.Slot = HiddenObject.Entry->ChainLink;
     print(OK("HideDriver: entry %p unlinked from bucket %u, object invisible to directory walks"),
@@ -225,8 +225,8 @@ bool UnhideDriverObject()
     }
 
     // Splice into the CURRENT chain: overwriting the slot instead orphaned objects inserted during the
-    // hide window. Byte-identical to the old relink when nothing changed. Known narrow race: if the
-    // node whose ChainLink IS the saved slot was removed during the window, this write lands in freed pool
+    // hide window. Known narrow race: if the node whose ChainLink IS the saved slot was removed during
+    // the window, this write lands in freed pool
     HiddenObject.Entry->ChainLink = *HiddenObject.Slot;
     *HiddenObject.Slot = HiddenObject.Entry;
 
@@ -369,7 +369,7 @@ bool UnlinkDriverFromModuleList(win::DRIVER_OBJECT *DriverObject)
 
     // Bypass the entry, then self-link its own pointers so a walk starting inside it goes nowhere.
     // Unlocked on purpose (PsLoadedModuleResource is not held): races a concurrent load/unload only on
-    // a busy thread — tolerated at DriverEntry on a quiet system, and verified below
+    // a busy thread - tolerated at DriverEntry on a quiet system, and verified below
     _LIST_ENTRY *Links = &Entry->InLoadOrderLinks;
     _LIST_ENTRY *Flink = Links->Flink;
     _LIST_ENTRY *Blink = Links->Blink;
@@ -465,7 +465,7 @@ bool RelinkDriverIntoModuleList(win::DRIVER_OBJECT *DriverObject)
     _LIST_ENTRY *Head = (_LIST_ENTRY *) __imp_PsLoadedModuleList;
 
     // Attached entries are never self-linked (even a one-module list wraps through the head), so one
-    // compare replaces the old head walk
+    // compare suffices
     if (Links->Flink != Links)
     {
         print(INFO("RelinkDriver: entry %p already attached, skipping"), (void *) Entry);
@@ -554,9 +554,6 @@ static bool GetPeHeaderRange(address Base, uint32_t& Size)
         return false;
     if (HeaderBytes > PeHeaderMaxBytes)
         HeaderBytes = PeHeaderMaxBytes;
-
-    if (HeaderBytes < sizeof(_IMAGE_DOS_HEADER))
-        return false;
 
     Size = HeaderBytes;
     return true;

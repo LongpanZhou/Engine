@@ -3,12 +3,12 @@
 //
 // Host-side unit tests for mapload's pure logic (no provider/KernelForge/SCM
 // traffic happens here):
-//   * mapper/map.cpp    — MapImage's helpers exercised as fragments:
+//   * mapper/map.cpp    - MapImage's helpers exercised as fragments:
 //                         RangeInImage, ApplyRelocs (+reject paths),
 //                         ResolveImports (+reject paths),
 //                         StripImportMetadata; a minimal PE image is built in
 //                         the test so the layouts are under our control.
-//   * controller/config.cpp — the mapload.json reader: Parser::ParseObject
+//   * controller/config.cpp - the mapload.json reader: Parser::ParseObject
 //                         for full/defaults/unknown-keys/number-formats/
 //                         malformed cases and LoadConfig's temp-file path.
 //
@@ -16,14 +16,13 @@
 // fragments themselves are included. The control layer (IsHvciAllowed, Log,
 // WorkspaceRoot, EnablePrivilege, ShutdownProvider, LogSetQuiet) and the
 // KernelForge foreign-memory layer (KfGetKernelProcAddress, KfHeapAlloc,
-// KfMemCopy, ...) are stubbed — the unit tests never touch real kernel
+// KfMemCopy, ...) are stubbed - the unit tests never touch real kernel
 // surfaces.
 //
 // Built and run by scripts/run-unit-tests.ps1 (Debug gate); never ships.
 // No external framework: micro harness of CHECK() counters.
 // ---------------------------------------------------------------------------
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -32,6 +31,8 @@
 #include <stdarg.h>
 #include <string>
 #include <vector>
+
+#include "check.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -68,9 +69,9 @@ namespace mapload {
     }
     static bool EnablePrivilege(const char*) { return true; }
     // Configurable workspace root for LoadConfig("") tests.
-static char g_TestWorkspaceRoot[MAX_PATH] = {};
+    static char g_TestWorkspaceRoot[MAX_PATH] = {};
 
-static void WorkspaceRoot(char* out, size_t outlen)
+    static void WorkspaceRoot(char* out, size_t outlen)
     {
         if (!out || !outlen) return;
         strncpy_s(out, outlen, g_TestWorkspaceRoot, _TRUNCATE);
@@ -131,13 +132,6 @@ extern "C" {
     {
         return reinterpret_cast<PVOID>(g_Heap.Alloc(Size));
     }
-    static PVOID KfHeapAllocData(SIZE_T Size, PVOID Data)
-    {
-        const uint64_t Base = g_Heap.Alloc(Size);
-        if (Data && Size)
-            std::memcpy(g_Heap.Translate(Base, Size), Data, Size);
-        return reinterpret_cast<PVOID>(Base);
-    }
     static void KfHeapFree(PVOID Addr)
     {
         g_Heap.Free(reinterpret_cast<uint64_t>(Addr));
@@ -193,26 +187,21 @@ extern "C" {
 // Micro harness
 // ---------------------------------------------------------------------------
 
-static unsigned g_Pass = 0;
-static unsigned g_Fail = 0;
+// ===========================================================================
+// 1. mapper/map.cpp - range guard + relocations
+// ===========================================================================
 
-static void Report(bool ok, const char* file, unsigned line, const char* expr)
+// Every fixture below puts the 64-bit NT headers at file offset 0x40.
+static IMAGE_NT_HEADERS64* NtHeaders(std::vector<uint8_t>& image)
 {
-    if (ok) ++g_Pass;
-    else { ++g_Fail; std::printf("[FAIL] %s:%u  %s\n", file, line, expr); }
+    return reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
 }
-
-#define CHECK(Cond) Report((Cond), __FILE__, __LINE__, #Cond)
-
-// ===========================================================================
-// 1. mapper/map.cpp — range guard + relocations
-// ===========================================================================
 
 // Minimal 64-bit PE: 64-byte DOS header at 0, NT headers at 0x40, one
 // ".text" section header; SizeOfImage 0x2000. DataDirectories returned via
 // the two input RVA/Size pairs.
-static std::vector<uint8_t> BuildMiniPe(DWORD RelocRva, DWORD RelocSize,
-                                        DWORD ImportRva, DWORD ImportSize)
+static std::vector<uint8_t> BuildMiniPe(DWORD RelocRva = 0, DWORD RelocSize = 0,
+                                        DWORD ImportRva = 0, DWORD ImportSize = 0)
 {
     std::vector<uint8_t> image(0x2000, 0);
 
@@ -220,7 +209,7 @@ static std::vector<uint8_t> BuildMiniPe(DWORD RelocRva, DWORD RelocSize,
     dos->e_magic = IMAGE_DOS_SIGNATURE;
     dos->e_lfanew = 0x40;
 
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
+    auto* nt = NtHeaders(image);
     nt->Signature = IMAGE_NT_SIGNATURE;
     nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
     nt->FileHeader.NumberOfSections = 1;
@@ -261,7 +250,7 @@ static void TestApplyRelocs()
 {
     // valid DIR64 + ABSOLUTE block: the DIR64 target is patched by deltaBase,
     // the ABSOLUTE entry is skipped, and the probe carries the first patch.
-    std::vector<uint8_t> image = BuildMiniPe(0x1800, 16, 0, 0);
+    std::vector<uint8_t> image = BuildMiniPe(0x1800, 16);
     const uint64_t deltaBase = 0x4000'0000ull;
 
     auto* rel = reinterpret_cast<IMAGE_BASE_RELOCATION*>(image.data() + 0x1800);
@@ -274,9 +263,6 @@ static void TestApplyRelocs()
 
     const uint64_t pre = 0x1400000000001234ull;
     memcpy(image.data() + 0x1010, &pre, 8);
-
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
-    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1800, 16};
 
     mapload::mapper::RelocProbe probe{};
     CHECK(mapload::mapper::ApplyRelocs(image.data(), 0x2000, deltaBase, &probe));
@@ -296,29 +282,23 @@ static void TestApplyRelocs()
 
 static void TestApplyRelocsRejects()
 {
-    auto image = BuildMiniPe(0, 16, 0, 0);
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
-    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0, 16};
+    auto image = BuildMiniPe(0, 16);
     CHECK(!mapload::mapper::ApplyRelocs(image.data(), 0x2000, 0x1000, nullptr));
 
     // directory range outside the image: {0x1FF8, 16} ends at 0x2008 > 0x2000,
     // rejected by the RangeInImage guard before any block is read
-    image = BuildMiniPe(0, 0, 0, 0);
-    nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
+    image = BuildMiniPe();
+    auto* nt = NtHeaders(image);
     nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1FF8, 16};
     CHECK(!mapload::mapper::ApplyRelocs(image.data(), 0x2000, 0x1000, nullptr));
 
     // malformed block: a zero-filled block has SizeOfBlock == 0, rejected by
     // the per-block sanity check
-    image = BuildMiniPe(0x1F00, 16, 0, 0);
-    nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
-    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1F00, 16};
+    image = BuildMiniPe(0x1F00, 16);
     CHECK(!mapload::mapper::ApplyRelocs(image.data(), 0x2000, 0x1000, nullptr));
 
     // block claiming more bytes than the directory grants -> malformed
-    image = BuildMiniPe(0x1800, 16, 0, 0);
-    nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
-    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1800, 16};
+    image = BuildMiniPe(0x1800, 16);
     auto* rel = reinterpret_cast<IMAGE_BASE_RELOCATION*>(image.data() + 0x1800);
     rel->VirtualAddress = 0x1000;
     rel->SizeOfBlock = 0x1000;                    // larger than dir size
@@ -326,9 +306,7 @@ static void TestApplyRelocsRejects()
 
     // unsupported relocation type -> reject (type 6 = IMAGE_REL_BASED_SECTION;
     // some SDK headers omit it, so aim for a type that never ships on x64)
-    image = BuildMiniPe(0x1800, 16, 0, 0);
-    nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
-    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1800, 16};
+    image = BuildMiniPe(0x1800, 16);
     rel = reinterpret_cast<IMAGE_BASE_RELOCATION*>(image.data() + 0x1800);
     rel->VirtualAddress = 0x1000;
     rel->SizeOfBlock = sizeof(IMAGE_BASE_RELOCATION) + 1 * sizeof(WORD);
@@ -340,9 +318,7 @@ static void TestApplyRelocsRejects()
     // DIR64 *target* outside the image: the target is the block's VirtualAddress
     // plus the 12-bit offset, so the block VA itself must sit at the top of the
     // image (target = 0x1F00 + 0x0F9 = 0x1FF9; 8 bytes needed, 7 remain).
-    image = BuildMiniPe(0x1F00, 16, 0, 0);
-    nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
-    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1F00, 16};
+    image = BuildMiniPe(0x1F00, 16);
     rel = reinterpret_cast<IMAGE_BASE_RELOCATION*>(image.data() + 0x1F00);
     rel->VirtualAddress = 0x1F00;
     rel->SizeOfBlock = sizeof(IMAGE_BASE_RELOCATION) + 1 * sizeof(WORD);
@@ -355,14 +331,10 @@ static void TestApplyRelocsEmptyDirectory()
 {
     // A nonzero RVA with Size 0 short-circuits to "no relocations" (true), and
     // a fully empty directory {0,0} is the normal no-reloc case.
-    auto image = BuildMiniPe(0x1800, 0, 0, 0);
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
-    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1800, 0};
+    auto image = BuildMiniPe(0x1800, 0);
     CHECK(mapload::mapper::ApplyRelocs(image.data(), 0x2000, 0x1000, nullptr));
 
-    image = BuildMiniPe(0, 0, 0, 0);
-    nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
-    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0, 0};
+    image = BuildMiniPe();
     CHECK(mapload::mapper::ApplyRelocs(image.data(), 0x2000, 0x1000, nullptr));
 }
 
@@ -370,9 +342,7 @@ static void TestApplyRelocsHighlow()
 {
     // HIGHLOW (type 3) is unexpected on x64 but still applied: the low 32 bits
     // get the delta and the rest of the image is untouched.
-    auto image = BuildMiniPe(0x1800, 16, 0, 0);
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
-    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1800, 16};
+    auto image = BuildMiniPe(0x1800, 16);
     auto* rel = reinterpret_cast<IMAGE_BASE_RELOCATION*>(image.data() + 0x1800);
     rel->VirtualAddress = 0x1000;
     rel->SizeOfBlock = sizeof(IMAGE_BASE_RELOCATION) + 1 * sizeof(WORD);
@@ -384,9 +354,7 @@ static void TestApplyRelocsHighlow()
     CHECK(*reinterpret_cast<uint32_t*>(image.data() + 0x1020) == 0x11224344u);
 
     // HIGHLOW target outside the image: block VA 0x1FFE + 4 bytes > 0x2000
-    image = BuildMiniPe(0x1800, 16, 0, 0);
-    nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
-    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1800, 16};
+    image = BuildMiniPe(0x1800, 16);
     rel = reinterpret_cast<IMAGE_BASE_RELOCATION*>(image.data() + 0x1800);
     rel->VirtualAddress = 0x1FFE;
     rel->SizeOfBlock = sizeof(IMAGE_BASE_RELOCATION) + 1 * sizeof(WORD);
@@ -396,7 +364,7 @@ static void TestApplyRelocsHighlow()
 }
 
 // ===========================================================================
-// 2. mapper/map.cpp — import resolution
+// 2. mapper/map.cpp - import resolution
 // ===========================================================================
 
 // Import descriptor for ntoskrnl.exe at dirRva with one by-name entry whose
@@ -422,18 +390,14 @@ static void AddNtImport(std::vector<uint8_t>& image, uint32_t dirRva)
     orig->u1.AddressOfData = dirRva + 0x60;
     (orig + 1)->u1.AddressOfData = 0;                       // terminator
 
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
+    auto* nt = NtHeaders(image);
     nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] =
         {dirRva, sizeof(IMAGE_IMPORT_DESCRIPTOR) * 2};
 }
 
-// ===========================================================================
-// 2. mapper/map.cpp — import resolution
-// ===========================================================================
-
 static void TestResolveImportsOk()
 {
-    std::vector<uint8_t> image = BuildMiniPe(0, 0, 0, 0);
+    std::vector<uint8_t> image = BuildMiniPe();
     AddNtImport(image, 0x1700);            // publishes dir = {0x1700, 0x28}
 
     CHECK(mapload::mapper::ResolveImports(image.data(), static_cast<DWORD>(image.size())));
@@ -456,8 +420,8 @@ static void TestResolveImportsRejects()
     // descriptor chain whose module name slot holds zeros: the empty name fails
     // the ntoskrnl-only _stricmp check (there is no explicit blank-name test in
     // the product; the empty string simply does not equal "ntoskrnl.exe")
-    auto image = BuildMiniPe(0, 0, 0, 0);
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
+    auto image = BuildMiniPe();
+    auto* nt = NtHeaders(image);
     nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] =
         {0x1700, sizeof(IMAGE_IMPORT_DESCRIPTOR)};
 
@@ -468,8 +432,8 @@ static void TestResolveImportsRejects()
     CHECK(!mapload::mapper::ResolveImports(image.data(), static_cast<DWORD>(image.size())));
 
     // non-ntoskrnl import -> reject (the mapload contract is ntoskrnl-only)
-    image = BuildMiniPe(0, 0, 0, 0);
-    nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
+    image = BuildMiniPe();
+    nt = NtHeaders(image);
     nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] =
         {0x1700, sizeof(IMAGE_IMPORT_DESCRIPTOR)};
     imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(image.data() + 0x1700);
@@ -485,8 +449,8 @@ static void TestResolveImportsRejects()
     CHECK(!mapload::mapper::ResolveImports(image.data(), static_cast<DWORD>(image.size())));
 
     // no-import image resolves trivially ("imports: none declared")
-    image = BuildMiniPe(0, 0, 0, 0);
-    nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
+    image = BuildMiniPe();
+    nt = NtHeaders(image);
     nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = {0, 0};
     CHECK(mapload::mapper::ResolveImports(image.data(), static_cast<DWORD>(image.size())));
 }
@@ -506,7 +470,7 @@ static void TestResolveImportsRejectsExpanded()
 
     // directory too small for one descriptor
     {
-        auto image = BuildMiniPe(0, 0, 0, 0);
+        auto image = BuildMiniPe();
         ntOf(image)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] =
             {0x1700, 8};
         CHECK(!mapload::mapper::ResolveImports(image.data(), size));
@@ -514,7 +478,7 @@ static void TestResolveImportsRejectsExpanded()
 
     // module-name RVA outside the image (NameInImage rejects at >= imageSize)
     {
-        auto image = BuildMiniPe(0, 0, 0, 0);
+        auto image = BuildMiniPe();
         AddNtImport(image, 0x1700);
         impOf(image)->Name = 0x2000;
         CHECK(!mapload::mapper::ResolveImports(image.data(), size));
@@ -522,7 +486,7 @@ static void TestResolveImportsRejectsExpanded()
 
     // ordinal import is not supported
     {
-        auto image = BuildMiniPe(0, 0, 0, 0);
+        auto image = BuildMiniPe();
         AddNtImport(image, 0x1700);
         iltOf(image)->u1.Ordinal = IMAGE_ORDINAL_FLAG64 | 5;
         CHECK(!mapload::mapper::ResolveImports(image.data(), size));
@@ -530,7 +494,7 @@ static void TestResolveImportsRejectsExpanded()
 
     // by-name RVA outside the image
     {
-        auto image = BuildMiniPe(0, 0, 0, 0);
+        auto image = BuildMiniPe();
         AddNtImport(image, 0x1700);
         iltOf(image)->u1.AddressOfData = 0x1FFF;
         CHECK(!mapload::mapper::ResolveImports(image.data(), size));
@@ -538,7 +502,7 @@ static void TestResolveImportsRejectsExpanded()
 
     // FirstThunk == 0 with a valid name/ILT is invalid
     {
-        auto image = BuildMiniPe(0, 0, 0, 0);
+        auto image = BuildMiniPe();
         AddNtImport(image, 0x1700);
         impOf(image)->FirstThunk = 0;
         CHECK(!mapload::mapper::ResolveImports(image.data(), size));
@@ -546,7 +510,7 @@ static void TestResolveImportsRejectsExpanded()
 
     // descriptor table outside the image
     {
-        auto image = BuildMiniPe(0, 0, 0, 0);
+        auto image = BuildMiniPe();
         ntOf(image)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] =
             {0x1FF0, 0x20};
         CHECK(!mapload::mapper::ResolveImports(image.data(), size));
@@ -554,7 +518,7 @@ static void TestResolveImportsRejectsExpanded()
 
     // 256 valid descriptors with no terminator -> fail closed instead of looping
     {
-        auto image = BuildMiniPe(0, 0, 0, 0);
+        auto image = BuildMiniPe();
         auto* nt = ntOf(image);
         nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = {0x600, 0x1400};
         memcpy(image.data() + 0x1A00, "ntoskrnl.exe", 13);
@@ -576,7 +540,7 @@ static void TestResolveImportsRejectsExpanded()
 
     // module name is matched case-insensitively (_stricmp)
     {
-        auto image = BuildMiniPe(0, 0, 0, 0);
+        auto image = BuildMiniPe();
         AddNtImport(image, 0x1700);
         memcpy(image.data() + 0x1740, "NTOSKRNL.EXE", 13);
         CHECK(mapload::mapper::ResolveImports(image.data(), size));
@@ -585,7 +549,7 @@ static void TestResolveImportsRejectsExpanded()
     // documented asymmetry: RVA 0 with a nonzero Size is "none declared" here
     // (ApplyRelocs rejects the same shape), and {0,0} is the normal no-import case
     {
-        auto image = BuildMiniPe(0, 0, 0, 0);
+        auto image = BuildMiniPe();
         ntOf(image)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] =
             {0, 0x28};
         CHECK(mapload::mapper::ResolveImports(image.data(), size));
@@ -602,8 +566,8 @@ static void TestStripImportMetadataOftZero()
     // walks OFT, so the hint/name string survives. The IAT still must survive
     // and the module name/descriptor are still wiped. This pins the documented
     // limitation (the by-name metadata is not stripped in this shape).
-    auto image = BuildMiniPe(0, 0, 0, 0);
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
+    auto image = BuildMiniPe();
+    auto* nt = NtHeaders(image);
     nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] =
         {0x1700, sizeof(IMAGE_IMPORT_DESCRIPTOR) * 2};
 
@@ -634,13 +598,13 @@ static void TestStripImportMetadataOftZero()
 
 static void TestStripImportMetadata()
 {
-    std::vector<uint8_t> image = BuildMiniPe(0, 0, 0, 0);
+    std::vector<uint8_t> image = BuildMiniPe();
     AddNtImport(image, 0x1700);
     CHECK(mapload::mapper::ResolveImports(image.data(), static_cast<DWORD>(image.size())));
 
     mapload::mapper::StripImportMetadata(image.data(), static_cast<DWORD>(image.size()));
 
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
+    auto* nt = NtHeaders(image);
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     CHECK(dir.VirtualAddress == 0 && dir.Size == 0);
 
@@ -659,20 +623,14 @@ static void TestStripImportMetadata()
     CHECK(ilt[1].u1.AddressOfData == 0);
 
     // by-name entry: WORD hint + 26-byte name = 28 bytes zeroed
-    bool byNameZero = true;
-    for (uint32_t i = 0; i < 2 + 26; ++i)
-        if (image[0x1700 + 0x60 + i] != 0) byNameZero = false;
-    CHECK(byNameZero);
+    CHECK(AllBytesZero(image.data() + 0x1700 + 0x60, 2 + 26));
 
     // module name "ntoskrnl.exe" (12 bytes incl. NUL) fully zeroed
-    bool nameZero = true;
-    for (uint32_t i = 0; i < 12; ++i)
-        if (image[0x1700 + 0x40 + i] != 0) nameZero = false;
-    CHECK(nameZero);
+    CHECK(AllBytesZero(image.data() + 0x1700 + 0x40, 12));
 }
 
 // ===========================================================================
-// 3. controller/config.cpp — mapload.json Parser + LoadConfig
+// 3. controller/config.cpp - mapload.json Parser + LoadConfig
 // ===========================================================================
 
 static void TestConfigParserFull()
@@ -683,19 +641,16 @@ static void TestConfigParserFull()
         "  \"driver\": \"Engine-ci\\\\Driver\\\\build-x\\\\Driver.sys\","
         "  \"providers\": [\"pte\"],"
         "  \"keep_provider\": true,"
-        "  \"cleanup\": false,"
         "  \"canary\": true,"
         "  \"verify\": true,"
-        "  \"pause_after_map\": true,"
-        "  \"pml4\": \"0x1AD000\""
+        "  \"pause_after_map\": true"
         "}";
     mapload::Parser p(json);
     CHECK(p.ParseObject(cfg));
     CHECK(cfg.driver == "Engine-ci\\Driver\\build-x\\Driver.sys");
     CHECK(cfg.providers.size() == 1 && cfg.providers[0] == "pte");
-    CHECK(cfg.keepProvider && !cfg.cleanup && cfg.canary && cfg.verify
+    CHECK(cfg.keepProvider && cfg.canary && cfg.verify
           && cfg.pauseAfterMap);
-    CHECK(cfg.pml4 == 0x1AD000ull);
 }
 
 static void TestConfigParserDefaults()
@@ -703,9 +658,8 @@ static void TestConfigParserDefaults()
     mapload::Config cfg{};
     mapload::Parser p("{}");
     CHECK(p.ParseObject(cfg));
-    CHECK(!cfg.keepProvider && cfg.cleanup && !cfg.canary && !cfg.verify
+    CHECK(!cfg.keepProvider && !cfg.canary && !cfg.verify
           && !cfg.pauseAfterMap);
-    CHECK(cfg.pml4 == 0);
     CHECK(cfg.providers.empty());
 }
 
@@ -715,51 +669,6 @@ static void TestConfigParserUnknownKey()
     mapload::Parser p("{\"future_key\": {\"nested\": 1}, \"keep_provider\": true}");
     CHECK(p.ParseObject(cfg));
     CHECK(cfg.keepProvider);
-}
-
-static void TestConfigParserU64()
-{
-    mapload::Config cfg{};
-    mapload::Parser p("{\"pml4\": 687104}");
-    CHECK(p.ParseObject(cfg));
-    CHECK(cfg.pml4 == 687104u);
-
-    mapload::Parser q("{\"pml4\": \"0x1AD000\"}");
-    CHECK(q.ParseObject(cfg));
-    CHECK(cfg.pml4 == 0x1AD000u);
-
-    mapload::Parser r("{\"pml4\": true}");       // bool is not a number
-    CHECK(!r.ParseObject(cfg));
-}
-
-static void TestConfigParserPml4Edges()
-{
-    mapload::Config cfg{};
-
-    mapload::Parser a("{\"pml4\": 0x1AD000}");   // unquoted hex
-    CHECK(a.ParseObject(cfg) && cfg.pml4 == 0x1AD000u);
-
-    mapload::Parser b("{\"pml4\": \"687104\"}"); // quoted decimal
-    CHECK(b.ParseObject(cfg) && cfg.pml4 == 687104);
-
-    // documented product quirk: a quoted empty string parses as 0 (accepted)
-    mapload::Parser c("{\"pml4\": \"\"}");
-    CHECK(c.ParseObject(cfg) && cfg.pml4 == 0);
-
-    // documented product quirk: overflow returns ULLONG_MAX (errno/ERANGE is
-    // not checked; _strtoui64 saturates)
-    mapload::Parser d("{\"pml4\": \"18446744073709551616\"}");
-    CHECK(d.ParseObject(cfg) && cfg.pml4 == 0xFFFFFFFFFFFFFFFFull);
-
-    // negative and fractional values are rejected
-    mapload::Parser e("{\"pml4\": -1}");
-    CHECK(!e.ParseObject(cfg));
-    mapload::Parser f("{\"pml4\": 1.5}");
-    CHECK(!f.ParseObject(cfg));
-
-    // base-0 integer parse: a leading zero is octal (documented quirk)
-    mapload::Parser g("{\"pml4\": 010}");
-    CHECK(g.ParseObject(cfg) && cfg.pml4 == 8);
 }
 
 static void TestConfigParserTrailingGarbage()
@@ -816,15 +725,23 @@ static void TestConfigParserMalformed()
     CHECK(!g.ParseObject(cfg));
 }
 
-static void TestLoadConfigTempFile()
+static std::string TempTestPath(const char* name)
 {
     char path[MAX_PATH] = {};
     GetTempPathA(MAX_PATH, path);
-    std::string file = std::string(path) + "kf_unit_test_config.json";
-    {
-        std::ofstream out(file.c_str(), std::ios::out | std::ios::trunc);
-        out << "{\"providers\": [\"pte\"], \"keep_provider\": true}";
-    }
+    return std::string(path) + name;
+}
+
+static void WriteTestText(const std::string& file, const char* text)
+{
+    std::ofstream out(file.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
+    out.write(text, static_cast<std::streamsize>(strlen(text)));
+}
+
+static void TestLoadConfigTempFile()
+{
+    const std::string file = TempTestPath("kf_unit_test_config.json");
+    WriteTestText(file, "{\"providers\": [\"pte\"], \"keep_provider\": true}");
     mapload::Config cfg{};
     CHECK(mapload::LoadConfig(file, cfg));
     CHECK(cfg.loaded);
@@ -835,40 +752,32 @@ static void TestLoadConfigTempFile()
 
     // explicit request for a nonexistent file -> clean failure
     mapload::Config miss{};
-    CHECK(!mapload::LoadConfig(std::string(path) + "kf_unit_test_missing.json", miss));
+    CHECK(!mapload::LoadConfig(TempTestPath("kf_unit_test_missing.json"), miss));
     CHECK(!miss.loaded);
 }
 
 static void TestLoadConfigEdgeFiles()
 {
-    char path[MAX_PATH] = {};
-    GetTempPathA(MAX_PATH, path);
-
-    auto write = [&](const char* name, const void* data, DWORD len) {
-        std::string file = std::string(path) + name;
-        std::ofstream out(file.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
-        out.write(static_cast<const char*>(data), len);
-        return file;
-    };
-
     // UTF-8 BOM is stripped before parsing
     const char bomJson[] = "\xEF\xBB\xBF{\"keep_provider\": true}";
-    std::string f1 = write("kf_ut_bom.json", bomJson, sizeof(bomJson) - 1);
+    const std::string f1 = TempTestPath("kf_ut_bom.json");
+    WriteTestText(f1, bomJson);
     mapload::Config c1{};
     CHECK(mapload::LoadConfig(f1, c1));
     CHECK(c1.loaded && c1.keepProvider);
     DeleteFileA(f1.c_str());
 
     // empty file -> parse failure (not a JSON object)
-    std::string f2 = write("kf_ut_empty.json", "", 0);
+    const std::string f2 = TempTestPath("kf_ut_empty.json");
+    WriteTestText(f2, "");
     mapload::Config c2{};
     CHECK(!mapload::LoadConfig(f2, c2));
     CHECK(!c2.loaded);
     DeleteFileA(f2.c_str());
 
     // truncated object -> parse failure, cfg not marked loaded
-    const char badJson[] = "{";
-    std::string f3 = write("kf_ut_bad.json", badJson, sizeof(badJson) - 1);
+    const std::string f3 = TempTestPath("kf_ut_bad.json");
+    WriteTestText(f3, "{");
     mapload::Config c3{};
     CHECK(!mapload::LoadConfig(f3, c3));
     CHECK(!c3.loaded);
@@ -876,7 +785,7 @@ static void TestLoadConfigEdgeFiles()
 }
 
 // ===========================================================================
-// 3b. mapper/map.cpp — MapImage end to end (fake kernel heap)
+// 3b. mapper/map.cpp - MapImage end to end (fake kernel heap)
 // ===========================================================================
 
 // A complete PE32+ image for MapImage: headers, .text (DIR64 target + one
@@ -892,6 +801,22 @@ static void PutRot1Name(std::vector<uint8_t>& f, size_t off, const char* plain)
         f[off + i] = static_cast<uint8_t>(plain[i] + 1);
 }
 
+// 11-slot ROT1 table shared by the MapImage fixture and FindRot1Table.
+// The scan needle (ROT1 of "KeInitialize") is in slot 10.
+static const char* const kRot1Names[11] = {
+    "KeQueryActiveProcessors",
+    "KeSetSystemAffinityThreadEx",
+    "KeRevertToUserAffinityThreadEx",
+    "KeGetCurrentProcessorNumberEx",
+    "KeStallExecutionProcessor",
+    "MmMapIoSpace",
+    "MmUnmapIoSpace",
+    "KeQueryActiveProcessorCountEx",
+    "HalSendNMI",
+    "KeInitializeAffinityEx",
+    "KeAddProcessorAffinityEx",
+};
+
 static std::vector<uint8_t> BuildMapImagePe()
 {
     std::vector<uint8_t> f(0xC00, 0);
@@ -900,7 +825,7 @@ static std::vector<uint8_t> BuildMapImagePe()
     dos->e_magic = IMAGE_DOS_SIGNATURE;
     dos->e_lfanew = 0x40;
 
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(f.data() + 0x40);
+    auto* nt = NtHeaders(f);
     nt->Signature = IMAGE_NT_SIGNATURE;
     nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
     nt->FileHeader.NumberOfSections = 4;
@@ -974,21 +899,8 @@ static std::vector<uint8_t> BuildMapImagePe()
     // .rdata: an 11-slot ROT1 table (40-byte slots). The scan needle is the
     // ROT1 of "KeInitialize", which is the 10th entry; the fixed scan must
     // anchor at slot 0 and report all 11 slots (440 bytes), not 2 (80 bytes).
-    static const char* Rot1Names[11] = {
-        "KeQueryActiveProcessors",
-        "KeSetSystemAffinityThreadEx",
-        "KeRevertToUserAffinityThreadEx",
-        "KeGetCurrentProcessorNumberEx",
-        "KeStallExecutionProcessor",
-        "MmMapIoSpace",
-        "MmUnmapIoSpace",
-        "KeQueryActiveProcessorCountEx",
-        "HalSendNMI",
-        "KeInitializeAffinityEx",          // the needle slot
-        "KeAddProcessorAffinityEx",
-    };
     for (uint32_t i = 0; i < 11; ++i)
-        PutRot1Name(f, 0xA00 + i * 40, Rot1Names[i]);
+        PutRot1Name(f, 0xA00 + i * 40, kRot1Names[i]);
 
     return f;
 }
@@ -1034,13 +946,8 @@ static void TestMapImageEndToEnd()
         const uint8_t zeroDesc[sizeof(IMAGE_IMPORT_DESCRIPTOR)] = {};
         CHECK(memcmp(pub + 0x1100, zeroDesc, sizeof(zeroDesc)) == 0);
 
-        bool relocZero = true, pdataZero = true;
-        for (uint32_t i = 0; i < 0x200; ++i)
-            if (pub[0x2000 + i]) relocZero = false;
-        for (uint32_t i = 0; i < 0x100; ++i)
-            if (pub[0x2800 + i]) pdataZero = false;
-        CHECK(relocZero);
-        CHECK(pdataZero);                          // StripPdata = true
+        CHECK(AllBytesZero(pub + 0x2000, 0x200));
+        CHECK(AllBytesZero(pub + 0x2800, 0x100));   // StripPdata = true
     }
 
     // Unaligned mode (MAPPED_SAFE payloads): raw base used as-is; .pdata kept.
@@ -1053,10 +960,7 @@ static void TestMapImageEndToEnd()
     CHECK(pub != nullptr);
     if (pub)
     {
-        bool pdataNonZero = false;
-        for (uint32_t i = 0; i < 0x100; ++i)
-            if (pub[0x2800 + i]) pdataNonZero = true;
-        CHECK(pdataNonZero);
+        CHECK(AnyByteNonZero(pub + 0x2800, 0x100));
     }
 
     // Independent pages: allocated through KfAllocIndependentPages, base as-is.
@@ -1070,81 +974,64 @@ static void TestMapImageEndToEnd()
 
 static void TestMapImageValidation()
 {
-    uint64_t base = 0, entry = 0;
-    bool independent = false;
+    auto Rejects = [](const std::vector<uint8_t>& image) {
+        uint64_t base = 0, entry = 0;
+        bool independent = false;
+        return !mapload::mapper::MapImage(image, &base, &entry, true, nullptr, nullptr,
+                                          false, false, &independent, nullptr, nullptr);
+    };
 
     std::vector<uint8_t> tiny(0x10, 0);
-    CHECK(!mapload::mapper::MapImage(tiny, &base, &entry, true, nullptr, nullptr,
-                                     false, false, &independent, nullptr, nullptr));
+    CHECK(Rejects(tiny));
 
     auto badMZ = BuildMapImagePe();
     badMZ[0] = 0;
-    CHECK(!mapload::mapper::MapImage(badMZ, &base, &entry, true, nullptr, nullptr,
-                                     false, false, &independent, nullptr, nullptr));
+    CHECK(Rejects(badMZ));
 
     auto badPE = BuildMapImagePe();
     badPE[0x40] = 0;                                   // PE signature
-    CHECK(!mapload::mapper::MapImage(badPE, &base, &entry, true, nullptr, nullptr,
-                                     false, false, &independent, nullptr, nullptr));
+    CHECK(Rejects(badPE));
 
     auto stripped = BuildMapImagePe();
-    reinterpret_cast<IMAGE_NT_HEADERS64*>(stripped.data() + 0x40)->FileHeader.Characteristics
-        |= IMAGE_FILE_RELOCS_STRIPPED;
-    CHECK(!mapload::mapper::MapImage(stripped, &base, &entry, true, nullptr, nullptr,
-                                     false, false, &independent, nullptr, nullptr));
+    NtHeaders(stripped)->FileHeader.Characteristics |= IMAGE_FILE_RELOCS_STRIPPED;
+    CHECK(Rejects(stripped));
 
     auto badEntry = BuildMapImagePe();
-    reinterpret_cast<IMAGE_NT_HEADERS64*>(badEntry.data() + 0x40)
-        ->OptionalHeader.AddressOfEntryPoint = 0x1800;  // .PAGE, not executable
-    CHECK(!mapload::mapper::MapImage(badEntry, &base, &entry, true, nullptr, nullptr,
-                                     false, false, &independent, nullptr, nullptr));
+    NtHeaders(badEntry)->OptionalHeader.AddressOfEntryPoint = 0x1800;  // outside .text
+    CHECK(Rejects(badEntry));
 
     auto badSection = BuildMapImagePe();
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(badSection.data() + 0x40);
+    auto* nt = NtHeaders(badSection);
     IMAGE_FIRST_SECTION(nt)[0].PointerToRawData = 0xFF00;   // past the file
-    CHECK(!mapload::mapper::MapImage(badSection, &base, &entry, true, nullptr, nullptr,
-                                     false, false, &independent, nullptr, nullptr));
+    CHECK(Rejects(badSection));
 
     auto badLfanew = BuildMapImagePe();
     reinterpret_cast<IMAGE_DOS_HEADER*>(badLfanew.data())->e_lfanew = 0x7FFFFFFF;
-    CHECK(!mapload::mapper::MapImage(badLfanew, &base, &entry, true, nullptr, nullptr,
-                                     false, false, &independent, nullptr, nullptr));
+    CHECK(Rejects(badLfanew));
 
     auto pe32 = BuildMapImagePe();
-    reinterpret_cast<IMAGE_NT_HEADERS64*>(pe32.data() + 0x40)
-        ->OptionalHeader.Magic = 0x10B;                    // PE32, not PE32+
-    CHECK(!mapload::mapper::MapImage(pe32, &base, &entry, true, nullptr, nullptr,
-                                     false, false, &independent, nullptr, nullptr));
+    NtHeaders(pe32)->OptionalHeader.Magic = 0x10B;                    // PE32, not PE32+
+    CHECK(Rejects(pe32));
 
     auto zeroImage = BuildMapImagePe();
-    reinterpret_cast<IMAGE_NT_HEADERS64*>(zeroImage.data() + 0x40)
-        ->OptionalHeader.SizeOfImage = 0;
-    CHECK(!mapload::mapper::MapImage(zeroImage, &base, &entry, true, nullptr, nullptr,
-                                     false, false, &independent, nullptr, nullptr));
+    NtHeaders(zeroImage)->OptionalHeader.SizeOfImage = 0;
+    CHECK(Rejects(zeroImage));
 
     auto hugeImage = BuildMapImagePe();
-    reinterpret_cast<IMAGE_NT_HEADERS64*>(hugeImage.data() + 0x40)
-        ->OptionalHeader.SizeOfImage = 0x20000000;
-    CHECK(!mapload::mapper::MapImage(hugeImage, &base, &entry, true, nullptr, nullptr,
-                                     false, false, &independent, nullptr, nullptr));
+    NtHeaders(hugeImage)->OptionalHeader.SizeOfImage = 0x20000000;
+    CHECK(Rejects(hugeImage));
 
     auto noSections = BuildMapImagePe();
-    reinterpret_cast<IMAGE_NT_HEADERS64*>(noSections.data() + 0x40)
-        ->FileHeader.NumberOfSections = 0;
-    CHECK(!mapload::mapper::MapImage(noSections, &base, &entry, true, nullptr, nullptr,
-                                     false, false, &independent, nullptr, nullptr));
+    NtHeaders(noSections)->FileHeader.NumberOfSections = 0;
+    CHECK(Rejects(noSections));
 
     auto tooManySections = BuildMapImagePe();
-    reinterpret_cast<IMAGE_NT_HEADERS64*>(tooManySections.data() + 0x40)
-        ->FileHeader.NumberOfSections = 97;
-    CHECK(!mapload::mapper::MapImage(tooManySections, &base, &entry, true, nullptr, nullptr,
-                                     false, false, &independent, nullptr, nullptr));
+    NtHeaders(tooManySections)->FileHeader.NumberOfSections = 97;
+    CHECK(Rejects(tooManySections));
 
     auto badHeaders = BuildMapImagePe();
-    reinterpret_cast<IMAGE_NT_HEADERS64*>(badHeaders.data() + 0x40)
-        ->OptionalHeader.SizeOfHeaders = 0x100;             // does not cover NT headers
-    CHECK(!mapload::mapper::MapImage(badHeaders, &base, &entry, true, nullptr, nullptr,
-                                     false, false, &independent, nullptr, nullptr));
+    NtHeaders(badHeaders)->OptionalHeader.SizeOfHeaders = 0x100;             // does not cover NT headers
+    CHECK(Rejects(badHeaders));
 }
 
 static std::string TestExeDir()
@@ -1157,19 +1044,12 @@ static std::string TestExeDir()
 
 static void TestLoadConfigDefaultSearchOrder()
 {
-    char tmp[MAX_PATH] = {};
-    GetTempPathA(MAX_PATH, tmp);
-    const std::string ws = std::string(tmp) + "kf_ut_ws";
+    const std::string ws = TempTestPath("kf_ut_ws");
     CreateDirectoryA(ws.c_str(), nullptr);
     const std::string wsFile = ws + "\\mapload.json";
 
-    auto writeFile = [](const std::string& path, const char* text) {
-        std::ofstream out(path.c_str(), std::ios::out | std::ios::trunc);
-        out << text;
-    };
-
     // 1. workspace mapload.json wins
-    writeFile(wsFile, "{\"keep_provider\": true}");
+    WriteTestText(wsFile, "{\"keep_provider\": true}");
     strcpy_s(mapload::g_TestWorkspaceRoot, ws.c_str());
     mapload::Config c1{};
     CHECK(mapload::LoadConfig("", c1));
@@ -1178,7 +1058,7 @@ static void TestLoadConfigDefaultSearchOrder()
     CHECK(c1.keepProvider);
 
     // 2. a malformed workspace file is a hard failure (no exe-dir fallback)
-    writeFile(wsFile, "{");
+    WriteTestText(wsFile, "{");
     mapload::Config c2{};
     CHECK(!mapload::LoadConfig("", c2));
     CHECK(!c2.loaded);
@@ -1195,7 +1075,7 @@ static void TestLoadConfigDefaultSearchOrder()
     const bool preexisting = GetFileAttributesA(exeFile.c_str()) != INVALID_FILE_ATTRIBUTES;
     if (!preexisting)
     {
-        writeFile(exeFile, "{\"keep_provider\": true}");
+        WriteTestText(exeFile, "{\"keep_provider\": true}");
         mapload::Config c4{};
         CHECK(mapload::LoadConfig("", c4));
         CHECK(c4.loaded);
@@ -1209,7 +1089,7 @@ static void TestLoadConfigDefaultSearchOrder()
 }
 
 // ===========================================================================
-// 4. controller/pure.h — extracted bootstrap helpers
+// 4. controller/pure.h - extracted bootstrap helpers
 // ===========================================================================
 
 static void TestIsAbsolutePathAndJoin()
@@ -1364,13 +1244,11 @@ static void TestFillPostboxImageLayout()
     CHECK(!mapload::FillPostboxImageLayout(bad, 0, 0, 0, &L));
 
     auto pe32 = file;
-    reinterpret_cast<IMAGE_NT_HEADERS64*>(pe32.data() + 0x40)
-        ->OptionalHeader.Magic = 0x10B;         // PE32, not PE32+
+    NtHeaders(pe32)->OptionalHeader.Magic = 0x10B;         // PE32, not PE32+
     CHECK(!mapload::FillPostboxImageLayout(pe32, 0, 0, 0, &L));
 
     auto badSize = file;
-    reinterpret_cast<IMAGE_NT_HEADERS64*>(badSize.data() + 0x40)
-        ->OptionalHeader.SizeOfImage = 0;
+    NtHeaders(badSize)->OptionalHeader.SizeOfImage = 0;
     CHECK(!mapload::FillPostboxImageLayout(badSize, 0, 0, 0, &L));
 }
 
@@ -1397,7 +1275,7 @@ static void TestWorkspaceRootWalk()
 }
 
 // ===========================================================================
-// 5. controller/pure.h — ROT1 table head, page protection, section zeroing,
+// 5. controller/pure.h - ROT1 table head, page protection, section zeroing,
 //    image/config-page teardown
 // ===========================================================================
 
@@ -1406,21 +1284,8 @@ static void TestFindRot1Table()
     // The needle is ROT1("KeInitialize") and sits in the 10th slot; the scan
     // must anchor at the table head and report all 11 slots.
     std::vector<uint8_t> buf(0x400, 0);
-    static const char* Names[11] = {
-        "KeQueryActiveProcessors",
-        "KeSetSystemAffinityThreadEx",
-        "KeRevertToUserAffinityThreadEx",
-        "KeGetCurrentProcessorNumberEx",
-        "KeStallExecutionProcessor",
-        "MmMapIoSpace",
-        "MmUnmapIoSpace",
-        "KeQueryActiveProcessorCountEx",
-        "HalSendNMI",
-        "KeInitializeAffinityEx",
-        "KeAddProcessorAffinityEx",
-    };
     for (uint32_t i = 0; i < 11; ++i)
-        PutRot1Name(buf, 0x100 + i * 40, Names[i]);
+        PutRot1Name(buf, 0x100 + i * 40, kRot1Names[i]);
 
     uint64_t rva = 0xDEAD;
     uint32_t size = 0xDEAD;
@@ -1464,7 +1329,7 @@ static void TestZeroSectionByName()
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image.data());
     dos->e_magic = IMAGE_DOS_SIGNATURE;
     dos->e_lfanew = 0x40;
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + 0x40);
+    auto* nt = NtHeaders(image);
     nt->Signature = IMAGE_NT_SIGNATURE;
     nt->FileHeader.NumberOfSections = 3;
     nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
@@ -1487,10 +1352,7 @@ static void TestZeroSectionByName()
     CHECK(mapload::ZeroSectionByName(image.data(), image.size(), sec, 3, ".reloc", &rva)
           == 0x100);
     CHECK(rva == 0x1800);
-    bool relocZero = true;
-    for (uint32_t i = 0; i < 0x100; ++i)
-        if (image[0x1800 + i]) relocZero = false;
-    CHECK(relocZero);
+    CHECK(AllBytesZero(image.data() + 0x1800, 0x100));
     CHECK(image[0x1900] == 0xAA);              // .pdata untouched by the .reloc call
 
     CHECK(mapload::ZeroSectionByName(image.data(), image.size(), sec, 3, ".pdata", &rva)
@@ -1530,9 +1392,7 @@ static void TestFreeMappedImageZeroed()
             base, size, independent,
             [&r](uint64_t b, const void* d, size_t s) {
                 ++r.Writes; r.WriteBase = b; r.WriteSize = s;
-                const uint8_t* p = static_cast<const uint8_t*>(d);
-                for (size_t i = 0; i < s; ++i)
-                    if (p[i]) r.WriteAllZero = false;
+                r.WriteAllZero = AllBytesZero(d, s) && r.WriteAllZero;
                 return r.WriteOk;
             },
             [&r](uint64_t b, size_t s) {
@@ -1716,8 +1576,6 @@ static void RunMaploadUnitTests()
     TestConfigParserFull();
     TestConfigParserDefaults();
     TestConfigParserUnknownKey();
-    TestConfigParserU64();
-    TestConfigParserPml4Edges();
     TestConfigParserTrailingGarbage();
     TestConfigParserProvidersAndEscapes();
     TestConfigParserMalformed();
@@ -1744,7 +1602,5 @@ static void RunMaploadUnitTests()
 int main()
 {
     RunMaploadUnitTests();
-    std::printf("\n==== kf_mapload_tests: %u passed, %u failed ====\n",
-                g_Pass, g_Fail);
-    return g_Fail ? 1 : 0;
+    return Summary("kf_mapload_tests");
 }

@@ -1,6 +1,6 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// Engine-ci/Driver/Lib/pure.h — kernel-side helpers with no kernel calls, kept
+// Engine-ci/Driver/Lib/pure.h - kernel-side helpers with no kernel calls, kept
 // here so the host unit tests can include them directly.
 // ---------------------------------------------------------------------------
 #include <cstddef>

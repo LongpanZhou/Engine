@@ -15,29 +15,25 @@ static uint64_t CachedPsLoadedModuleList = 0;
 static uint64_t PreStartNtoskrnl = 0;
 cr3 GetSystemCr3()
 {
-#ifdef POSTBOX_CHANNEL
     uint64_t Value = __atomic_load_n(&SystemCr3Value, __ATOMIC_SEQ_CST);
     if (!Value)
     {
+        _KPROCESS* SystemProcess;
+#ifdef POSTBOX_CHANNEL
         PostboxMemCaches* Caches = PostboxGetMemCaches();
         uint64_t PsInitial = Caches ? Caches->PsInitialSystemProcess : 0;
         if (!PsInitial)
             PsInitial = __atomic_load_n(&CachedPsInitialSystemProcess, __ATOMIC_SEQ_CST);
         if (!PsInitial)
             return cr3{0};
-        Value = ((_KPROCESS *) *(_KPROCESS **) (uintptr_t) PsInitial)->DirectoryTableBase;
-        __atomic_store_n(&SystemCr3Value, Value, __ATOMIC_SEQ_CST);
-    }
-    return cr3{Value};
+        SystemProcess = *(_KPROCESS **) (uintptr_t) PsInitial;
 #else
-    uint64_t Value = __atomic_load_n(&SystemCr3Value, __ATOMIC_SEQ_CST);
-    if (!Value)
-    {
-        Value = ((_KPROCESS *) *__imp_PsInitialSystemProcess)->DirectoryTableBase;
+        SystemProcess = (_KPROCESS *) *__imp_PsInitialSystemProcess;
+#endif
+        Value = SystemProcess->DirectoryTableBase;
         __atomic_store_n(&SystemCr3Value, Value, __ATOMIC_SEQ_CST);
     }
     return cr3{Value};
-#endif
 }
 
 // Claims an empty entry (all-zero) for a mapping, atomically, so a live mapping's entry is never taken
@@ -111,7 +107,7 @@ bool MapInDedicatedTable(address PhysicalAddress, T &&Callback)
 constexpr int MaxTablesPerMapping = 16;
 
 // Forward declarations: the walk's table lookups go through GetVirtualAddress, whose extractor chain sits
-// on the accessors defined below — the dependency cycle cannot be ordered away in the unity build
+// on the accessors defined below - the dependency cycle cannot be ordered away in the unity build
 template<typename T>
 bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSize);
 
@@ -423,11 +419,30 @@ void MemSetPreStartNtoskrnl(uint64_t Base)
         CachedPsLoadedModuleList =
             (uint64_t) (uintptr_t) FindFuncExports((address) Base, PsLoadedName);
 
-    for (uint32_t i = 0; i < sizeof(PsInitialName); ++i)
-        ((volatile char*) PsInitialName)[i] = 0;
-    for (uint32_t i = 0; i < sizeof(PsLoadedName); ++i)
-        ((volatile char*) PsLoadedName)[i] = 0;
+    // Volatile zero: the compiler must not elide the wipe of either stack buffer
+    auto WipeName = [](char (&Name)[32])
+    {
+        for (uint32_t i = 0; i < sizeof(Name); ++i)
+            ((volatile char*) Name)[i] = 0;
+    };
+    WipeName(PsInitialName);
+    WipeName(PsLoadedName);
 #endif // POSTBOX_JOB_ONLY
+}
+
+uint64_t MemPsInitialSystemProcess()
+{
+#ifdef POSTBOX_CHANNEL
+    PostboxMemCaches* Caches = PostboxGetMemCaches();
+    uint64_t Address = Caches ? Caches->PsInitialSystemProcess : 0;
+    if (!Address)
+        Address = __atomic_load_n(&CachedPsInitialSystemProcess, __ATOMIC_SEQ_CST);
+    return Address;
+#else
+    // Non-Postbox builds use the import slot; Postbox builds take the cached
+    // path above.
+    return (uint64_t) (uintptr_t) __imp_PsInitialSystemProcess;
+#endif
 }
 
 #ifdef DEBUG
@@ -522,7 +537,7 @@ address GetNtoskrnl()
     address base = (address) ((uint64_t) (void *) __imp_PsInitialSystemProcess & ~0xFFFull);
 
     // The scan reads image pages directly, with no IsAddressValid checks: a validity walk re-enters the
-    // extractor chain while the cache is empty — unbounded recursion, kernel stack overflow, bugcheck
+    // extractor chain while the cache is empty - unbounded recursion, kernel stack overflow, bugcheck
     // 0x7F/0x8. Direct reads are safe down to the base because every page belongs to the image
 
     auto NtoskrnlFile = Decode(NtoskrnlName);
@@ -608,7 +623,7 @@ address GetNtoskrnl()
 #endif
 }
 
-// Shared body of the two extractors below: scans PAGE then .text of ntoskrnl for the instruction
+// Shared body of the two extractors below: scans .text then .PAGE of ntoskrnl for the instruction
 // signature, verifies the shl displacement byte at Match + GuardOffset, and reads the imm64 at
 // Match + 2 (must be a canonical kernel pointer). The caller does the caching
 template<size_t N>
@@ -690,6 +705,10 @@ void MemAdoptCaches(PostboxMemCaches* Dst)
     __atomic_store_n(&CachedPfnPteAddressBase, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&CachedPsInitialSystemProcess, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&CachedPsLoadedModuleList, 0, __ATOMIC_SEQ_CST);
+    // the bootstrap nt base and the lazily cached System CR3 must not
+    // remain as static anchors after their state-page copies are live.
+    __atomic_store_n(&PreStartNtoskrnl, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&SystemCr3Value, 0, __ATOMIC_SEQ_CST);
 }
 
 // PA -> VA through the self-map: read PfnDatabase[PA >> 12].PteAddress, then the PTE's index in the
@@ -847,6 +866,7 @@ bool MapPhysicalToVirtual(address PhysicalAddress, T &&Callback, pagesize PageSi
     return false;
 }
 
+#ifdef DEBUG
 // Verifies the PTE_BASE extracted by GetPteBase() against the kernel itself: the exported MM routines
 // are ground truth, and the self-map walk must agree with them on each sample
 static bool SelfMapAgrees(address PteBase, address Va, address Physical, cr3 Cr3)
@@ -944,10 +964,11 @@ static uint32_t VerifyOneAddress(address Va, cr3 SystemCR3, const char *What)
     // PFN's PteAddress is the PDE/PDPTE), so skip the comparison for large-page samples
     address MmVirtual{};
     if (PageSize == Page_4KB) MmVirtual = win::MmGetVirtualForPhysical(MmPhysical);
-    if (MmVirtual && (uint64_t) GetVirtualAddress(MmPhysical) != (uint64_t) MmVirtual)
+    const address OurVirtual = MmVirtual ? GetVirtualAddress(MmPhysical) : address{};
+    if (MmVirtual && (uint64_t) OurVirtual != (uint64_t) MmVirtual)
     {
         print(ERROR("VerifyMemory: %s %p: PA->VA ours %p, MM %p"), What, (void *) Va,
-              (void *) GetVirtualAddress(MmPhysical), (void *) MmVirtual);
+              (void *) OurVirtual, (void *) MmVirtual);
         Failures++;
     }
 
@@ -986,8 +1007,8 @@ static uint32_t VerifyOneAddress(address Va, cr3 SystemCR3, const char *What)
 }
 
 // Write path on stack memory, so no kernel or image data is touched: a pattern goes in through the
-// physical mapper and through CopyVirtualMemory (the same path the command hook uses) and comes back
-// out through a direct read both times. Returns the number of failed checks
+// physical mapper and through CopyVirtualMemory, then comes back out through a direct read both
+// times. Returns the number of failed checks
 static uint32_t VerifyWritePath(cr3 SystemCR3)
 {
     uint8_t Expected[64];
@@ -1022,9 +1043,9 @@ static uint32_t VerifyWritePath(cr3 SystemCR3)
 
     memcpy(Scratch, Zeros, sizeof(Scratch));
 
-    // CopyVirtualMemory, the same path the NtCompareSigningLevels commands take (same address space
-    // here; the hook's cross-process case is the same code with a second CR3). It chunks across
-    // pages itself, so the full 64 bytes can go in one call
+    // CopyVirtualMemory walks both address spaces through AccessVirtualMemory; here both point at the
+    // same CR3. A cross-process copy is the same code with a second CR3. It chunks across pages
+    // itself, so the full 64 bytes can go in one call
     address Src = address((uint64_t) (void *) Expected);
     if (!CopyVirtualMemory(Src, SystemCR3, Va, SystemCR3, sizeof(Expected)) ||
         memcmp(Scratch, Expected, sizeof(Expected)))
@@ -1076,3 +1097,4 @@ bool VerifyMemory()
     else print(OK("VerifyMemory: all checks passed (VA->PA, PA->VA, validity, virtual/physical read, physical write, copy)"));
     return Failures == 0;
 }
+#endif

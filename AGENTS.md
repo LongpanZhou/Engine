@@ -1,5 +1,24 @@
 # Agent notes
 
+## Commenting rules
+
+- Write comments for the current code, not its history. Do not include task IDs,
+  dates, changelogs, reviewer labels, or narration about removed/legacy/test-only
+  code unless the comment defines current build behavior.
+- Explain why a non-obvious choice exists and what invariant it preserves. Do not
+  restate what the next line already says.
+- Keep comments technically accurate. Update or delete any comment that
+  contradicts the code.
+- Do not leave commented-out code. Delete it; version control keeps history.
+- Document ABI, layout, protocol, and offset invariants at the declaration or the
+  check that enforces them, not as prose in unrelated functions.
+- Use ASCII punctuation only: `-`, `->`, `...`. Do not use em dashes, arrows,
+  smart quotes, or other non-ASCII display characters in code or agent notes.
+- File headers describe purpose and current flow, not past changes or future
+  plans.
+- Test comments describe the behavior being pinned, not the bug or task that
+  prompted the test.
+
 ## Kernel debugging (WinDbg MCP)
 
 Default KDNET connection:
@@ -23,14 +42,14 @@ net:port=50001,key=1.2.3.4
 - To reset the guest, revert to `pre-driver-tests` and start the VM.
 - See `../VM-ACCESS.md` for guest credentials and the full rule.
 
-## Live kernel debugging — breakpoints, no dumps
+## Live kernel debugging - breakpoints, no dumps
 
 - Crashes are analyzed **live** over KDNET, never from a dump. There is no
   crash-dump workflow: do not configure, collect, or analyze `MEMORY.DMP`.
 - Attach with `open_kd_session` using the connection string above, install the
   breakpoint kit `mapload/scripts/kd_breakpoints.txt`, then `g`.
 - Keep the session attached while a risky run executes. On a bugcheck the
-  debugger stops at `nt!KeBugCheckEx` with the faulting context — run
+  debugger stops at `nt!KeBugCheckEx` with the faulting context - run
   `!analyze -v`, `kb`, `r`, inspect, then `g`.
 - Breakpoints are session-scoped. Reinstall them after every attach or reboot.
 - If a crash is missed, re-run the experiment with the debugger attached.

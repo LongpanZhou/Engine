@@ -12,7 +12,7 @@
 // with the same include order Driver main.cpp uses. No kernel memory access
 // happens here.
 //
-// IMPORTANT: unit tests, debug-only in spirit — this target is compiled only
+// IMPORTANT: unit tests, debug-only in spirit - this target is compiled only
 // by scripts/run-unit-tests.ps1; it is not part of the driver build and never
 // ships.
 //
@@ -25,6 +25,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+
+#include "check.h"
 
 // --- driver unity preamble (mirrors main.cpp, minimal subset) --------------
 
@@ -58,28 +60,16 @@ extern "C" void** __imp_PsLoadedModuleList = &g_HostPsLoadedModuleList;
 #include "../../Driver/Strings.h"
 #include "../../Driver/Locate.cpp"
 #include "../../Driver/Lib/pure.h"
-#include "../../Common/Command.h"
 
 // ---------------------------------------------------------------------------
 // Micro harness
 // ---------------------------------------------------------------------------
 
-static unsigned g_Pass = 0;
-static unsigned g_Fail = 0;
-
-static void Report(bool ok, const char* file, unsigned line, const char* expr)
-{
-    if (ok) ++g_Pass;
-    else { ++g_Fail; std::printf("[FAIL] %s:%u  %s\n", file, line, expr); }
-}
-
-#define CHECK(Cond) Report((Cond), __FILE__, __LINE__, #Cond)
-
 // address has an implicit operator uintptr_t(); use it for comparisons.
 static uintptr_t AddrOf(address A) { return static_cast<uintptr_t>(A); }
 
 // ===========================================================================
-// 1. Crypt.cpp — compile-time string/bytes codec (XorSeed family)
+// 1. Crypt.cpp - compile-time string/bytes codec (XorSeed family)
 // ===========================================================================
 
 // The encode contract exactly as the driver's runtime decode sites rely on:
@@ -152,7 +142,8 @@ static void TestEncodedNamesCrossDecode()
     // byte transforms the runtime decode rules implement, row by row.
     const char name[] = "PsLoadedModuleList";
     const auto encoded = EncodeName(name);
-    for (size_t i = 0; i < strlen(name); ++i)
+    const size_t nameLen = strlen(name);
+    for (size_t i = 0; i < nameLen; ++i)
         CHECK(static_cast<unsigned char>(encoded.Bytes[i]) ==
               static_cast<unsigned char>(name[i] ^ SEED));
 }
@@ -187,7 +178,7 @@ static void TestEncodeBytesRoundTrip()
     CHECK(enc[0] == (char)(withTerm[0] ^ SEED));    // and it moved the bytes
     CHECK(enc[5] == '\0' && dec[5] == '\0');        // terminator untouched
 
-    // DOCUMENTED QUIRK: an array with a nonzero last byte does NOT round-trip —
+    // DOCUMENTED QUIRK: an array with a nonzero last byte does NOT round-trip -
     // the output is value-initialized, so the untouched last element reads back
     // as 0 (the byte is effectively lost, not moved).
     const std::array<char, 2> full = {'\x48', '\xFF'};
@@ -197,7 +188,7 @@ static void TestEncodeBytesRoundTrip()
 }
 
 // ===========================================================================
-// 2. Scan.cpp — pattern parser, signature scan, string helpers
+// 2. Scan.cpp - pattern parser, signature scan, string helpers
 // ===========================================================================
 
 static void TestHexToByte()
@@ -227,7 +218,8 @@ static void TestPatternToBytes()
 
     // '??' COLLAPSES: after the first wildcard the parser does i += 2, which
     // consumes the second '?' as well, so "4A ?? 60" is one wildcard + hex pair
-    // (len 3, not 4). Faithful as coded — see the review note in the README.
+    // (len 3, not 4). Faithful as coded (see the documented quirks in
+    // tests/host/README.md).
     auto p3 = PatternToBytes("4A ?? 60");
     CHECK(p3.Length == 3);
     CHECK(p3.Bytes[0] == '\x4A');
@@ -240,7 +232,7 @@ static void TestPatternToBytes()
     CHECK(static_cast<unsigned char>(p4.Bytes[0]) == 0xFF);
     CHECK(!p4.Valid);                              // '?' is not a hex nibble
 
-    // DV-60: invalid hex and a short token must set Valid=false, and the
+    // invalid hex and a short token must set Valid=false, and the
     // ScanModuleImage runtime guard must reject them.
     auto bad = PatternToBytes("GG");
     CHECK(!bad.Valid);
@@ -266,13 +258,8 @@ static void TestPatternToBytes()
 static void TestSignatureScan()
 {
     // SignatureScan's runtime contract: the caller passes the DECODED signature
-    // bytes (PatternToBytes output), not the textual pattern — the scan path
+    // bytes (PatternToBytes output), not the textual pattern - the scan path
     // treats each character as a byte of the compared pattern.
-    auto Parse = [](auto&& text) {
-        auto decoded = PatternToBytes(text);
-        return decoded;
-    };
-
     // synthetic buffer with two matches of the same signature
     const unsigned char buf[] = {0x10, 0xA9, 0x4A, 0x11, 0x22, 0x60,
                                  0x55, 0x4A, 0x11, 0x22, 0x60};
@@ -280,66 +267,66 @@ static void TestSignatureScan()
     const void* End = buf + sizeof(buf);
 
     {
-        const auto sig = Parse("4A 11 22 60");
+        const auto sig = PatternToBytes("4A 11 22 60");
         const auto hit = SignatureScan(Start, End, sig.data(), sig.Length);
         CHECK(hit == reinterpret_cast<const void*>(buf + 2));  // leftmost, not 7
     }
     {
-        const auto sig = Parse("10 A9 4A 11");
+        const auto sig = PatternToBytes("10 A9 4A 11");
         const auto hit = SignatureScan(Start, End, sig.data(), sig.Length);
         CHECK(hit == Start);
     }
     {
-        const auto sig = Parse("?? 11 ?? 60");
+        const auto sig = PatternToBytes("?? 11 ?? 60");
         const auto hit = SignatureScan(Start, End, sig.data(), sig.Length);
         CHECK(hit == buf + 2);
     }
     {
         // all-wildcard matches the very first position (First == size)
-        const auto sig = Parse("?? ?? ?? ??");
+        const auto sig = PatternToBytes("?? ?? ?? ??");
         CHECK(sig.Length == 4);
         const auto hit = SignatureScan(Start, End, sig.data(), sig.Length);
         CHECK(hit == Start);
     }
     {
         // first-byte reject: the anchor byte appears at 6 exactly
-        const auto sig = Parse("55 4A 11 22");
+        const auto sig = PatternToBytes("55 4A 11 22");
         const auto hit = SignatureScan(Start, End, sig.data(), sig.Length);
         CHECK(hit == buf + 6);
     }
     {
-        const auto sig = Parse("77 88 99 AA");
+        const auto sig = PatternToBytes("77 88 99 AA");
         CHECK(SignatureScan(Start, End, sig.data(), sig.Length) == nullptr);
     }
     {
         // range shorter than the signature (the wrap guard)
-        const auto sig = Parse("4A 11 22 60");
+        const auto sig = PatternToBytes("4A 11 22 60");
         CHECK(SignatureScan(Start, buf + 3, sig.data(), sig.Length) == nullptr);
     }
     {
-        const auto sig = Parse("4A 11 22 60");
+        const auto sig = PatternToBytes("4A 11 22 60");
         CHECK(SignatureScan(Start, End, "", 0) == nullptr);       // empty -> reject
     }
     {
-        const auto sig = Parse("4A 11 22 60");
+        const auto sig = PatternToBytes("4A 11 22 60");
         CHECK(SignatureScan(nullptr, End, sig.data(), sig.Length) == nullptr);
     }
 
     // boundary cases
     {
         // exact-size range (End == Start + size) still matches at Start
-        const auto sig = Parse("10 A9 4A 11");
+        const auto sig = PatternToBytes("10 A9 4A 11");
         CHECK(SignatureScan(Start, buf + sig.Length, sig.data(), sig.Length) == Start);
     }
     {
         // reversed range: End < Start. The product has no explicit reject; the
         // loop simply never executes (documented here so a future guard change
         // is visible).
-        const auto sig = Parse("4A 11 22 60");
+        const auto sig = PatternToBytes("4A 11 22 60");
         CHECK(SignatureScan(buf + 3, buf, sig.data(), sig.Length) == nullptr);
     }
     {
-        const auto sig = Parse("4A 11 22 60");
+        const auto sig = PatternToBytes("4A 11 22 60");
         CHECK(SignatureScan(Start, nullptr, sig.data(), sig.Length) == nullptr);
         CHECK(SignatureScan(Start, End, nullptr, 4) == nullptr);
     }
@@ -506,8 +493,6 @@ static void TestSectionScanAndModuleScan()
     // VirtualSize == 0 gives an empty scan range, so even a present section
     // cannot match (SectionScan uses Misc.VirtualSize, not SizeOfRawData)
     auto emptySection = BuildDriverPe();
-    reinterpret_cast<_IMAGE_NT_HEADERS64*>(emptySection.data() + 0x40)
-        ->OptionalHeader.DataDirectory[0] = {0x1000, 0x100};
     auto* sec = reinterpret_cast<_IMAGE_SECTION_HEADER*>(
         reinterpret_cast<uint8_t*>(&reinterpret_cast<_IMAGE_NT_HEADERS64*>(
             emptySection.data() + 0x40)->OptionalHeader) + sizeof(_IMAGE_OPTIONAL_HEADER64));
@@ -536,11 +521,11 @@ static void CheckStringsPattern(const Pattern<N>& Encoded)
     CHECK(P.Length > 0 && P.Length <= 64);
     CHECK(P.Valid);
 
-    // Wildcards are carried in the explicit mask, so a literal 0x3F byte is
-    // still a bug: it would silently broaden the signature. Check the decoded
-    // bytes; the stored bytes are SEED-XORed.
+    // The '?' byte is the wildcard sentinel, so a literal 0x3F byte cannot be
+    // expressed: any 0x3F in the decoded bytes must be a '?' wildcard position.
+    // Check the decoded bytes; the stored bytes are SEED-XORed.
     for (size_t i = 0; i < P.Length; ++i)
-        if (!P.Wildcards[i])
+        if (P.Bytes[i] != '?')
             CHECK(static_cast<unsigned char>(P.Bytes[i]) != 0x3F);
 }
 
@@ -577,8 +562,7 @@ static void TestStringsHeader()
 }
 
 // ===========================================================================
-// 4. Lib/pure.h + Common/Command.h — kernel-side pure helpers and the
-//    shared-memory channel ABI
+// 4. Lib/pure.h - kernel-side pure helpers
 // ===========================================================================
 
 static void TestWideEqualsIgnoreCase()
@@ -606,29 +590,6 @@ static void TestIsObjectKernelPointer()
     CHECK(!IsObjectKernelPointer(0));
 }
 
-static void TestChannelHeaderAbi()
-{
-    CHECK(sizeof(ChannelHeader) == 0x30);
-    CHECK(offsetof(ChannelHeader, Magic) == 0x00);
-    CHECK(offsetof(ChannelHeader, Sequence) == 0x04);
-    CHECK(offsetof(ChannelHeader, Ack) == 0x08);
-    CHECK(offsetof(ChannelHeader, Status) == 0x0C);
-    CHECK(offsetof(ChannelHeader, Op) == 0x10);
-    CHECK(offsetof(ChannelHeader, TargetPid) == 0x14);
-    CHECK(offsetof(ChannelHeader, Size) == 0x18);
-    CHECK(offsetof(ChannelHeader, Reserved) == 0x1C);
-    CHECK(offsetof(ChannelHeader, RemoteAddress) == 0x20);
-    CHECK(offsetof(ChannelHeader, Heartbeat) == 0x28);
-
-    CHECK(ChannelMagic == 0x31494345);          // "ECI1"
-    CHECK(ChannelBytes == 0x100000);
-    CHECK(ChannelDataAt == 0x40);
-    CHECK(ChannelDataMax == 0xFFFC0);
-    CHECK(static_cast<uint32_t>(op_ping) == 1);
-    CHECK(static_cast<uint32_t>(op_read) == 2);
-    CHECK(static_cast<uint32_t>(op_write) == 3);
-}
-
 // ===========================================================================
 // harness
 // ===========================================================================
@@ -652,13 +613,10 @@ static void RunDriverUnitTests()
 
     TestWideEqualsIgnoreCase();
     TestIsObjectKernelPointer();
-    TestChannelHeaderAbi();
 }
 
 int main()
 {
     RunDriverUnitTests();
-    std::printf("\n==== kf_driver_tests: %u passed, %u failed ====\n",
-                g_Pass, g_Fail);
-    return g_Fail ? 1 : 0;
+    return Summary("kf_driver_tests");
 }

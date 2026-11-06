@@ -54,9 +54,6 @@ template<size_t N>
 struct Pattern
 {
     std::array<char, N> Bytes;
-    // Explicit wildcard mask: 1 = '?', 0 = literal byte. Keeping this separate
-    // from Bytes means a literal 0x3F can never be mistaken for a wildcard.
-    std::array<uint8_t, N> Wildcards;
     size_t Length;
     bool Valid;
 
@@ -74,13 +71,13 @@ constexpr bool PatternIsValid(const Pattern<N> &P) { return P.Valid; }
 template<size_t N>
 constexpr Pattern<N> EncodeBytes(const Pattern<N> &In)
 {
-    return {XorSeed(In.Bytes), In.Wildcards, In.Length, In.Valid};
+    return {XorSeed(In.Bytes), In.Length, In.Valid};
 }
 
 template<size_t N>
 constexpr Pattern<N> Decode(const Pattern<N> &In)
 {
-    return {XorSeed(In.Bytes), In.Wildcards, In.Length, In.Valid};
+    return {XorSeed(In.Bytes), In.Length, In.Valid};
 }
 
 // Hex to bytes
@@ -97,7 +94,6 @@ template<size_t N>
 constexpr Pattern<N> PatternToBytes(const char (&Signature)[N])
 {
     std::array<char, N> Bytes{};
-    std::array<uint8_t, N> Wildcards{};
     size_t i = 0;
     size_t len = 0;
     bool valid = true;
@@ -108,7 +104,6 @@ constexpr Pattern<N> PatternToBytes(const char (&Signature)[N])
         if (Signature[i] == '?')
         {
             Bytes[len] = '?';
-            Wildcards[len] = 1;
             ++len;
             i += 2;
             continue;
@@ -121,44 +116,32 @@ constexpr Pattern<N> PatternToBytes(const char (&Signature)[N])
         if (hi == 0xFF || lo == 0xFF) valid = false;
 
         Bytes[len] = static_cast<char>(hi << 4 | lo);
-        Wildcards[len] = 0;
         ++len;
         i += 2;
     }
 
     Bytes[len] = '\0';
-    return {Bytes, Wildcards, len, valid};
+    return {Bytes, len, valid};
 }
 
-// True if the signature matches at Current. Wildcards are explicit mask bits;
-// a literal 0x3F byte is compared normally.
-static bool Matches(const char *Current, const char *Signature,
-                    const uint8_t *Wildcards, size_t size)
+// True if the signature matches at Current. The '?' byte is the wildcard
+// sentinel; a literal 0x3F byte cannot be expressed in a signature.
+static bool Matches(const char *Current, const char *Signature, size_t size)
 {
     for (size_t i = 0; i < size; ++i)
     {
-        if ((Wildcards && Wildcards[i]) || (!Wildcards && Signature[i] == '?'))
+        if (Signature[i] == '?')
             continue;
         if (Signature[i] != Current[i]) return false;
     }
     return true;
 }
 
-// Per-scan address dumps are debug-only noise on a normal load; flip this when a signature miss needs
-// the exact range that was searched
-constexpr bool VerboseScan = false;
-
 // Signature scan over a range. This is intentionally quiet: ScanModuleImage tries .text and then
 // .PAGE and logs one result after all section attempts are done
 address SignatureScan(const void *StartAddress, const void *EndAddress, const char *Signature,
-                      size_t Size, const uint8_t *Wildcards = nullptr)
+                      size_t Size)
 {
-    if constexpr (VerboseScan)
-    {
-        print(INFO("Start Address: %p"), StartAddress);
-        print(INFO("End Address: %p"), EndAddress);
-        print(INFO("Signature Address: %p"), Signature);
-    }
     size_t size = Size;
 
     // Nothing to search: a missing range, or one shorter than the signature (the bound below would wrap)
@@ -169,20 +152,20 @@ address SignatureScan(const void *StartAddress, const void *EndAddress, const ch
     }
 
     // First-byte reject: the earliest non-wildcard byte of the signature. A position where it differs
-    // cannot match, so the full compare only runs where it hits — for a concrete first byte roughly
+    // cannot match, so the full compare only runs where it hits - for a concrete first byte roughly
     // one position in 256. The whole compare below is still what decides, so the leftmost match is
     // unchanged. An all-wildcard signature (First == size) keeps matching at the first position,
     // exactly as before
     size_t First = 0;
-    while (First < size &&
-           ((Wildcards && Wildcards[First]) || (!Wildcards && Signature[First] == '?')))
+    while (First < size && Signature[First] == '?')
         ++First;
 
-    for (const char *Current = (char *) StartAddress; Current <= (char *) ((size_t) EndAddress - size); ++Current)
+    const char *Last = (char *) ((size_t) EndAddress - size);
+    for (const char *Current = (char *) StartAddress; Current <= Last; ++Current)
     {
         // In range by construction: First < size, and the loop bound holds Current + size <= EndAddress
         if (First < size && Current[First] != Signature[First]) continue;
-        if (Matches(Current, Signature, Wildcards, size))
+        if (Matches(Current, Signature, size))
             return Current;
     }
 
@@ -191,9 +174,8 @@ address SignatureScan(const void *StartAddress, const void *EndAddress, const ch
 
 // Pattern scan over one image section
 address SectionScan(address BaseAddress, const char *SectionName, const char *Signature,
-                    size_t Size, const uint8_t *Wildcards = nullptr)
+                    size_t Size)
 {
-    (void) Wildcards;   // signature wildcard table is applied by the caller
     // Get section
     auto dosHeader = (_IMAGE_DOS_HEADER *) BaseAddress;
     auto ntHeader = (_IMAGE_NT_HEADERS64 *) (BaseAddress + dosHeader->e_lfanew);
@@ -225,29 +207,47 @@ address SectionScan(address BaseAddress, const char *SectionName, const char *Si
     return SignatureScan(sectionStart, sectionEnd, Signature, Size);
 }
 
+// The three export arrays plus their entry count, from the image's DataDirectory[0]
+struct ExportTable
+{
+    uint32_t *Functions;
+    uint16_t *Ordinals;
+    uint32_t *Names;
+    uint32_t Count;
+};
+
+// Shared DOS/NT/export-directory prologue for both lookups below. False when the image has no
+// export directory
+static bool GetExportTable(address BaseAddress, ExportTable &Table)
+{
+    if (!BaseAddress) return false;
+
+    auto dosHeader = (_IMAGE_DOS_HEADER *) BaseAddress;
+    auto ntHeader = (_IMAGE_NT_HEADERS64 *) (BaseAddress + dosHeader->e_lfanew);
+    auto &dataDir = ntHeader->OptionalHeader.DataDirectory[0];
+    if (!dataDir.VirtualAddress) return false;
+
+    auto exportDir = (_IMAGE_EXPORT_DIRECTORY *) (BaseAddress + dataDir.VirtualAddress);
+    Table.Functions = (uint32_t *) (BaseAddress + exportDir->AddressOfFunctions);
+    Table.Ordinals = (uint16_t *) (BaseAddress + exportDir->AddressOfNameOrdinals);
+    Table.Names = (uint32_t *) (BaseAddress + exportDir->AddressOfNames);
+    Table.Count = exportDir->NumberOfNames;
+    return true;
+}
+
 // Lazy Import: resolves a name through the image's export table, so no import table entries are
 // created (data exports come back as the variable's address)
 address FindFuncExports(address BaseAddress, const char *FuncName)
 {
-    if (!BaseAddress) return nullptr;
-
-    // DataDirectory[0] is the export directory; an image without one has nothing to resolve
-    auto dosHeader = (_IMAGE_DOS_HEADER *) BaseAddress;
-    auto ntHeader = (_IMAGE_NT_HEADERS64 *) (BaseAddress + dosHeader->e_lfanew);
-    auto &dataDir = ntHeader->OptionalHeader.DataDirectory[0];
-    if (!dataDir.VirtualAddress) return nullptr;
-
-    auto exportDir = (_IMAGE_EXPORT_DIRECTORY *) (BaseAddress + dataDir.VirtualAddress);
-    uint32_t *functions = (uint32_t *) (BaseAddress + exportDir->AddressOfFunctions);
-    uint16_t *ordinals = (uint16_t *) (BaseAddress + exportDir->AddressOfNameOrdinals);
-    uint32_t *names = (uint32_t *) (BaseAddress + exportDir->AddressOfNames);
+    ExportTable Table{};
+    if (!GetExportTable(BaseAddress, Table)) return nullptr;
 
     // Loop through export table
-    for (uint32_t i = 0; i < exportDir->NumberOfNames; ++i)
+    for (uint32_t i = 0; i < Table.Count; ++i)
     {
-        const char *funcName = (const char *) (BaseAddress + names[i]);
+        const char *funcName = (const char *) (BaseAddress + Table.Names[i]);
         if (StringEquals(funcName, FuncName))
-            return BaseAddress + functions[ordinals[i]];
+            return BaseAddress + Table.Functions[Table.Ordinals[i]];
     }
 
     print(ERROR("EXPORT FUNCTION NOT FOUND!"));
@@ -262,31 +262,22 @@ void FindFuncExportsBatch(address BaseAddress, const char *const *Names, address
     for (uint32_t i = 0; i < Count; ++i)
         Results[i] = nullptr;
 
-    if (!BaseAddress) return;
-
-    auto dosHeader = (_IMAGE_DOS_HEADER *) BaseAddress;
-    auto ntHeader = (_IMAGE_NT_HEADERS64 *) (BaseAddress + dosHeader->e_lfanew);
-    auto &dataDir = ntHeader->OptionalHeader.DataDirectory[0];
-    if (!dataDir.VirtualAddress) return;
-
-    auto exportDir = (_IMAGE_EXPORT_DIRECTORY *) (BaseAddress + dataDir.VirtualAddress);
-    uint32_t *functions = (uint32_t *) (BaseAddress + exportDir->AddressOfFunctions);
-    uint16_t *ordinals = (uint16_t *) (BaseAddress + exportDir->AddressOfNameOrdinals);
-    uint32_t *names = (uint32_t *) (BaseAddress + exportDir->AddressOfNames);
+    ExportTable Table{};
+    if (!GetExportTable(BaseAddress, Table)) return;
 
     // One pass over the exports, stopping once everything on the wanted list is found. The
     // wanted list is a handful of names, so the inner compare loop is negligible next to the
     // table walk it saves
     uint32_t Missing = Count;
-    for (uint32_t i = 0; i < exportDir->NumberOfNames && Missing; ++i)
+    for (uint32_t i = 0; i < Table.Count && Missing; ++i)
     {
-        const char *funcName = (const char *) (BaseAddress + names[i]);
+        const char *funcName = (const char *) (BaseAddress + Table.Names[i]);
 
         for (uint32_t j = 0; j < Count; ++j)
         {
             if (!Results[j] && StringEquals(funcName, Names[j]))
             {
-                Results[j] = BaseAddress + functions[ordinals[i]];
+                Results[j] = BaseAddress + Table.Functions[Table.Ordinals[i]];
                 Missing--;
                 break;
             }

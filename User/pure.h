@@ -1,13 +1,13 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// Engine-ci/User/pure.h — PostboxClient helpers with no Win32 calls, kept here
-// so the host unit tests can exercise the argument parser and stop policy.
+// Engine-ci/User/pure.h - PostboxClient helpers with no Win32 calls: argument
+// parsing and stop policy.
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 
-// Test-only client modes.
+// Optional client modes.
 struct ClientOptions
 {
     bool Kill;
@@ -16,8 +16,7 @@ struct ClientOptions
     const char* LoaderPath;
     const char* LoaderArgs;
 #ifdef POSTBOX_SELFTEST
-    // The read/write/invalid/bulk sequence is a test harness, not a product
-    // default. It is compiled only into the explicit test client.
+    // Enabled only with POSTBOX_SELFTEST.
     bool SelfTest;
 #endif
 #ifdef NMI_PROBE
@@ -52,8 +51,20 @@ inline bool ParseMilliseconds(const char* Text, uint32_t& Out)
     return true;
 }
 
-// Flags may appear in any order. Unrecognized arguments are ignored, which keeps the
-// User.exe entry point working: it forwards its own "--postbox" as argv[1].
+inline bool ParseU32Option(int argc, char** argv, int& i, uint32_t& Out,
+                           const char* Name, const char* What)
+{
+    if (i + 1 >= argc || !ParseMilliseconds(argv[i + 1], Out))
+    {
+        std::printf("postbox: %s requires %s\n", Name, What);
+        return false;
+    }
+    ++i;
+    return true;
+}
+
+// Flags may appear in any order. Unrecognized arguments are ignored, so the
+// User.exe wrapper's "--postbox" argument is accepted.
 inline bool ParseArguments(int argc, char** argv, ClientOptions& Options)
 {
     for (int i = 1; i < argc; ++i)
@@ -71,12 +82,9 @@ inline bool ParseArguments(int argc, char** argv, ClientOptions& Options)
 #endif
         else if (std::strcmp(Arg, "--hold") == 0)
         {
-            if (i + 1 >= argc || !ParseMilliseconds(argv[i + 1], Options.HoldMs))
-            {
-                std::printf("postbox: --hold requires a millisecond value\n");
+            if (!ParseU32Option(argc, argv, i, Options.HoldMs, "--hold",
+                                "a millisecond value"))
                 return false;
-            }
-            ++i;
         }
 #ifdef NMI_PROBE
         else if (std::strcmp(Arg, "--nmi-probe") == 0)
@@ -85,12 +93,9 @@ inline bool ParseArguments(int argc, char** argv, ClientOptions& Options)
         }
         else if (std::strcmp(Arg, "--nmi-spin") == 0)
         {
-            if (i + 1 >= argc || !ParseMilliseconds(argv[i + 1], Options.NmiSpinMs))
-            {
-                std::printf("postbox: --nmi-spin requires a millisecond value\n");
+            if (!ParseU32Option(argc, argv, i, Options.NmiSpinMs, "--nmi-spin",
+                                "a millisecond value"))
                 return false;
-            }
-            ++i;
         }
         else if (std::strcmp(Arg, "--nmi-status") == 0)
         {
@@ -102,22 +107,16 @@ inline bool ParseArguments(int argc, char** argv, ClientOptions& Options)
         }
         else if (std::strcmp(Arg, "--nmi-gate-hold") == 0)
         {
-            if (i + 1 >= argc || !ParseMilliseconds(argv[i + 1], Options.NmiGateHoldMs))
-            {
-                std::printf("postbox: --nmi-gate-hold requires a millisecond value\n");
+            if (!ParseU32Option(argc, argv, i, Options.NmiGateHoldMs,
+                                "--nmi-gate-hold", "a millisecond value"))
                 return false;
-            }
-            ++i;
             Options.NmiGate = true;
         }
         else if (std::strcmp(Arg, "--nmi-gate-storm") == 0)
         {
-            if (i + 1 >= argc || !ParseMilliseconds(argv[i + 1], Options.NmiGateStorm))
-            {
-                std::printf("postbox: --nmi-gate-storm requires a count\n");
+            if (!ParseU32Option(argc, argv, i, Options.NmiGateStorm,
+                                "--nmi-gate-storm", "a count"))
                 return false;
-            }
-            ++i;
             Options.NmiGate = true;
         }
 #endif
@@ -129,12 +128,9 @@ inline bool ParseArguments(int argc, char** argv, ClientOptions& Options)
 #endif
         else if (std::strcmp(Arg, "--hold-ping") == 0)
         {
-            if (i + 1 >= argc || !ParseMilliseconds(argv[i + 1], Options.HoldPingMs))
-            {
-                std::printf("postbox: --hold-ping requires a millisecond value\n");
+            if (!ParseU32Option(argc, argv, i, Options.HoldPingMs, "--hold-ping",
+                                "a millisecond value"))
                 return false;
-            }
-            ++i;
         }
         else if (std::strcmp(Arg, "--loader") == 0)
         {

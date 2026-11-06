@@ -100,10 +100,7 @@ address EnumerateKProcess(const wchar_t *ProcessName)
         if (!(entry->DllBase && moduleName.Length && !(moduleName.Length & 1) && moduleName.Buffer))
             continue;
 
-        // Print info
-        // print(INFO("Module Name: %ws"), moduleName.Buffer);
-
-        // Str cmp
+        // Match the module name.
         if (WideEqualsIgnoreCase(moduleName.Buffer, ProcessName, moduleName.Length / sizeof(wchar_t)))
             return entry->DllBase;
     }
@@ -113,12 +110,11 @@ address EnumerateKProcess(const wchar_t *ProcessName)
     return nullptr;
 }
 
-// True if the process's image path ends in ProcessName, with a '\' before it. Only the file name counts, not the directory
-bool ProcessHasName(_EPROCESS *pProcess, const wchar_t *ProcessName)
+// Shared suffix check: the caller supplies the target length when it is fixed across a walk.
+static bool ProcessHasNameOfLength(_EPROCESS *pProcess, const wchar_t *ProcessName, size_t targetLen)
 {
     if (!pProcess->ImageFilePointer || !pProcess->ImageFilePointer->FileName.Length) return false;
 
-    size_t targetLen = WideStringLength(ProcessName);
     size_t processLen = pProcess->ImageFilePointer->FileName.Length / sizeof(wchar_t);
     if (!targetLen || processLen <= targetLen) return false;
 
@@ -127,14 +123,24 @@ bool ProcessHasName(_EPROCESS *pProcess, const wchar_t *ProcessName)
     return FileName[NameStart - 1] == L'\\' && BytesEqual(FileName + NameStart, ProcessName, targetLen * sizeof(wchar_t));
 }
 
+// True if the process's image path ends in ProcessName, with a '\' before it. Only the file name counts, not the directory
+bool ProcessHasName(_EPROCESS *pProcess, const wchar_t *ProcessName)
+{
+    if (!pProcess->ImageFilePointer || !pProcess->ImageFilePointer->FileName.Length) return false;
+    return ProcessHasNameOfLength(pProcess, ProcessName, WideStringLength(ProcessName));
+}
+
 _EPROCESS *EnumerateEProcess(const wchar_t *ProcessName, const uint64_t PID = -1)
 {
     // Parameters
     print(INFO("Target EProcess Name: %ws"), ProcessName);
     print(INFO("Target PID: %p"), PID);
 
-    // Get system default EProcess n ListEntry
-    _EPROCESS *Process = (_EPROCESS *) *__imp_PsInitialSystemProcess;
+    // Get system default EProcess and ListEntry from the loader-resolved data
+    // export; the Postbox image has no PsInitialSystemProcess IAT slot.
+    const uint64_t PsInitial = MemPsInitialSystemProcess();
+    if (!PsInitial) return nullptr;
+    _EPROCESS *Process = *(_EPROCESS **) (uintptr_t) PsInitial;
     _LIST_ENTRY *pHead = &(Process->ActiveProcessLinks);
     _LIST_ENTRY *pCurrent = pHead;
 
@@ -143,6 +149,7 @@ _EPROCESS *EnumerateEProcess(const wchar_t *ProcessName, const uint64_t PID = -1
     // counts are far below the bound, so a well-formed list ends long before it
     constexpr uint32_t MaxProcessWalk = 4096;
     uint32_t Count = 0;
+    size_t TargetNameLength = 0;   // fixed for the walk; measured on the first matchable entry
 
     // The Flink read has a race window: the list is mutated at process create/exit under locks
     // this walk does not take, so an entry may unlink between being observed and being followed.
@@ -154,20 +161,16 @@ _EPROCESS *EnumerateEProcess(const wchar_t *ProcessName, const uint64_t PID = -1
         pCurrent = pCurrent->Flink;
         Count++;
 
-        // PID cmp
-        // print(INFO("Process Name: %s, PID: %p"), pProcess->ImageFileName, pProcess->UniqueProcessId);
         if (pProcess->UniqueProcessId == (void *) PID)
             return pProcess;
 
-        // Check if EProcess has ImageFilePointer n FilePath
+        // Skip entries without a file path. The fixed target name is measured
+        // once, on the first candidate that can actually match.
         if (!pProcess->ImageFilePointer || !pProcess->ImageFilePointer->FileName.Length)
             continue;
 
-        // Print info
-        // print(INFO("File Path: %ws"),
-        //       pProcess->ImageFilePointer->FileName.Buffer);
-
-        if (ProcessHasName(pProcess, ProcessName)) return pProcess;
+        if (!TargetNameLength) TargetNameLength = WideStringLength(ProcessName);
+        if (ProcessHasNameOfLength(pProcess, ProcessName, TargetNameLength)) return pProcess;
     } while (pCurrent && pCurrent != pHead && Count < MaxProcessWalk);
 
     // Not Found
@@ -175,7 +178,7 @@ _EPROCESS *EnumerateEProcess(const wchar_t *ProcessName, const uint64_t PID = -1
     return nullptr;
 }
 
-// DV-57: runtime layout check for the EPROCESS/PEB fields the driver reads.
+// Runtime layout check for the EPROCESS/PEB fields the driver reads.
 // The static asserts in structs.h pin the compile-time offsets; this check
 // proves the live System process matches the same layout before any walk.
 // The job-only build performs the equivalent check from its loader-provided
@@ -183,7 +186,9 @@ _EPROCESS *EnumerateEProcess(const wchar_t *ProcessName, const uint64_t PID = -1
 #ifndef POSTBOX_JOB_ONLY
 bool VerifyProcessLayout()
 {
-    const _EPROCESS* System = (_EPROCESS*) *__imp_PsInitialSystemProcess;
+    const uint64_t PsInitial = MemPsInitialSystemProcess();
+    if (!PsInitial) return false;
+    const _EPROCESS* System = *(_EPROCESS **) (uintptr_t) PsInitial;
     if (!System) return false;
     if (System->UniqueProcessId != (void*) 4) return false;
     if (System->Peb != nullptr) return false;

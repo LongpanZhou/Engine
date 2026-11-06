@@ -2,8 +2,8 @@
 // hardcoded offsets beyond the record layouts. Uses ScanModuleImage, ResolveRipRelative, GetNtoskrnl,
 // EnumerateKProcess and the encoded strings. The fourth (WdFilter) is Defender's own bookkeeping and
 // is the only one that can legitimately have nothing to do on a stripped image.
-// Compiled into both variants: release builds lose print() output, but the cleaners still run from
-// DriverEntry step 0 and DriverExit
+// Compiled only when MANUAL_MAP_ONLY is not defined. Release builds omit print()
+// output, but the cleaners run from DriverEntry and DriverExit.
 
 // Shared helpers
 // ---------------------------------------------------------------------------
@@ -43,7 +43,7 @@ address ResolveKernelSymbol(const char *Name)
     return FindFuncExports(Nt, Name);
 }
 
-// Batch variant: one walk of ntoskrnl's export table resolves every name at once — the single
+// Batch variant: one walk of ntoskrnl's export table resolves every name at once - the single
 // variant above re-walks the whole table per symbol. Names[i] lands in Results[i]; a name
 // not exported leaves that slot null
 static void ResolveKernelSymbols(const char *const *Names, address *Results, uint32_t Count)
@@ -72,6 +72,18 @@ static uint64_t CachedWdFilterCount = 0;
 static uint64_t CachedWdFilterArray = 0;
 static uint64_t CachedWdFilterFree = 0;
 
+// Shared prologue for the Find* resolvers: true when Cache already holds a terminal value (Result is
+// the typed address, or null for Failed); false when the caller must run the scan.
+template<typename T>
+static bool LoadTraceCache(uint64_t* Cache, T* Result)
+{
+    uint64_t Cached = __atomic_load_n(Cache, __ATOMIC_SEQ_CST);
+    if (!Cached) return false;
+
+    *Result = Cached == Failed ? (T) nullptr : (T) Cached;
+    return true;
+}
+
 // Case-folded equality of two UNICODE_STRINGs (the names compared here are ASCII file names, so
 // folding the 6th bit is exact). Null buffers, odd lengths or mismatched lengths do not match
 static bool WideNameEquals(const _UNICODE_STRING* A, const _UNICODE_STRING* B)
@@ -79,7 +91,8 @@ static bool WideNameEquals(const _UNICODE_STRING* A, const _UNICODE_STRING* B)
     if (!A || !B || !A->Buffer || !B->Buffer) return false;
     if (A->Length != B->Length || (A->Length & 1)) return false;
 
-    for (uint32_t i = 0; i < A->Length / sizeof(wchar_t); ++i)
+    const uint32_t Chars = A->Length / sizeof(wchar_t);
+    for (uint32_t i = 0; i < Chars; ++i)
         if (!(A->Buffer[i] == B->Buffer[i] || (A->Buffer[i] | 0x20) == (B->Buffer[i] | 0x20)))
             return false;
 
@@ -144,6 +157,16 @@ static bool IsValidTraceTarget(const _UNICODE_STRING* Target)
            IsKernelPointer((uint64_t) Target->Buffer);
 }
 
+// A PiDDB record name is well formed: even bounded length, capacity covers it, and a non-empty
+// name has a kernel-resident buffer. A zero-length name is legal here (the walkers treat it as
+// non-matching, not as damage).
+static bool IsPlausiblePiDDBEntryName(const _UNICODE_STRING& Name)
+{
+    return !(Name.Length & 1) && Name.Length <= MaxPiDDBCacheNameBytes &&
+           Name.MaximumLength >= Name.Length &&
+           (!Name.Length || IsKernelPointer((uint64_t) Name.Buffer));
+}
+
 // Reads a header field without forming a misaligned typed pointer: the table base is only known to be
 // byte-aligned, and -Wcast-align is part of the build. The constant size makes __builtin_memcpy inline
 template<typename T>
@@ -168,8 +191,8 @@ static uint64_t CachedPiDDBLock = 0;
 // to the head, so the whole cache is reachable without ever touching the AVL tree
 static _LIST_ENTRY* FindPiDDBCacheList(address Nt)
 {
-    uint64_t Cached = __atomic_load_n(&CachedPiDDBCacheList, __ATOMIC_SEQ_CST);
-    if (Cached) return Cached == Failed ? nullptr : (_LIST_ENTRY *) Cached;
+    _LIST_ENTRY* Cached = nullptr;
+    if (LoadTraceCache(&CachedPiDDBCacheList, &Cached)) return Cached;
 
     address Match = ScanModuleImage(Nt, Decode(PiDDBCacheListSignature));
     if (!Match)
@@ -197,8 +220,8 @@ static _LIST_ENTRY* FindPiDDBCacheList(address Nt)
 // an arbitrary pool block. Count/depth/routine fields match the live 19041 table (142 entries, depth 9)
 static void* FindPiDDBCacheTable(address Nt)
 {
-    uint64_t Cached = __atomic_load_n(&CachedPiDDBCacheTable, __ATOMIC_SEQ_CST);
-    if (Cached) return Cached == Failed ? nullptr : (void *) Cached;
+    void* Cached = nullptr;
+    if (LoadTraceCache(&CachedPiDDBCacheTable, &Cached)) return Cached;
 
     address Match = ScanModuleImage(Nt, Decode(PiDDBCacheTableSignature));
     if (!Match)
@@ -243,8 +266,8 @@ static void* FindPiDDBCacheTable(address Nt)
 // lands on the global. The first two ERESOURCE fields are the system-resource list links
 static void* FindPiDDBLock(address Nt)
 {
-    uint64_t Cached = __atomic_load_n(&CachedPiDDBLock, __ATOMIC_SEQ_CST);
-    if (Cached) return Cached == Failed ? nullptr : (void *) Cached;
+    void* Cached = nullptr;
+    if (LoadTraceCache(&CachedPiDDBLock, &Cached)) return Cached;
 
     address Match = ScanModuleImage(Nt, Decode(PiDDBLockSignature));
     if (!Match)
@@ -289,8 +312,8 @@ static bool ForEachPiDDBEntry(_LIST_ENTRY* Head, F Visitor)
         // MaxPiDDBEntries entries counts as complete, and a null next pointer counts as damage
         if (Link == Head) return true;
 
-        // Validate the link before reading through it: the old order read Link->Flink first, so a
-        // corrupt Head->Flink faulted before the IsKernelPointer guard could reject it
+        // Validate the link before reading through it; a corrupt Head->Flink would otherwise fault
+        // before the IsKernelPointer guard could reject it
         if (!IsKernelPointer((uint64_t) Link) || Walked >= MaxPiDDBEntries)
         {
             print(WARN("PiDDB: malformed link %p, walk stopped"), (void *) Link);
@@ -301,9 +324,7 @@ static bool ForEachPiDDBEntry(_LIST_ENTRY* Head, F Visitor)
         // torn or malformed entry would read garbage as pointers
         auto Entry = (_PiDDB_CACHE_ENTRY *) Link;
         if (!IsKernelPointer((uint64_t) Link->Flink) ||
-            (Entry->DriverName.Length & 1) || Entry->DriverName.Length > MaxPiDDBCacheNameBytes ||
-            Entry->DriverName.MaximumLength < Entry->DriverName.Length ||
-            (Entry->DriverName.Length && !IsKernelPointer((uint64_t) Entry->DriverName.Buffer)))
+            !IsPlausiblePiDDBEntryName(Entry->DriverName))
         {
             print(WARN("PiDDB: malformed entry %p, walk stopped"), (void *) Entry);
             return false;
@@ -352,7 +373,7 @@ static bool ResolvePiDDBRoutines()
 }
 
 // A record belongs to this driver when it still carries the loader's name, or when it was camouflaged
-// by an older load and carries this binary's timestamp under a different name. A zero timestamp is
+// by a previous load and carries this binary's timestamp under a different name. A zero timestamp is
 // never used as a wildcard
 static bool PiDDBEntryIsTarget(const _PiDDB_CACHE_ENTRY* Entry, const _UNICODE_STRING* Name, uint32_t Timestamp)
 {
@@ -361,8 +382,8 @@ static bool PiDDBEntryIsTarget(const _PiDDB_CACHE_ENTRY* Entry, const _UNICODE_S
 }
 
 // Put the loader's original name back before touching the AVL tree. The tree still positions the node
-// by the key it was inserted with; the old camouflage changed only the stored name, so restoring it
-// makes RtlDeleteElementGenericTableAvl's key search reach the node again
+// by the key it was inserted with; the stored name was changed but the insertion key was not, so
+// restoring it makes RtlDeleteElementGenericTableAvl's key search reach the node again
 static bool RestorePiDDBEntryName(_PiDDB_CACHE_ENTRY* Entry, const _UNICODE_STRING* Original)
 {
     if (!Entry->DriverName.Buffer || !Original->Buffer || (Original->Length & 1) ||
@@ -510,11 +531,7 @@ bool ClearPiDDBCache(const _UNICODE_STRING* Target, uint32_t Timestamp)
         _LIST_ENTRY* Next = Link->Flink;
 
         if (!IsKernelPointer((uint64_t) Next) ||
-            (Entry->DriverName.Length & 1) ||
-            Entry->DriverName.Length > MaxPiDDBCacheNameBytes ||
-            Entry->DriverName.MaximumLength < Entry->DriverName.Length ||
-            (Entry->DriverName.Length &&
-             (!Entry->DriverName.Buffer || !IsKernelPointer((uint64_t) Entry->DriverName.Buffer))))
+            !IsPlausiblePiDDBEntryName(Entry->DriverName))
         {
             print(WARN("PiDDB: malformed entry %p, clean stopped"), (void *) Entry);
             ListOk = false;
@@ -598,11 +615,7 @@ static bool VerifyPiDDBTree(void* Table, const _UNICODE_STRING* Name, uint32_t T
         auto Node = (_PiDDB_AVL_NODE *) Item.Node;
         auto Entry = (_PiDDB_CACHE_ENTRY *) ((uintptr_t) Node + PiDDBAvlUserDataOffset);
 
-        if ((Entry->DriverName.Length & 1) ||
-            Entry->DriverName.Length > MaxPiDDBCacheNameBytes ||
-            Entry->DriverName.MaximumLength < Entry->DriverName.Length ||
-            (Entry->DriverName.Length &&
-             (!Entry->DriverName.Buffer || !IsKernelPointer((uint64_t) Entry->DriverName.Buffer))))
+        if (!IsPlausiblePiDDBEntryName(Entry->DriverName))
         {
             print(ERROR("VerifyPiDDB: malformed tree entry %p"), (void *) Entry);
             return false;
@@ -747,8 +760,8 @@ struct _MM_UNLOADED_DRIVER
 // The array itself: the mov loads &MmUnloadedDrivers, one deref reads the array pointer out
 static _MM_UNLOADED_DRIVER* FindMmUnloadedDrivers(address Nt)
 {
-    uint64_t Cached = __atomic_load_n(&CachedMmUnloadedDrivers, __ATOMIC_SEQ_CST);
-    if (Cached) return Cached == Failed ? nullptr : (_MM_UNLOADED_DRIVER *) Cached;
+    _MM_UNLOADED_DRIVER* Cached = nullptr;
+    if (LoadTraceCache(&CachedMmUnloadedDrivers, &Cached)) return Cached;
 
     address Match = ScanModuleImage(Nt, Decode(MmUnloadedDriversSignature));
     if (!Match)
@@ -776,8 +789,8 @@ static _MM_UNLOADED_DRIVER* FindMmUnloadedDrivers(address Nt)
 // The used-slot count, behind the "cmp eax, 0x32"
 static uint32_t* FindMmLastUnloadedDriver(address Nt)
 {
-    uint64_t Cached = __atomic_load_n(&CachedMmLastUnloadedDriver, __ATOMIC_SEQ_CST);
-    if (Cached) return Cached == Failed ? nullptr : (uint32_t *) Cached;
+    uint32_t* Cached = nullptr;
+    if (LoadTraceCache(&CachedMmLastUnloadedDriver, &Cached)) return Cached;
 
     address Match = ScanModuleImage(Nt, Decode(MmLastUnloadedDriverSignature));
     if (!Match)
@@ -866,7 +879,7 @@ static void WipeMmUnloadName(_MM_UNLOADED_DRIVER* Entry)
 }
 
 // Remove every matching record in one pass: survivors compact down over the holes, past-count slots
-// are zeroed. The old code removed one record per pass and chased duplicates with up to four passes
+// are zeroed
 static uint32_t RemoveMmUnloadRecords(const wchar_t* DriverName, _MM_UNLOADED_DRIVER* Table, uint32_t* Count, bool Filled)
 {
     uint32_t Removed = 0;
@@ -965,7 +978,7 @@ bool ClearMmUnloadedDrivers(const _UNICODE_STRING* Target, uint32_t Timestamp)
     // Zero-API: no ExAcquireResourceExclusiveLite around the rewrite. The array is only touched on the
     // load/unload path; a concurrent kernel insert would be another driver unloading at this instant.
     // The count update in RemoveMmUnloadRecords is clamped, so a stale read cannot underflow it.
-    // One pass removes every matching record; duplicates no longer need the old four-pass chase
+    // One pass removes every matching record
     uint32_t Removed = RemoveMmUnloadRecords(Target->Buffer, Table, Count, IsMmUnloadedFilled(Table));
     bool Modified = Removed != 0;
     if (Modified) NormalizeMmUnloadTimes(Table);
@@ -1080,12 +1093,12 @@ constexpr uint32_t HashBucketEntryHashSize = 20;
 constexpr uint32_t MaxHashBucketEntries = 0x800;
 constexpr uint32_t HashBucketHeadCount = 2;
 
-// ci.dll's base from the kernel module list; needs this driver's loader entry relinked, which both call
-// sites guarantee
+// ci.dll's base from the kernel module list. EnumerateKProcess walks PsLoadedModuleList directly,
+// so the lookup does not depend on this driver's own loader entry being linked
 static address FindCiBase()
 {
-    uint64_t Cached = __atomic_load_n(&CachedCiBase, __ATOMIC_SEQ_CST);
-    if (Cached) return Cached == Failed ? nullptr : (address) Cached;
+    address Cached = nullptr;
+    if (LoadTraceCache(&CachedCiBase, &Cached)) return Cached;
 
     auto Ci = Decode(CiDllName);
     address Base = EnumerateKProcess(Ci.data());
@@ -1120,8 +1133,8 @@ static ULONGLONG* FindBucketListByPattern(address CiBase, const Pattern<N> &Sig)
 // pattern (1903-21H1, our 19041 included) is tried first, the 22H2 pattern as fallback
 static ULONGLONG* FindKernelHashBucketList(address CiBase)
 {
-    uint64_t Cached = __atomic_load_n(&CachedHashBucketList, __ATOMIC_SEQ_CST);
-    if (Cached) return Cached == Failed ? nullptr : (ULONGLONG *) Cached;
+    ULONGLONG* Cached = nullptr;
+    if (LoadTraceCache(&CachedHashBucketList, &Cached)) return Cached;
 
     if (!CiBase)
     {
@@ -1250,7 +1263,8 @@ static bool UnlinkHashBucketEntries(ULONGLONG* Heads, const wchar_t* Base, uint3
 
     for (uint32_t HeadIndex = 0; HeadIndex < HashBucketHeadCount; ++HeadIndex)
     {
-        uint64_t* Link = (uint64_t*) &Heads[HeadIndex];
+        uint64_t* const HeadLink = (uint64_t*) &Heads[HeadIndex];
+        uint64_t* Link = HeadLink;
         uint64_t Current = __atomic_load_n(Link, __ATOMIC_SEQ_CST);
         uint32_t Walked = 0, Retries = 0;
 
@@ -1265,7 +1279,7 @@ static bool UnlinkHashBucketEntries(ULONGLONG* Heads, const wchar_t* Base, uint3
             uint64_t Next = *(uint64_t*) (uintptr_t) Current;
             if (HashBucketEntryMatches(Current, Base, BaseChars))
             {
-                if (Link == (uint64_t*) &Heads[HeadIndex])
+                if (Link == HeadLink)
                 {
                     if (!__atomic_compare_exchange_n(Link, &Current, Next, false,
                                                      __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
@@ -1357,6 +1371,8 @@ void VerifyKernelHashBucketList(const _UNICODE_STRING* Target, uint32_t Timestam
         return;
     }
 
+    const wchar_t* const Base = Target->Buffer;
+    const uint32_t BaseChars = (uint32_t) Target->Length / 2;
     uint32_t Walked = 0, Leaked = 0;
     bool Complete = true;
 
@@ -1375,8 +1391,7 @@ void VerifyKernelHashBucketList(const _UNICODE_STRING* Target, uint32_t Timestam
                 break;
             }
 
-            if (HashBucketEntryMatches(Current, Target->Buffer,
-                                       (uint32_t) Target->Length / 2))
+            if (HashBucketEntryMatches(Current, Base, BaseChars))
             {
                 print(ERROR("VerifyHashBucket: entry %p still names this driver"), (void*) Current);
                 Leaked++;
@@ -1458,8 +1473,8 @@ typedef void (*MpFreeDriverInfoEx_t)(void* DriverInfo);
 // is deterministic for the rest of the boot like the ci.dll lookup above
 static address FindWdFilterBase()
 {
-    uint64_t Cached = __atomic_load_n(&CachedWdFilterBase, __ATOMIC_SEQ_CST);
-    if (Cached) return Cached == Failed ? nullptr : (address) Cached;
+    address Cached = nullptr;
+    if (LoadTraceCache(&CachedWdFilterBase, &Cached)) return Cached;
 
     auto Name = Decode(WdFilterName);
     address Base = EnumerateKProcess(Name.data());
@@ -1471,8 +1486,8 @@ static address FindWdFilterBase()
 // The list head, from the rip-relative `lea` at the match; its target is head + 8
 static _LIST_ENTRY* FindWdFilterList(address Wd)
 {
-    uint64_t Cached = __atomic_load_n(&CachedWdFilterList, __ATOMIC_SEQ_CST);
-    if (Cached) return Cached == Failed ? nullptr : (_LIST_ENTRY*) Cached;
+    _LIST_ENTRY* Cached = nullptr;
+    if (LoadTraceCache(&CachedWdFilterList, &Cached)) return Cached;
 
     address Match = ScanModuleImage(Wd, Decode(WdFilterRuntimeDriversListSignature));
     if (!Match)
@@ -1500,8 +1515,8 @@ static _LIST_ENTRY* FindWdFilterList(address Wd)
 // The used-record count, from the `inc dword ptr [rip+disp]` in the same routine
 static uint32_t* FindWdFilterCount(address Wd)
 {
-    uint64_t Cached = __atomic_load_n(&CachedWdFilterCount, __ATOMIC_SEQ_CST);
-    if (Cached) return Cached == Failed ? nullptr : (uint32_t*) Cached;
+    uint32_t* Cached = nullptr;
+    if (LoadTraceCache(&CachedWdFilterCount, &Cached)) return Cached;
 
     address Match = ScanModuleImage(Wd, Decode(WdFilterRuntimeDriversCountSignature));
     if (!Match)
@@ -1530,8 +1545,8 @@ static uint32_t* FindWdFilterCount(address Wd)
 // The record array: a global pointer at count + 8 that the routine dereferences for every access
 static void** FindWdFilterArray(uint32_t* Count)
 {
-    uint64_t Cached = __atomic_load_n(&CachedWdFilterArray, __ATOMIC_SEQ_CST);
-    if (Cached) return Cached == Failed ? nullptr : (void**) Cached;
+    void** Cached = nullptr;
+    if (LoadTraceCache(&CachedWdFilterArray, &Cached)) return Cached;
 
     void** Slot = (void**) ((uintptr_t) Count + WdFilterArrayFromCount);
     auto Array = (void**) *Slot;
@@ -1556,8 +1571,8 @@ static void** FindWdFilterArray(uint32_t* Count)
 // routine, so the result must land inside WdFilter.sys itself
 static MpFreeDriverInfoEx_t FindWdFilterFreeDriverInfo(address Wd)
 {
-    uint64_t Cached = __atomic_load_n(&CachedWdFilterFree, __ATOMIC_SEQ_CST);
-    if (Cached) return Cached == Failed ? nullptr : (MpFreeDriverInfoEx_t) Cached;
+    MpFreeDriverInfoEx_t Cached = nullptr;
+    if (LoadTraceCache(&CachedWdFilterFree, &Cached)) return Cached;
 
     address Match = ScanModuleImage(Wd, Decode(WdFilterFreeDriverInfoSignature));
     uint32_t CallOffset = 3;
@@ -1848,8 +1863,8 @@ void VerifyWdFilterDriverList(const _UNICODE_STRING* Target, uint32_t Timestamp)
 }
 
 // One pass over the four load traces, each its own small cleaner above. Runs at load (step 0, wiping
-// what earlier cycles left) and at unload (dropping records from previous cycles; whatever MM adds
-// after the unload callback returns is prevented by DriverExit zeroing BaseDllName.Length)
+// records from earlier loads) and at unload (dropping this load's records; whatever MM adds after the
+// unload callback returns is prevented by DriverExit zeroing BaseDllName.Length)
 bool CleanDriverTraces(win::DRIVER_OBJECT* DriverObject)
 {
     // A manual map has no loader-created DriverSection, so none of these records can belong to this
@@ -1881,10 +1896,6 @@ bool CleanDriverTraces(win::DRIVER_OBJECT* DriverObject)
     return PiDDB && MmU && Hash && WdF;
 }
 
-// The same four cleaners against an explicitly named image rather than this driver's loader entry. The
-// manual-map path uses it to remove the staged provider's records while the provider is still resident.
-// Timestamp 0 keeps the PiDDB match strictly name-based: PiDDBEntryIsTarget only compares timestamps
-// when the value is non-zero, so an unknown timestamp never acts as a wildcard
 #ifdef DEBUG
 // Debug-only self-test: after CleanDriverTraces has run, a second clear pass on
 // the now-empty PiDDB / MmUnloadedDrivers / CI hash-bucket / WdFilter state must
@@ -1918,6 +1929,11 @@ bool VerifyEmptyTraceState(win::DRIVER_OBJECT* DriverObject)
 }
 #endif
 
+// The same four cleaners against an explicitly named image rather than this driver's loader entry.
+// A manual-mapped run of this build uses it to remove the staged provider's records while the
+// provider is still resident. Timestamp 0 keeps the PiDDB match strictly name-based:
+// PiDDBEntryIsTarget only compares timestamps when the value is non-zero, so an unknown timestamp
+// never acts as a wildcard
 bool CleanExtraTraces(const _UNICODE_STRING* Target)
 {
     // The manual-map second parameter is only a candidate: require the structure itself to be

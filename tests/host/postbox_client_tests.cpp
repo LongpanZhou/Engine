@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
 // Engine-ci/tests/host/postbox_client_tests.cpp
 //
-// Host-side tests for Engine-ci/User/pure.h — the PostboxClient argument
+// Host-side tests for Engine-ci/User/pure.h - the PostboxClient argument
 // parser, stop policy, and the protocol body-length helpers shared with the
 // driver. No Win32, no BCrypt, no process/section calls.
 //
@@ -13,19 +13,9 @@
 #include <cstdio>
 #include <cstring>
 
+#include "check.h"
 #include "../../Common/Postbox.h"
 #include "../../User/pure.h"
-
-static unsigned g_Pass = 0;
-static unsigned g_Fail = 0;
-
-static void Report(bool ok, const char* file, unsigned line, const char* expr)
-{
-    if (ok) ++g_Pass;
-    else { ++g_Fail; std::printf("[FAIL] %s:%u  %s\n", file, line, expr); }
-}
-
-#define CHECK(Cond) Report((Cond), __FILE__, __LINE__, #Cond)
 
 static void TestParseMilliseconds()
 {
@@ -44,8 +34,9 @@ static void TestParseMilliseconds()
 
 static void TestParseArguments()
 {
+    char exe[] = "postbox";
+
     {
-        char exe[] = "postbox";
         char a1[] = "--hold"; char v1[] = "1000";
         char a2[] = "--hold-ping"; char v2[] = "250";
         char a3[] = "--loader"; char v3[] = "C:\\loader.exe";
@@ -62,7 +53,6 @@ static void TestParseArguments()
     }
 
     {
-        char exe[] = "postbox";
         char a1[] = "--kill";
         char* argv[] = {exe, a1};
         ClientOptions o{};
@@ -72,7 +62,6 @@ static void TestParseArguments()
 
     {
         // missing values are hard errors
-        char exe[] = "postbox";
         char a1[] = "--hold";
         char* argv[] = {exe, a1};
         ClientOptions o{};
@@ -96,7 +85,6 @@ static void TestParseArguments()
 
 #ifdef NMI_PROBE
     {
-        char exe[] = "postbox";
         char a1[] = "--nmi-probe";
         char a2[] = "--nmi-spin"; char v2[] = "12";
         char a3[] = "--nmi-status";
@@ -111,7 +99,6 @@ static void TestParseArguments()
 #endif
 #ifdef STACK_PROBE
     {
-        char exe[] = "postbox";
         char a1[] = "--stack-probe";
         char* argv[] = {exe, a1};
         ClientOptions o{};
@@ -161,7 +148,5 @@ int main()
     TestStopPlan();
     TestResponseBodyLengths();
 
-    std::printf("\n==== kf_postbox_client_tests: %u passed, %u failed ====\n",
-                g_Pass, g_Fail);
-    return g_Fail ? 1 : 0;
+    return Summary("kf_postbox_client_tests");
 }

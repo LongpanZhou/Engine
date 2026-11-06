@@ -1,36 +1,30 @@
-// Constructed-IDT NMI gate for the Postbox build (test-only, default OFF).
+// Constructed-IDT NMI gate (POSTBOX_NMI only; default OFF).
 //
 // The chain path is assembly-only (PostboxNmi.S): no C call, no stack switch,
 // no XMM/FP use on the NMI path; every write is below the entry RSP or to a
 // RIP-relative global. This removes the interrupted-context corruption class
-// that produced 0x3B (0xC0000005) in KiSystemServiceExit. Validated live:
-// 20,007 chained accounted NMIs (HalSendNMI + a registered callback) under a
-// syscall-dense workload, plus 13 detector NMIs during a 60 s gate hold, with
-// no bugcheck; the self-test consumed its own NMI and reported an in-driver
-// RIP.
+// that produced 0x3B (0xC0000005) in KiSystemServiceExit.
 //
-// The gate is still a test-only IDT hook: the IDTR and constructed table are
-// observable, PatchGuard may check the IDT, and CMake keeps POSTBOX_NMI default
-// OFF and forbidden in STEALTH_PROFILE. The product keeps the stock Windows IDT
-// and uses the callback-list sanitizer instead.
+// The gate is an IDT hook: the IDTR and constructed table are observable,
+// PatchGuard may check the IDT, and CMake keeps POSTBOX_NMI default OFF; job-only
+// builds reject it. The default build keeps the stock IDT and uses the
+// callback-list sanitizer.
 //
-// This follows the physmem_remapper reference: save the Windows NMI gate, install
-// a copy of the IDT with vector 2 pointing at an assembly trampoline, and chain
-// every non-self-test NMI back to the original handler with the trap frame intact.
+// Install saves the Windows NMI gate, installs a copy of the IDT with vector 2
+// pointing at an assembly trampoline, and chains every non-self-test NMI back to
+// the original handler with the trap frame intact.
 //
 // The gate is system-wide because a work item can run on any CPU. It is opt-in
-// (POSTBOX_NMI) and is removed by pb_stop / PostboxStop; the fixed image stays
-// mapped, so an in-flight handler can never jump into freed memory.
+// (POSTBOX_NMI) and is removed by PostboxStop; the fixed image stays mapped, so
+// an in-flight handler cannot jump into freed memory.
 //
 // One constructed IDT is shared by every CPU, and the install mask is 64 bits, so
 // the gate supports up to 64 active CPUs in processor group 0 only. Install refuses
 // larger or multi-group systems before the first lidt instead of gating a subset.
 // There is no hot-add support: a CPU that appears after install keeps the stock IDT.
 //
-// What this buys: a self-test can deliver a real NMI without bugchecking Windows,
-// and the count proves the gate/trampoline/stack handling are live. It does NOT
-// hide the driver from an NMI-based sampler: the IDTR, the 4 KiB constructed
-// table, and the gate remain observable. See AC-25/AC-26 for the tradeoff.
+// The self-test proves the gate, trampoline, and stack handling are live; it does
+// not hide the IDTR, the 4 KiB constructed table, or the gate from an NMI sampler.
 
 #ifdef POSTBOX_NMI
 
@@ -60,8 +54,8 @@ static PostboxIdtr* PostboxOldIdt = nullptr;
 static bool PostboxIdtIndependent = false;
 static uint64_t PostboxNmiInstalledMask = 0;
 
-// Referenced by PostboxNmi.S. used/noinline keep LTO from dropping the entry
-// points that the non-LTO assembly object resolves against.
+// PostboxNmi.S defines the stub by name and reads the chained handler slot.
+// `used` keeps that slot emitted for the assembly object under LTO.
 extern "C" void PostboxNmiStub();
 extern "C" __attribute__((used)) uint64_t PostboxOriginalNmiHandler = 0;
 
@@ -95,7 +89,7 @@ using FnKeAddProcessorAffinityEx = void (*)(void*, int32_t);
 using FnKeRegisterNmiCallback = void* (*)(uint8_t (*)(void*, uint8_t), void*);
 using FnKeDeregisterNmiCallback = int32_t (*)(void*);
 
-// Stored in the independent state page (C-01): .data keeps no ntoskrnl routine
+// Stored in the independent state page: .data keeps no ntoskrnl routine
 // pointers for the NMI gate. PostboxNmiInstall runs after PostboxStart created
 // the page; PostboxNmiUninstall runs before PostboxStop frees it.
 #define g_KeQueryActiveProcessors (PostboxStatePtr->NmiImports.KeQueryActiveProcessors)
@@ -280,7 +274,7 @@ static uint8_t PostboxNmiStormCallback(void* Context, uint8_t Handled)
 // Send Count accounted NMIs (HalSendNMI) one CPU at a time, with the self-test
 // flag clear, so the stub chains each one to the Windows handler. This is the
 // detector's known-good pattern (registered callback + per-CPU affinity) and
-// exercises the historical 0x3B path. Returns the number sent.
+// exercises the 0x3B crash path. Returns the number sent.
 uint32_t PostboxNmiStorm(uint32_t Count)
 {
     if (!Count || !__atomic_load_n(&PostboxNmiActive, __ATOMIC_ACQUIRE) ||
@@ -388,11 +382,7 @@ static bool PostboxNmiResolve()
     if (!Functions[11] || !Functions[12])
         print(WARN("PostboxNmi: NMI callback exports missing; accounted storm unavailable"));
 
-    for (uint32_t i = 0; i < 13; ++i)
-    {
-        volatile char* p = Decoded[i];
-        for (uint32_t j = 0; j < 40; ++j) p[j] = 0;
-    }
+    PostboxWipe(Decoded, sizeof(Decoded));
 
     g_KeQueryActiveProcessors = Functions[0];
     g_KeQueryActiveProcessorCountEx = Functions[7];
@@ -407,9 +397,8 @@ static bool PostboxNmiResolve()
     g_KeAddProcessorAffinityEx = Functions[10];
     g_KeRegisterNmiCallback = Functions[11];
     g_KeDeregisterNmiCallback = Functions[12];
-    return Ok && g_KeQueryActiveProcessors && g_KeQueryActiveProcessorCountEx &&
-           g_KeSetSystemAffinityThreadEx && g_KeRevertToUserAffinityThreadEx &&
-           g_KeGetCurrentProcessorNumberEx && g_KeStallExecutionProcessor;
+    // Ok already requires every non-optional pointer assigned above.
+    return Ok;
 }
 
 static bool PostboxNmiRestore(const uint64_t Mask, uint64_t Active)
@@ -463,8 +452,6 @@ static bool PostboxNmiAllocState()
     // The 4 KiB IDT is the only session-visible NMI allocation. Prefer page-granular
     // independent pages so it is not a 'Ntfs' BigPool entry during the self-test;
     // fall back to NonPagedPoolNx when the loader did not pass the helpers.
-    PostboxIdt = nullptr;
-    PostboxIdtIndependent = false;
     if (g_MmAllocateIndependentPages && g_MmSetPageProtection && g_MmFreeIndependentPages)
     {
         PostboxIdt = (PostboxIdtGate*) ((FnMmAllocateIndependentPages)
@@ -574,11 +561,6 @@ bool PostboxNmiInstall()
     }
 
     const uint32_t Entries = ((uint32_t) Current.Limit + 1) / 16;
-    if (Entries < 3)
-    {
-        print(ERROR("PostboxNmi: IDT has %u entries"), Entries);
-        return false;
-    }
 
     const PostboxIdtGate* Live = (const PostboxIdtGate*) (uintptr_t) Current.Base;
     const PostboxIdtGate WindowsNmi = Live[2];
@@ -607,16 +589,7 @@ bool PostboxNmiInstall()
 
     const uint32_t Copy = Entries < 256 ? Entries : 256;
     for (uint32_t i = 0; i < Copy; ++i) PostboxIdt[i] = Live[i];
-    for (uint32_t i = Copy; i < 256; ++i)
-    {
-        PostboxIdt[i].OffsetLow = 0;
-        PostboxIdt[i].Selector = 0;
-        PostboxIdt[i].Ist = 0;
-        PostboxIdt[i].Type = 0;
-        PostboxIdt[i].OffsetMid = 0;
-        PostboxIdt[i].OffsetHigh = 0;
-        PostboxIdt[i].Zero = 0;
-    }
+    PostboxWipe(&PostboxIdt[Copy], sizeof(PostboxIdtGate) * (256 - Copy));
 
     PostboxIdt[2] = WindowsNmi;
     PostboxIdt[2].Ist = WindowsNmi.Ist & 7;
@@ -708,8 +681,9 @@ static bool PostboxNmiQuiesceAndZero()
 
     // Leave PostboxOriginalNmiHandler pointing at nt!KiNmiInterrupt. A stub that
     // started before the IDTR restore may still execute `jmp *handler`; zeroing it
-    // would turn a rare in-flight NMI into a jump to NULL. The table/old IDTRs are
-    // zeroed, and the counters/last RIP/CS are diagnostic residue.
+    // would turn a rare in-flight NMI into a jump to NULL. The counters and last
+    // RIP/CS are cleared first; PostboxNmiFreeState then wipes the table and
+    // saved IDTRs.
     __atomic_store_n(&PostboxNmiTicks, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&PostboxNmiHandled, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&PostboxNmiLastRip, 0, __ATOMIC_RELAXED);
