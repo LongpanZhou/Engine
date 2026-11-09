@@ -126,6 +126,18 @@ process attach, and `MmCopyVirtualMemory` telemetry. The cost is a dependency on
 the signed provider, PTE and page-table artifacts, non-HVCI execution, and
 resident target pages.
 
+## Finding your own vulnerable driver
+
+This repo does not ship the kernel read/write provider. To find and validate
+your own, use the [BYOVD AI Guide](https://github.com/LongpanZhou/BYOVD-AI-Guide).
+It walks through collecting vendor drivers, checking the live LOLDrivers
+blocklist, static REA audits, and VM-only proof runs before you rely on a write
+primitive.
+
+Only vendor-signed drivers that verify with `signtool verify /pa` are acceptable.
+Self-signed, test-signed, and unsigned providers are not supported. Run the
+proof in a disposable VM, on systems you are authorized to test.
+
 ## Detection summary
 
 | Area | Result |
